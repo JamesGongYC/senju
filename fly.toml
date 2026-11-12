@@ -1,0 +1,29 @@
+# fly.toml app configuration file generated for senju-hub on 2026-11-12T12:03:23-08:00
+#
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
+#
+
+app = 'senju-hub'
+primary_region = 'sjc'
+
+[build]
+[env]
+  PORT = '8787'
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '15s'
+    method = 'GET'
+    path = '/health'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'

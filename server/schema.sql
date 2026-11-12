@@ -194,3 +194,19 @@ create or replace function has_api_key() returns boolean language sql stable sec
 $$;
 
 grant execute on function create_team(text), join_team(text), has_api_key(), is_team_member(uuid) to authenticated;
+
+-- ---- Who may reach which table through the API ---------------------------------------------------
+-- New Supabase projects no longer expose tables automatically, so every grant is spelled out.
+-- Row level security above still decides which rows a signed-in person gets.
+-- The server (secret key) does everything; a signed-in person only reads, plus the few changes below.
+-- Nobody but the server can touch user_secrets, and visitors who are not signed in get nothing.
+
+grant usage on schema public to authenticated, service_role;
+grant all on profiles, teams, team_members, devices, user_secrets, sessions, messages, memories, memory_revisions to service_role;
+grant usage, select on all sequences in schema public to service_role;
+grant execute on all functions in schema public to service_role;
+
+grant select, update on profiles to authenticated;
+grant select on teams, devices, sessions, messages, memory_revisions to authenticated;
+grant select, delete on team_members, memories to authenticated;
+revoke all on profiles, teams, team_members, devices, user_secrets, sessions, messages, memories, memory_revisions from anon;

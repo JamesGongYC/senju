@@ -42,8 +42,8 @@ What this does not cover: a worker that reads something on Linda's computer can 
 
 ## Set it up
 
-1. **Supabase.** Create a project. In the SQL editor, run `server/schema.sql`. Under Authentication, decide whether sign-ups must confirm their email.
-2. **Server settings.** Copy `server/env.example` to `.env.server` in the project folder and fill in the project URL, anon key, service role key, and a long random `KEY_ENCRYPTION_SECRET`. Keep the service role key and the secret private: together they can read every stored API key.
+1. **Supabase.** Create a project. In the SQL editor, paste all of `server/schema.sql` and run it. Under Authentication, turn off "Confirm email" while you test: the built-in mail sender allows only a few messages an hour.
+2. **Server settings.** Copy `server/env.example` to `.env.server` in the project folder. Fill in the project URL, the publishable key and the secret key (Settings > API Keys), and a `KEY_ENCRYPTION_SECRET` from `openssl rand -hex 32`. Keep the secret key and the encryption secret private: together they can read every stored API key.
 3. **Run the server.** `npm install`, then `npm run server`. It serves the web app at `http://localhost:8787`.
 4. **Accounts.** Open the web app, create an account, create a team, and share the invite code. Each person saves their own Anthropic API key under Settings.
 5. **Desktop apps.** On each computer, add the server's address to `swarm.config.json` and start the app as usual. Sign in from the bar.
@@ -68,13 +68,13 @@ There are three things to deploy, not two.
 
 Why the hub cannot live on Supabase or Vercel: Supabase Edge Functions stop after 150 seconds (400 on paid plans), and Vercel Functions close a WebSocket when the function reaches its maximum duration, about five minutes by default. A session runs for an hour or more and its state is in the hub's memory, so it needs a process that stays up.
 
-**1. Supabase.** Create a project, run `server/schema.sql` in the SQL editor, and copy the project URL, anon key and service role key. Under Authentication, set the Site URL to the hub's address so confirmation emails link back to the web app.
+**1. Supabase.** Create a project, run `server/schema.sql` in the SQL editor, and copy the project URL, the publishable key and the secret key. Under Authentication, set the Site URL to the hub's address so confirmation emails link back to the web app.
 
-**2. The hub.** The included `Dockerfile` builds it. Set these on the host (the same names as `server/env.example`): `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `KEY_ENCRYPTION_SECRET`, `PORT`. On Fly.io, for example:
+**2. The hub.** The included `Dockerfile` builds it. Set these on the host (the same names as `server/env.example`): `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `KEY_ENCRYPTION_SECRET`. A `fly.toml` is included. On Fly.io:
 
 ```sh
-fly launch --no-deploy            # picks up the Dockerfile; set the internal port to 8787
-fly secrets set SUPABASE_URL=... SUPABASE_ANON_KEY=... SUPABASE_SERVICE_ROLE_KEY=... KEY_ENCRYPTION_SECRET=...
+fly launch --copy-config --no-deploy   # keeps fly.toml; choose an app name
+fly secrets set SUPABASE_URL=... SUPABASE_PUBLISHABLE_KEY=... SUPABASE_SECRET_KEY=... KEY_ENCRYPTION_SECRET=...
 fly deploy
 fly scale count 1
 ```

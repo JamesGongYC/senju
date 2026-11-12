@@ -1,6 +1,8 @@
 // Server entry point: the hub (WebSocket), a small HTTP API, and the web app's files.
 //
-//   SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY   from your Supabase project
+//   SUPABASE_URL                                   from your Supabase project
+//   SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY  its API keys (the older names
+//                                                  SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY also work)
 //   KEY_ENCRYPTION_SECRET   a long random string; encrypts people's API keys at rest
 //   PORT                    default 8787
 //   SWARM_MODEL             default claude-sonnet-5-5
@@ -21,7 +23,15 @@ if (fs.existsSync(envFile)) for (const line of fs.readFileSync(envFile, 'utf8').
   if (m && !env[m[1]]) env[m[1]] = m[2].replace(/^["']|["']$/g, '');
 }
 
-const store = new SupabaseStore({ url: env.SUPABASE_URL, serviceKey: env.SUPABASE_SERVICE_ROLE_KEY, encryptionSecret: env.KEY_ENCRYPTION_SECRET });
+const publicKey = env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY;
+const secretKey = env.SUPABASE_SECRET_KEY || env.SUPABASE_SERVICE_ROLE_KEY;
+const missing = [['SUPABASE_URL', env.SUPABASE_URL], ['SUPABASE_PUBLISHABLE_KEY', publicKey], ['SUPABASE_SECRET_KEY', secretKey], ['KEY_ENCRYPTION_SECRET', env.KEY_ENCRYPTION_SECRET]].filter(([, v]) => !v || /^\.\.\.$|YOUR-PROJECT/.test(v)).map(([k]) => k);
+if (missing.length) {
+  console.error(`The team server cannot start. Missing: ${missing.join(', ')}.\nCopy server/env.example to .env.server in the project folder and fill it in, or set them in the host's settings.`);
+  process.exit(1);
+}
+if (publicKey === secretKey) { console.error('SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY are the same value. The secret key must never be the one sent to browsers.'); process.exit(1); }
+const store = new SupabaseStore({ url: env.SUPABASE_URL, serviceKey: secretKey, encryptionSecret: env.KEY_ENCRYPTION_SECRET });
 const model = env.SWARM_MODEL ?? 'claude-sonnet-5-5';
 const config = {
   model, plannerModel: model,
@@ -45,8 +55,8 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
     if (url.pathname === '/health') return json(res, 200, { ok: true });
-    // What a client needs to reach Supabase. The anon key is public by design.
-    if (url.pathname === '/api/config') return json(res, 200, { supabaseUrl: env.SUPABASE_URL, supabaseAnonKey: env.SUPABASE_ANON_KEY });
+    // What a client needs to reach Supabase. The publishable key is public by design.
+    if (url.pathname === '/api/config') return json(res, 200, { supabaseUrl: env.SUPABASE_URL, supabaseAnonKey: publicKey });
     if (url.pathname === '/api/key') {
       const user = await store.verifyToken((req.headers.authorization ?? '').replace(/^Bearer\s+/i, ''));
       if (!user) return json(res, 401, { error: 'Sign in again.' });
