@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
+<title>Senju</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="cursors"></div>
+  <div id="floats"></div>
+
+  <div id="dock">
+    <form id="bar" class="hit" autocomplete="off">
+      <span id="state-dot" data-state="idle"></span>
+      <input id="prompt" type="text" placeholder="What should the swarm do?" spellcheck="false">
+      <button id="go" type="submit" title="Run (Enter)">Run</button>
+      <button id="stop" type="button" title="Stop the current job" hidden>Stop</button>
+      <button id="dismiss" type="button" title="Hide (Esc)">Hide</button>
+    </form>
+    <div id="account" class="hit" hidden></div>
+    <div id="chips"></div>
+    <div id="people"></div>
+    <div id="thread" class="hit" hidden></div>
+    <div id="asks"></div>
+    <div id="card" class="hit" hidden>
+      <button id="card-close" type="button" title="Close">Close</button>
+      <div id="card-summary"></div>
+      <div id="card-usage"></div>
+      <details id="card-details"><summary>Agent reports</summary><div id="card-reports"></div></details>
+    </div>
+    <div id="toasts"></div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
