@@ -45,7 +45,7 @@ npm install
 npm run release
 ```
 
-This builds `dist/Senju-<version>-arm64.dmg` (Apple silicon) and `-x64.dmg` (Intel), and copies both into `../senju-website/downloads/`, where the download page expects them. `npm run dist` builds without copying. It must run on a Mac.
+This builds `dist/Senju-arm64.dmg` (Apple silicon) and `dist/Senju-x64.dmg` (Intel), then prints the command that publishes them as a GitHub Release on the website's repository. The download buttons on the site point at the latest release, so a new release needs no change to the site. `npm run dist` only builds. It must run on a Mac.
 
 What changes in the installed app:
 

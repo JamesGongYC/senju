@@ -1,16 +1,17 @@
-// npm run release: build the Mac installers, then copy them next to the download page.
-// The page links to downloads/Senju-<version>-arm64.dmg and -x64.dmg.
+// npm run release: build the Mac installers and say how to publish them.
+// The installers are too large for the website's host, so they are published as a GitHub Release.
+// The download page links to .../releases/latest/download/Senju-arm64.dmg and Senju-x64.dmg.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT } from '../src/config.js';
 
+const SITE_REPO = process.env.SENJU_RELEASE_REPO ?? 'JamesGongYC/senju-site';
+
 if (process.platform !== 'darwin') { console.error('Mac installers can only be built on a Mac.'); process.exit(1); }
 execFileSync('npx', ['electron-builder', '--mac'], { cwd: ROOT, stdio: 'inherit' });
 
-const site = process.argv[2] ?? path.join(ROOT, '..', 'senju-website');
-const dmgs = fs.readdirSync(path.join(ROOT, 'dist')).filter((f) => f.endsWith('.dmg'));
-if (!fs.existsSync(site)) { console.log(`\nBuilt ${dmgs.join(', ')} in dist/. No website folder at ${site}, so nothing was copied.`); process.exit(0); }
-fs.mkdirSync(path.join(site, 'downloads'), { recursive: true });
-for (const f of dmgs) fs.copyFileSync(path.join(ROOT, 'dist', f), path.join(site, 'downloads', f));
-console.log(`\nCopied ${dmgs.join(', ')} to ${path.join(site, 'downloads')}`);
+const { version } = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+const dmgs = fs.readdirSync(path.join(ROOT, 'dist')).filter((f) => f.endsWith('.dmg')).map((f) => path.join('dist', f));
+console.log(`\nBuilt ${dmgs.join(', ')}.\n\nPublish them (the repository must be public for the links to work):\n`);
+console.log(`  gh release create v${version} ${dmgs.join(' ')} --repo ${SITE_REPO} --title "Senju ${version}" --notes "Senju ${version} for macOS."\n`);

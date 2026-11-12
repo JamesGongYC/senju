@@ -48,7 +48,7 @@
       "!traces/**",
       "!skills/**"
     ],
-    "artifactName": "Senju-${version}-${arch}.${ext}",
+    "artifactName": "Senju-${arch}.${ext}",
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "build/icon.png",
