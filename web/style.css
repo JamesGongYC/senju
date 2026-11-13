@@ -44,3 +44,5 @@ main { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, 1fr)
 .pill.on { color: var(--good); }
 code { background: #101116; padding: 2px 6px; border-radius: 6px; user-select: all; }
 .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: #3a1f1f; border: 1px solid rgba(255, 93, 93, 0.5); padding: 8px 14px; border-radius: 12px; }
+
+.row.pay { flex-wrap: wrap; } .row.pay button { white-space: nowrap; }

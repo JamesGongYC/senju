@@ -9,10 +9,12 @@
 // sends the call to that computer, which runs it and sends the result back.
 import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
+import { costMicro, dollars, isActive } from './billing.js';
 import { Swarm } from '../src/orchestrator.js';
 
 const slug = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'computer';
 const CALL_TIMEOUT = 150000;
+const CHARGE_STEP = 250_000;   // hosted sessions are charged each time another $0.25 has been used
 // Kept so that someone who joins late can catch up.
 const LOGGED = new Set(['said', 'chat', 'result', 'board', 'remembered', 'skill']);
 const LOG_MAX = 300;
@@ -25,7 +27,10 @@ export class Hub {
    * @param {object} o.config     swarm settings: model, maxAgents, maxSteps, context, tokenBudget
    * @param {string} [o.traceDir]
    */
-  constructor({ store, makeLlm, config, traceDir = null, log = () => {} }) {
+  // hostedKey and pricing are set when the server sells hosted sessions; without them everyone brings a key.
+  constructor({ store, makeLlm, config, traceDir = null, log = () => {}, hostedKey = null, pricing = null }) {
+    this.hostedKey = pricing ? hostedKey : null;
+    this.pricing = pricing;
     this.store = store;
     this.makeLlm = makeLlm;
     this.config = config;
@@ -203,8 +208,17 @@ export class Hub {
     const team = client.team;
     if (!goal) return;
     if (team.session) return this.send(client, { t: 'error', message: `${team.session.owner.name} already has a session running. Write to its lead to change the plan.` });
-    const key = await this.store.getKey(client.user.id);
-    if (!key) return this.send(client, { t: 'error', code: 'no_key', message: 'Add your Anthropic API key in the web app first. A session runs on the key of whoever starts it.' });
+    // Whoever starts the session pays for it: with their own key if they saved one, otherwise from their credits.
+    let key = await this.store.getKey(client.user.id);
+    let hosted = false;
+    if (!key) {
+      if (!this.hostedKey) return this.send(client, { t: 'error', code: 'no_key', message: 'Add your Anthropic API key in the web app first. A session runs on the key of whoever starts it.' });
+      const account = await this.store.getBilling(client.user.id);
+      if (!isActive(account.status)) return this.send(client, { t: 'error', code: 'no_plan', message: 'Hosted sessions need a subscription. Subscribe in the web app, or save your own Anthropic key there to run for free.' });
+      if (account.credits < this.pricing.minStartMicro) return this.send(client, { t: 'error', code: 'no_credits', message: `You have ${dollars(Math.max(0, account.credits))} of credits left, which is not enough to start. Add credits in the web app.` });
+      key = this.hostedKey;
+      hosted = true;
+    }
 
     const s = {
       id: crypto.randomUUID(), team, goal,
@@ -216,6 +230,7 @@ export class Hub {
       people: new Map([[client.user.id, client.user.name]]),   // participants, for memory attribution
       // The session's current picture, for people who join late: built per person in snapshot().
       spawns: new Map(), latest: new Map(), leadLast: null, stateNow: 'planning', log: [], done: null,
+      billing: hosted ? { cost: 0, charged: 0, n: 0, out: false, chain: Promise.resolve() } : null,
     };
     const store = this.store;
     const config = { ...this.config, servers: {} };
@@ -256,13 +271,37 @@ export class Hub {
 
     s.swarm.run(goal).then(async () => {
       const done = s.done;
-      await store.endSession(s.id, { status: done ? 'done' : 'stopped', summary: done?.summary ?? null, usage: s.swarm.usage }).catch(() => {});
+      if (s.billing) await this.meter(s, s.swarm.usage, true);
+      await store.endSession(s.id, { status: done ? 'done' : 'stopped', summary: done?.summary ?? null, usage: s.swarm.usage, billing: s.billing ? 'hosted' : 'own_key', costMicro: s.billing?.cost ?? null }).catch(() => {});
       for (const c of team.clients) if (c.device) this.send(c, { t: 'session_over', sessionId: s.id });
       team.session = null;
       this.presence(team);
       await s.swarm.learning;   // the retrospective finishes in the background
+      if (s.billing) await this.meter(s, s.swarm.usage, true);   // writing the skill used tokens too
       if (team.clients.size === 0 && !team.session) this.teams.delete(team.id);
     });
+  }
+
+  // Charge a hosted session's owner for what it has used since the last charge. Charges are small and
+  // frequent so that a crash loses little, and the session stops as soon as the balance is gone.
+  meter(s, usage, final = false) {
+    const b = s.billing;
+    b.cost = costMicro(usage, this.pricing);
+    const due = b.cost - b.charged;
+    if (due <= 0 || (!final && due < CHARGE_STEP)) return b.chain;
+    b.charged = b.cost;
+    const n = ++b.n;
+    b.chain = b.chain.then(async () => {
+      const balance = await this.store.applyCredit({ userId: s.owner.id, deltaMicro: -due, kind: 'usage', sessionId: s.id, eventId: `usage:${s.id}:${n}`, note: s.goal.slice(0, 80) });
+      // Only the person paying sees their balance.
+      for (const c of s.team.clients) if (c.user.id === s.owner.id) this.send(c, { t: 'event', sessionId: s.id, event: { type: 'credits', balance, text: dollars(Math.max(0, balance)), spent: dollars(b.charged) } });
+      if (balance <= 0 && !b.out && s.team.session === s) {
+        b.out = true;
+        this.event(s, { type: 'notice', message: `${s.owner.name} is out of credits, so this session is stopping. Add credits in the web app to run it again.` });
+        s.swarm.cancel();
+      }
+    }).catch((err) => this.log('billing: could not charge', s.id, err?.message ?? err));
+    return b.chain;
   }
 
   // Someone takes part for the first time: the lead is told, along with what is remembered about them.
@@ -353,6 +392,7 @@ export class Hub {
     if (e.type === 'lead') s.leadLast = e;
     if (e.type === 'state') s.stateNow = e.state;
     if (e.type === 'done') s.done = e;
+    if (e.type === 'usage' && s.billing) this.meter(s, e);
     if (LOGGED.has(e.type)) { s.log.push(e); if (s.log.length > LOG_MAX) s.log.shift(); }
     for (const c of s.team.clients) {
       const seen = this.view(s, c, e);

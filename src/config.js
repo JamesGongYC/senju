@@ -33,6 +33,9 @@ export function loadConfig() {
 }
 
 // Folder the agents share for files. Created on first run.
+// Where team mode connects unless swarm.config.json names another server under "cloud".
+export const DEFAULT_HUB = 'https://senju-hub.fly.dev';
+
 export function ensureWorkspace() {
   // The app used to be called Cursor Swarm. A workspace from then keeps working until it is renamed.
   const old = path.join(os.homedir(), 'CursorSwarm');

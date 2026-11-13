@@ -12,6 +12,8 @@ export class MemoryStore {
     this.messages = [];
     this.skills = new Map();     // `${teamId}/${name}` -> { name, description, body, revision, authorId, history: [] }
     this.memories = [];
+    this.billing = new Map();    // userId -> { credits, status, customerId, subscriptionId, periodEnd }
+    this.ledger = [];            // { userId, deltaMicro, kind, sessionId, eventId, note }
   }
 
   addUser(id, name, teamId = null) { this.users.set(id, { id, name, email: `${id}@example.com` }); if (teamId) this.join(id, teamId); return `user:${id}`; }
@@ -50,4 +52,18 @@ export class MemoryStore {
       .map((m) => ({ scope: m.scope, subjectId: m.subjectId, subjectName: name(m.subjectId), authorName: name(m.authorId), note: m.note }));
   }
   async addMemory(m) { this.memories.push({ ...m, at: Date.now() }); }
+
+  // ---- Billing ---------------------------------------------------------------------------
+  account(userId) { if (!this.billing.has(userId)) this.billing.set(userId, { credits: 0, status: 'none', customerId: null, subscriptionId: null, periodEnd: null }); return this.billing.get(userId); }
+  async getBilling(userId) { return { ...this.account(userId) }; }
+  async setBilling(userId, patch) { Object.assign(this.account(userId), patch); }
+  async userByCustomer(customerId) { return [...this.billing].find(([, b]) => b.customerId === customerId)?.[0] ?? null; }
+  // Adds to (or takes from) a balance. An event id makes it safe to apply twice.
+  async applyCredit({ userId, deltaMicro, kind, sessionId = null, eventId = null, note = '' }) {
+    const b = this.account(userId);
+    if (eventId && this.ledger.some((l) => l.eventId === eventId)) return b.credits;
+    this.ledger.push({ userId, deltaMicro, kind, sessionId, eventId, note });
+    b.credits += deltaMicro;
+    return b.credits;
+  }
 }

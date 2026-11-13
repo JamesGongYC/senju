@@ -79,6 +79,54 @@ create table if not exists messages (
   created_at timestamptz not null default now()
 );
 
+-- ---- Plan and credits -----------------------------------------------------------------------
+-- Someone without their own API key runs sessions on the server's key and pays in credits.
+-- Amounts are micro-dollars: 1,000,000 = $1.00. Only the server changes these tables.
+
+alter table sessions add column if not exists billing text;        -- 'own_key' or 'hosted'
+alter table sessions add column if not exists cost_micro bigint;   -- what a hosted session was charged
+
+create table if not exists billing_accounts (
+  user_id uuid primary key references profiles on delete cascade,
+  stripe_customer_id text unique,
+  subscription_id text,
+  status text not null default 'none',          -- Stripe's subscription status; 'active' unlocks hosted sessions
+  period_end timestamptz,
+  credits_micro bigint not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+-- Every change to a balance: monthly credits, purchases, and what each session used.
+create table if not exists credit_ledger (
+  id bigint generated always as identity primary key,
+  user_id uuid not null references profiles on delete cascade,
+  delta_micro bigint not null,
+  kind text not null check (kind in ('plan', 'topup', 'usage', 'adjust')),
+  session_id uuid references sessions on delete set null,
+  event_id text unique,                          -- the Stripe event or usage step; applying it twice does nothing
+  note text,
+  created_at timestamptz not null default now()
+);
+create index if not exists credit_ledger_user on credit_ledger (user_id, created_at desc);
+
+-- Changes a balance and writes the ledger line in one step. Returns the new balance.
+create or replace function apply_credit(p_user uuid, p_delta bigint, p_kind text, p_session uuid, p_event text, p_note text)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare bal bigint;
+begin
+  insert into billing_accounts (user_id) values (p_user) on conflict (user_id) do nothing;
+  insert into credit_ledger (user_id, delta_micro, kind, session_id, event_id, note)
+    values (p_user, p_delta, p_kind, p_session, p_event, p_note)
+    on conflict (event_id) do nothing;
+  if not found then   -- this event was already applied
+    select credits_micro into bal from billing_accounts where user_id = p_user;
+    return bal;
+  end if;
+  update billing_accounts set credits_micro = credits_micro + p_delta, updated_at = now()
+    where user_id = p_user returning credits_micro into bal;
+  return bal;
+end $$;
+
 -- ---- Memory ---------------------------------------------------------------------------------
 -- kind 'note':  a lasting preference or fact. scope 'user' is about one person and visible
 --               only to them; scope 'team' is for the whole team.
@@ -132,6 +180,14 @@ alter table sessions enable row level security;
 alter table messages enable row level security;
 alter table memories enable row level security;
 alter table memory_revisions enable row level security;
+alter table billing_accounts enable row level security;
+alter table credit_ledger enable row level security;
+
+-- You can see your own plan, balance and charges. Nobody else's.
+drop policy if exists billing_read on billing_accounts;
+create policy billing_read on billing_accounts for select using (user_id = auth.uid());
+drop policy if exists ledger_read on credit_ledger;
+create policy ledger_read on credit_ledger for select using (user_id = auth.uid());
 
 drop policy if exists profiles_read on profiles;
 create policy profiles_read on profiles for select using (
@@ -204,7 +260,14 @@ grant execute on function create_team(text), join_team(text), has_api_key(), is_
 grant usage on schema public to authenticated, service_role;
 grant all on profiles, teams, team_members, devices, user_secrets, sessions, messages, memories, memory_revisions to service_role;
 grant usage, select on all sequences in schema public to service_role;
+grant all on billing_accounts, credit_ledger to service_role;
 grant execute on all functions in schema public to service_role;
+grant select on billing_accounts, credit_ledger to authenticated;
+revoke all on billing_accounts, credit_ledger from anon;
+-- Postgres lets everyone run a new function unless told otherwise. This one hands out money,
+-- so only the server may call it.
+revoke execute on function apply_credit(uuid, bigint, text, uuid, text, text) from public, anon, authenticated;
+grant execute on function apply_credit(uuid, bigint, text, uuid, text, text) to service_role;
 
 grant select, update on profiles to authenticated;
 grant select on teams, devices, sessions, messages, memory_revisions to authenticated;

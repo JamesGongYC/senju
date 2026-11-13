@@ -4,6 +4,9 @@
 //   SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY  its API keys (the older names
 //                                                  SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY also work)
 //   KEY_ENCRYPTION_SECRET   a long random string; encrypts people's API keys at rest
+//   ANTHROPIC_API_KEY       optional. With it, people can run sessions on this server's key and pay in credits.
+//   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET   optional. Needed to sell the plan and credits.
+//   PUBLIC_URL              this server's public address, for the pages Stripe sends people back to
 //   PORT                    default 8787
 //   SWARM_MODEL             default claude-sonnet-5-5
 import fs from 'node:fs';
@@ -12,6 +15,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Hub } from './hub.js';
 import { SupabaseStore } from './store-supabase.js';
+import { Billing, verifyWebhook } from './billing.js';
 import { makeLlm } from '../src/llm.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -32,6 +36,10 @@ if (missing.length) {
 }
 if (publicKey === secretKey) { console.error('SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY are the same value. The secret key must never be the one sent to browsers.'); process.exit(1); }
 const store = new SupabaseStore({ url: env.SUPABASE_URL, serviceKey: secretKey, encryptionSecret: env.KEY_ENCRYPTION_SECRET });
+const billing = new Billing({ store, env, log: (...a) => console.error(...a) });
+const hostedKey = env.ANTHROPIC_API_KEY || null;
+if (hostedKey && !billing.enabled) console.error('ANTHROPIC_API_KEY is set but STRIPE_SECRET_KEY is not: nobody can buy credits, so hosted sessions cannot start.');
+if (billing.enabled && !billing.webhookSecret) console.error('STRIPE_WEBHOOK_SECRET is not set: payments will be taken but credits will not be added.');
 const model = env.SWARM_MODEL ?? 'claude-sonnet-5-5';
 const config = {
   model, plannerModel: model,
@@ -41,11 +49,16 @@ const config = {
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 const json = (res, code, body) => { res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(body)); };
-const readBody = (req) => new Promise((resolve, reject) => {
-  let data = '';
-  req.on('data', (c) => { data += c; if (data.length > 10000) { reject(new Error('too large')); req.destroy(); } });
-  req.on('end', () => { try { resolve(JSON.parse(data || '{}')); } catch { reject(new Error('bad json')); } });
+const readRaw = (req, limit) => new Promise((resolve, reject) => {
+  const chunks = []; let size = 0;
+  req.on('data', (c) => { size += c.length; if (size > limit) { reject(new Error('too large')); req.destroy(); } else chunks.push(c); });
+  req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+  req.on('error', reject);
 });
+const readBody = async (req) => { try { return JSON.parse((await readRaw(req, 10000)) || '{}'); } catch { throw new Error('bad json'); } };
+const signedIn = (req) => store.verifyToken((req.headers.authorization ?? '').replace(/^Bearer\s+/i, ''));
+// Where Stripe sends people back to. Set PUBLIC_URL in production; locally the request's own address is right.
+const originOf = (req) => (env.PUBLIC_URL || `${req.headers['x-forwarded-proto'] ?? 'http'}://${req.headers.host}`).replace(/\/+$/, '');
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -58,7 +71,7 @@ const server = http.createServer(async (req, res) => {
     // What a client needs to reach Supabase. The publishable key is public by design.
     if (url.pathname === '/api/config') return json(res, 200, { supabaseUrl: env.SUPABASE_URL, supabaseAnonKey: publicKey });
     if (url.pathname === '/api/key') {
-      const user = await store.verifyToken((req.headers.authorization ?? '').replace(/^Bearer\s+/i, ''));
+      const user = await signedIn(req);
       if (!user) return json(res, 401, { error: 'Sign in again.' });
       if (req.method === 'DELETE') { await store.deleteKey(user.id); return json(res, 200, { ok: true }); }
       if (req.method === 'POST') {
@@ -68,6 +81,29 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true });
       }
       return json(res, 405, { error: 'Use POST or DELETE.' });
+    }
+    // ---- Plan and credits ----
+    if (url.pathname === '/api/billing') {
+      const user = await signedIn(req);
+      if (!user) return json(res, 401, { error: 'Sign in again.' });
+      return json(res, 200, await billing.summary(user.id, { hasOwnKey: Boolean(await store.getKey(user.id)), hosted: Boolean(hostedKey) }));
+    }
+    if (url.pathname === '/api/billing/checkout' || url.pathname === '/api/billing/portal') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'Use POST.' });
+      const user = await signedIn(req);
+      if (!user) return json(res, 401, { error: 'Sign in again.' });
+      try {
+        const to = url.pathname.endsWith('portal') ? await billing.portal(user, originOf(req)) : await billing.checkout(user, await readBody(req), originOf(req));
+        return json(res, 200, { url: to });
+      } catch (err) { return json(res, 400, { error: String(err?.message ?? err) }); }
+    }
+    // Stripe tells us here that money arrived. Nothing is credited unless the signature is Stripe's.
+    if (url.pathname === '/api/stripe/webhook') {
+      if (req.method !== 'POST' || !billing.webhookSecret) return json(res, 400, { error: 'Not accepting webhooks.' });
+      let event;
+      try { event = verifyWebhook(await readRaw(req, 1_000_000), req.headers['stripe-signature'], billing.webhookSecret); }
+      catch (err) { return json(res, 400, { error: String(err?.message ?? err) }); }
+      return json(res, 200, { received: true, result: await billing.handleEvent(event) });   // an error here becomes a 500, and Stripe retries
     }
     // The Supabase browser library, served from our own install so the page needs no CDN.
     if (url.pathname === '/vendor/supabase.js') {
@@ -85,6 +121,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-new Hub({ store, makeLlm, config, traceDir: env.SWARM_TRACE_DIR ?? null, log: (...a) => console.error(...a) }).listen(server);
+new Hub({ store, makeLlm, config, hostedKey, pricing: hostedKey ? billing.p : null, traceDir: env.SWARM_TRACE_DIR ?? null, log: (...a) => console.error(...a) }).listen(server);
 const port = Number(env.PORT ?? 8787);
 server.listen(port, () => console.log(`Senju server on http://localhost:${port}`));

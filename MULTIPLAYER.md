@@ -46,13 +46,13 @@ What this does not cover: a worker that reads something on Linda's computer can 
 2. **Server settings.** Copy `server/env.example` to `.env.server` in the project folder. Fill in the project URL, the publishable key and the secret key (Settings > API Keys), and a `KEY_ENCRYPTION_SECRET` from `openssl rand -hex 32`. Keep the secret key and the encryption secret private: together they can read every stored API key.
 3. **Run the server.** `npm install`, then `npm run server`. It serves the web app at `http://localhost:8787`.
 4. **Accounts.** Open the web app, create an account, create a team, and share the invite code. Each person saves their own Anthropic API key under Settings.
-5. **Desktop apps.** On each computer, add the server's address to `swarm.config.json` and start the app as usual. Sign in from the bar.
+5. **Desktop apps.** Start the app and choose **With my team**, then sign in from the bar. While you test against a server on your own Mac, point the app at it in `swarm.config.json`:
 
    ```json
    "cloud": { "url": "http://localhost:8787" }
    ```
 
-   Remove the `cloud` entry to go back to solo mode.
+   Without a `cloud` entry, team mode uses the built-in server address. Choosing **On this Mac** at launch never contacts a server.
 
 For two laptops on one network, run the server on one and use its address (`http://192.168.x.x:8787`) on both. For anything beyond that, deploy it (a `Dockerfile` is included) behind HTTPS, so sign-in tokens and screen contents are encrypted in transit.
 
@@ -88,7 +88,38 @@ fly scale count 1
 
 **4. The download site.** Import `senju-website` into Vercel as a static project (no framework, no build command). The DMGs are over 100 MB each: publish them as a GitHub Release and point the two download buttons in `index.html` at the release URLs, rather than committing them to the site.
 
-**5. Point the desktop app at the hub.** A fresh install has no `cloud` entry and runs solo. For a team build, add `"cloud": { "url": "https://your-hub" }` to `swarm.config.json` before `npm run release`, or have each person add it to the config in the app's data folder.
+**5. Point the desktop app at the hub.** The app asks on every launch whether to work on this Mac or with the team. Team mode connects to the address in `DEFAULT_HUB` in `src/config.js`, which is built into the installers. To use another server, change that constant before `npm run release`, or add `"cloud": { "url": "https://your-hub" }` to `swarm.config.json` on one computer.
+
+## Charging for hosted sessions
+
+By default everyone brings their own Anthropic key. Give the server a key of its own and a Stripe account, and people can instead subscribe and run sessions on the server's key.
+
+**How it works**
+
+- Whoever starts a session pays for it. If they saved their own key, it is used and nothing is charged. Otherwise the session runs on the server's key and comes off their credits.
+- A subscription is $20 a month and each paid month adds $20 of credits. Unused credits carry over. Subscribers can buy more in $10, $25 and $50 amounts.
+- Credits are spent at what the tokens cost, times 1.3. The token rates in `server/billing.js` are Claude Sonnet 5.5 list prices; update them if you change the model.
+- A session is charged in steps of about $0.25 while it runs and stops when the balance reaches zero. The most a session can overrun is roughly one step plus the model calls already in flight.
+- Every change to a balance is a line in `credit_ledger`: monthly credits, purchases, and what each session used.
+
+All of these numbers are settings (`SENJU_PLAN_USD`, `SENJU_PLAN_CREDITS_USD`, `SENJU_TOPUPS_USD`, `SENJU_MARKUP`, `SENJU_RATE_*`).
+
+**Set it up in Stripe's test mode**
+
+1. Run `server/schema.sql` in Supabase again. It is safe to re-run and adds the billing tables.
+2. In the Stripe dashboard, stay in test mode and copy the secret key (`sk_test_...`).
+3. Add to `.env.server`: `ANTHROPIC_API_KEY`, `STRIPE_SECRET_KEY`, and `PUBLIC_URL` (for local testing, `http://localhost:8787`).
+4. Stripe has to be able to tell the server that a payment arrived. Locally, install the Stripe CLI and leave this running; it prints a `whsec_...` value to put in `.env.server` as `STRIPE_WEBHOOK_SECRET`:
+
+   ```sh
+   stripe listen --forward-to localhost:8787/api/stripe/webhook
+   ```
+
+5. Restart `npm run server`. In the web app, remove your own API key under Settings, click Subscribe, and pay with the test card `4242 4242 4242 4242`, any future date and any CVC. Your balance should show $20.00 a few seconds later.
+
+**On the deployed server:** in Stripe, add a webhook endpoint at `https://your-hub/api/stripe/webhook` for the events `checkout.session.completed`, `invoice.paid`, `customer.subscription.updated` and `customer.subscription.deleted`, and set its signing secret, the Stripe key, the Anthropic key and `PUBLIC_URL` with `fly secrets set`. Turn on the customer portal in Stripe's billing settings so "Change card or cancel" works.
+
+**Before charging real money:** switch to the live Stripe keys, turn email confirmation back on in Supabase, and put a spending limit on the Anthropic key in the Anthropic console. Anyone with database access can change a balance, so keep the Supabase secret key private.
 
 ## How it is built
 

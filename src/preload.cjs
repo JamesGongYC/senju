@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('swarm', {
   consent: (allow, watch = false) => ipcRenderer.send('team:consent', { allow, watch }),
   join: () => ipcRenderer.send('team:join'),
   leave: () => ipcRenderer.send('team:leave'),
+  setMode: (mode) => ipcRenderer.send('app:mode', mode),
   saveKey: (key) => ipcRenderer.send('solo:key', key),
   setInteractive: (on) => ipcRenderer.send('overlay:interactive', on),
   onEvent: (fn) => ipcRenderer.on('swarm:event', (_e, event) => fn(event)),

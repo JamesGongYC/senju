@@ -61,8 +61,8 @@ export class SupabaseStore {
   async createSession({ id, teamId, ownerId, goal }) {
     ok(await this.db.from('sessions').insert({ id, team_id: teamId, owner_id: ownerId, goal }));
   }
-  async endSession(id, { status, summary, usage }) {
-    ok(await this.db.from('sessions').update({ status, summary, usage, ended_at: new Date().toISOString() }).eq('id', id));
+  async endSession(id, { status, summary, usage, billing = null, costMicro = null }) {
+    ok(await this.db.from('sessions').update({ status, summary, usage, billing, cost_micro: costMicro, ended_at: new Date().toISOString() }).eq('id', id));
   }
   async addMessage({ sessionId, authorId, target, text }) {
     ok(await this.db.from('messages').insert({ session_id: sessionId, author_id: authorId, target, text }));
@@ -101,6 +101,28 @@ export class SupabaseStore {
       .filter((m) => m.scope === 'team' || userIds.includes(m.subject_id))
       .map((m) => ({ scope: m.scope, subjectId: m.subject_id, subjectName: m.subject?.name ?? 'Someone', authorName: m.author?.name ?? 'Someone', note: m.body }));
   }
+  // ---- Billing: one balance per person, every change written to a ledger -----------------------
+  async getBilling(userId) {
+    const row = ok(await this.db.from('billing_accounts').select('stripe_customer_id, subscription_id, status, period_end, credits_micro').eq('user_id', userId).maybeSingle());
+    return { credits: Number(row?.credits_micro ?? 0), status: row?.status ?? 'none', customerId: row?.stripe_customer_id ?? null, subscriptionId: row?.subscription_id ?? null, periodEnd: row?.period_end ?? null };
+  }
+  async setBilling(userId, { status, customerId, subscriptionId, periodEnd }) {
+    const patch = { user_id: userId, updated_at: new Date().toISOString() };
+    if (status !== undefined) patch.status = status;
+    if (customerId !== undefined) patch.stripe_customer_id = customerId;
+    if (subscriptionId !== undefined) patch.subscription_id = subscriptionId;
+    if (periodEnd !== undefined) patch.period_end = periodEnd;
+    ok(await this.db.from('billing_accounts').upsert(patch));
+  }
+  async userByCustomer(customerId) {
+    const row = ok(await this.db.from('billing_accounts').select('user_id').eq('stripe_customer_id', customerId).maybeSingle());
+    return row?.user_id ?? null;
+  }
+  // The balance change and its ledger line happen together in the database (see apply_credit in schema.sql).
+  async applyCredit({ userId, deltaMicro, kind, sessionId = null, eventId = null, note = '' }) {
+    return Number(ok(await this.db.rpc('apply_credit', { p_user: userId, p_delta: deltaMicro, p_kind: kind, p_session: sessionId, p_event: eventId, p_note: note })));
+  }
+
   async addMemory({ scope, teamId, subjectId, authorId, sessionId, note }) {
     ok(await this.db.from('memories').insert({ kind: 'note', scope, team_id: teamId, subject_id: subjectId, author_id: authorId, session_id: sessionId, body: note }));
   }

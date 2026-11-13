@@ -12,7 +12,7 @@ const h = (tag, attrs = {}, ...kids) => {
   return el;
 };
 const app = $('#app');
-const state = { sb: null, user: null, token: null, name: '', team: null, hasKey: false, ws: null, people: [], tab: 'people', live: null, target: 'lead', memory: [], history: [] };
+const state = { sb: null, user: null, token: null, name: '', team: null, hasKey: false, billing: null, ws: null, people: [], tab: 'people', live: null, target: 'lead', memory: [], history: [] };
 
 function toast(message) {
   const t = h('div', { class: 'toast' }, message);
@@ -49,8 +49,35 @@ async function loadAccount() {
   state.team = rows?.[0]?.teams ?? null;
   if (!state.team) return viewOnboarding();
   state.hasKey = Boolean((await sb.rpc('has_api_key')).data);
+  await loadBilling();
   connect();
   viewMain();
+  // Back from paying: Stripe tells the server a moment later, so look again a few times.
+  const back = new URLSearchParams(location.search).get('billing');
+  if (back) {
+    history.replaceState(null, '', location.pathname);
+    state.tab = 'settings';
+    toast(back === 'done' ? 'Payment received. Your balance updates in a few seconds.' : 'Nothing was charged.');
+    if (back === 'done') for (const wait of [1500, 4000, 9000]) setTimeout(async () => { await loadBilling(); render(); }, wait);
+    render();
+  }
+}
+
+// Plan, balance and what is for sale. Null when the server sells nothing.
+async function loadBilling() {
+  try {
+    const res = await fetch('/api/billing', { headers: { authorization: `Bearer ${state.token}` } });
+    state.billing = res.ok ? await res.json() : null;
+  } catch { state.billing = null; }
+}
+// A session can start on your own key, or on credits if you subscribe.
+function startBlocker() {
+  const b = state.billing;
+  if (state.hasKey) return null;
+  if (!b?.hosted) return 'Add your API key under Settings before you start a session.';
+  if (!b.active) return 'Subscribe under Settings to start a session, or save your own API key there to run for free.';
+  if (b.credits <= 0) return 'You are out of credits. Add more under Settings.';
+  return null;
 }
 
 function viewAuth(mode = 'in') {
@@ -133,6 +160,7 @@ function onEvent(e) {
   if (e.type === 'session') { state.live = newLive(e); state.target = 'lead'; return; }
   const L = state.live;
   if (!L) return;
+  if (e.type === 'credits') { if (state.billing) { state.billing.credits = e.balance; state.billing.creditsText = e.text; } return; }
   if (e.type === 'spawn') L.agents.set(e.agent.id, { ...e.agent, status: 'starting', label: '' });
   else if (e.type === 'agent') { const a = L.agents.get(e.id); if (a) Object.assign(a, { status: e.status, label: e.label, deviceName: e.deviceName ?? a.deviceName }); }
   else if (e.type === 'lead') L.lead = e.label || e.status;
@@ -169,11 +197,13 @@ function sessionPanel() {
   if (!L || (!L.running && !L.summary)) {
     return h('section', { class: 'card' },
       h('h2', {}, 'Start a session'),
-      h('p', { class: 'muted small' }, 'The lead plans the work and sends agents to the computers your team has connected. A session runs on the API key of whoever starts it.'),
-      !state.hasKey && h('p', { class: 'error' }, 'Add your API key under Settings before you start a session.'),
+      h('p', { class: 'muted small' }, state.hasKey || !state.billing?.hosted
+        ? 'The lead plans the work and sends agents to the computers your team has connected. A session runs on the API key of whoever starts it.'
+        : `The lead plans the work and sends agents to the computers your team has connected. Whoever starts a session pays for it. You have ${state.billing.creditsText} of credits.`),
+      startBlocker() && h('p', { class: 'error' }, startBlocker()),
       h('form', { onsubmit: (ev) => { ev.preventDefault(); const goal = $('#goal-input').value.trim(); if (goal) { say({ t: 'start', goal }); draft = ''; } } },
         h('textarea', { id: 'goal-input', rows: 3, placeholder: 'What should the swarm do?' }),
-        h('div', {}, h('button', { class: 'primary', type: 'submit', disabled: !state.hasKey }, 'Start'))));
+        h('div', {}, h('button', { class: 'primary', type: 'submit', disabled: Boolean(startBlocker()) }, 'Start'))));
   }
   // A teammate's session you have not joined: you are told it exists, and nothing of what is in it.
   const me = state.people.find((p) => p.id === state.user.id);
@@ -290,12 +320,37 @@ function settingsTab() {
     const out = await res.json();
     if (!res.ok) { err.textContent = out.error; return false; }
     state.hasKey = method === 'POST';
+    await loadBilling();
     render();
     return true;
   };
+  const b = state.billing;
+  const pay = async (path, body) => {
+    const res = await fetch(path, { method: 'POST', headers: { authorization: `Bearer ${state.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) });
+    const out = await res.json();
+    if (!res.ok) { err.textContent = out.error; return; }
+    location.href = out.url;   // Stripe's own page takes the card
+  };
+  const plan = b?.hosted && h('div', {},
+    h('h3', {}, 'Plan and credits'),
+    !b.payments
+      ? h('p', { class: 'muted small' }, 'Payments are not set up on this server yet.')
+      : b.active
+        ? h('div', {},
+          h('p', {}, 'Balance: ', h('b', {}, b.creditsText), b.periodEnd ? h('span', { class: 'muted small' }, `  Next ${`$${b.plan.creditsUsd}`} of credits on ${new Date(b.periodEnd).toLocaleDateString()}.`) : null),
+          h('div', { class: 'row pay' }, b.topups.map((usd) => h('button', { onclick: () => pay('/api/billing/checkout', { kind: 'topup', amount: usd }) }, `Add $${usd}`)),
+            h('button', { class: 'link', onclick: () => pay('/api/billing/portal') }, 'Change card or cancel')))
+        : h('div', {},
+          h('p', { class: 'small' }, `$${b.plan.usd} a month. Each month adds $${b.plan.creditsUsd} of credits, and unused credits carry over. Sessions you start are charged for the tokens they use.`),
+          b.credits > 0 ? h('p', { class: 'muted small' }, `You still have ${b.creditsText} of credits from before. They are usable again once you subscribe.`) : null,
+          h('div', {}, h('button', { class: 'primary', onclick: () => pay('/api/billing/checkout', { kind: 'subscribe' }) }, 'Subscribe'))),
+    b.hasOwnKey ? h('p', { class: 'muted small' }, 'You have your own API key saved, so your sessions run on it and cost no credits.') : null);
   return h('div', {},
-    h('h3', {}, 'Your Anthropic API key'),
-    h('p', { class: 'muted small' }, 'Sessions you start run on your key. It is encrypted on the server and never shown again, and teammates cannot use it for their own sessions.'),
+    plan,
+    h('h3', {}, b?.hosted ? 'Or use your own Anthropic API key' : 'Your Anthropic API key'),
+    h('p', { class: 'muted small' }, b?.hosted
+      ? 'With a key saved, sessions you start run on it for free and use no credits. It is encrypted on the server and never shown again, and teammates cannot use it for their own sessions.'
+      : 'Sessions you start run on your key. It is encrypted on the server and never shown again, and teammates cannot use it for their own sessions.'),
     state.hasKey
       ? h('p', {}, 'A key is saved. ', h('button', { class: 'link', onclick: () => keyCall('DELETE') }, 'Remove it'))
       : h('form', { onsubmit: (ev) => { ev.preventDefault(); keyCall('POST', { key: new FormData(ev.target).get('key') }); } },
@@ -304,8 +359,7 @@ function settingsTab() {
     h('h3', {}, 'Team'),
     h('p', { class: 'small' }, `${state.team.name}. Invite code: `, h('code', {}, state.team.invite_code)),
     h('h3', {}, 'Desktop app'),
-    h('p', { class: 'muted small' }, 'To connect a computer, put this address under "cloud" in the desktop app\'s swarm.config.json and sign in there with this account:'),
-    h('p', {}, h('code', {}, location.origin)));
+    h('p', { class: 'muted small' }, 'To connect a computer, open the Senju app on it, choose "With my team", and sign in with this account.'));
 }
 
 boot().catch((err) => { app.replaceChildren(h('p', { class: 'center error' }, `Could not start: ${err.message}`)); });

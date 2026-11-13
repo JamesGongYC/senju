@@ -336,9 +336,9 @@ function refreshBar() {
   go.hidden = state === 'planning';
   if (state === 'idle') {
     go.textContent = 'Run';
-    prompt.disabled = team.on && team.account !== 'signed_in';
+    prompt.disabled = !modeChosen || (team.on && team.account !== 'signed_in');
     go.hidden = prompt.disabled;
-    prompt.placeholder = team.on && team.account !== 'signed_in' ? 'Sign in to your team to start'
+    prompt.placeholder = !modeChosen ? 'Choose how to work to start' : team.on && team.account !== 'signed_in' ? 'Sign in to your team to start'
       : (demo ? 'Demo mode: type anything and press Enter' : agents.size ? 'Done. What next?' : team.on ? `What should the swarm do for ${team.name}?` : 'What should the swarm do?') + (returnKey ? `   (${returnKey} hides and shows this bar)` : '');
   } else if (state === 'planning') {
     prompt.placeholder = 'Starting...';
@@ -361,6 +361,31 @@ function setState(next) {
   refreshBar();
   placeAll();
   renderThread();
+}
+
+// ---- Each launch: work on this Mac, or with the team ----------------------------------------------
+let modeChosen = false;
+function renderModeChoice(last) {
+  const box = $('account');
+  box.hidden = false;
+  box.innerHTML = '';
+  add(box, 'div', 'acct-title', 'How do you want to work this time?');
+  const row = add(box, 'div', 'mode-choice');
+  const options = [
+    ['local', 'On this Mac', 'No account. Agents run here on your own API key.'],
+    ['team', 'With my team', 'Sign in. Share a session across your team\'s computers.'],
+  ];
+  if (last === 'team') options.reverse();   // the one used last time comes first
+  const buttons = options.map(([mode, title, note]) => {
+    const b = add(row, 'button', '');
+    add(b, 'b', '', title);
+    add(b, 'span', '', note);
+    b.addEventListener('click', () => window.swarm.setMode(mode));
+    return b;
+  });
+  add(box, 'div', 'acct-note', 'You can switch later from the menu bar icon.');
+  recheckHit();
+  buttons[0].focus();
 }
 
 // ---- Team mode: account, consent, people ---------------------------------------------------------
@@ -466,8 +491,22 @@ window.swarm.onEvent((e) => {
         returnKey = e.hotkey;
         $('dismiss').title = `Hide (Esc). ${returnKey} brings it back. A running job keeps going.`;
       }
+      modeChosen = Boolean(e.mode);
       refreshBar();
-      prompt.focus();
+      if (modeChosen) prompt.focus(); else renderModeChoice(e.lastMode);
+      break;
+    case 'mode':
+      // The way of working was chosen or switched: start from a clean bar.
+      modeChosen = true;
+      team.on = Boolean(e.team);
+      if (!team.on) team.account = 'solo';
+      reset();
+      renderPeople([]);
+      $('account').hidden = true;
+      $('account').innerHTML = '';
+      recheckHit();
+      refreshBar();
+      if (!prompt.disabled) prompt.focus();
       break;
     case 'reset': reset(); break;
     case 'account': renderAccount(e); break;
