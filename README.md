@@ -57,7 +57,7 @@ What changes in the installed app:
 
 ## Team mode
 
-Several people can share one session across their computers: an agent can work on your Mac and a teammate's, its cursor shows on whichever screen it is called to, and everyone can talk to the lead. This needs a small server and a Supabase project. See [MULTIPLAYER.md](MULTIPLAYER.md).
+Several people can share one session across their computers: an agent can work on your Mac and a teammate's, its cursor shows on whichever screen it is called to, and everyone can talk to the lead. Each time the app opens it asks how you want to work: **On this Mac** (no account, your own API key) or **With my team** (sign in). You can switch from the menu bar icon whenever no job is running. To skip the question, set `"mode": "local"` or `"mode": "team"` in `swarm.config.json`. Team mode needs a small server and a Supabase project. See [MULTIPLAYER.md](MULTIPLAYER.md).
 
 ## Working together
 
@@ -91,7 +91,7 @@ npm run doctor
 **How it behaves**
 
 - **One app per worker.** The lead gives each desktop worker its own app, and desktop calls run one at a time across workers, since they share one keyboard.
-- **Windows are arranged.** The first time a worker uses an app, that app's window is moved into the worker's slot so nothing overlaps, and put back when the job ends (`"restoreWindows": false` to leave them). This needs your terminal allowed under Privacy & Security > Accessibility and Automation > System Events.
+- **Windows are arranged.** The first time a worker uses an app, that app's window is moved into the worker's slot so nothing overlaps, and put back when the job ends (`"restoreWindows": false` to leave them). The desktop driver moves the windows, using the permission you already gave it. Without the driver, this falls back to System Events, which needs the app you start Senju from allowed under Privacy & Security > Accessibility.
 - **Focus.** Workers act in the background where they can. For an app that ignores background input, a worker may bring it to the front for a single action, and never while you are typing.
 - **Messaging and mail.** Workers may read and draft. Every send needs your click on a card that shows the exact text and recipient. Note that Discord's terms prohibit automating a user account.
 - **Off limits unless you name them.** Terminal, System Settings, password managers, and banking apps.

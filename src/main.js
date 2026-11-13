@@ -10,9 +10,11 @@ import { Swarm } from './orchestrator.js';
 import { listWindows, processParents, pickWindow } from './windows.js';
 import { demoLlm, demoConnect, demoConfigServers } from './demo.js';
 import { placeWindow } from './place.js';
+import { callTool } from './mcp.js';
 import { makeLlm as claude } from './llm.js';
 import { ToolHost } from './toolhost.js';
 import { CloudClient, supabaseAuth } from './cloud.js';
+import { DEFAULT_HUB } from './config.js';
 
 const DEMO = process.argv.includes('--demo') || process.env.SWARM_DEMO === '1';
 
@@ -48,8 +50,10 @@ function saveKey(key) {
   return null;
 }
 const isMac = process.platform === 'darwin';
-// Team mode: a server address under "cloud" in swarm.config.json. Otherwise the app runs solo.
-const TEAM = !DEMO && Boolean(loadConfig().cloud?.url);
+// Two ways to work, chosen each time the app opens: on this Mac only, or signed in to a team.
+// TEAM is true once team mode is chosen; `mode` stays null until the choice is made.
+let TEAM = false;
+let mode = null;
 
 loadEnv();
 const config = loadConfig();
@@ -106,8 +110,20 @@ function makeLlm() {
 const agentsNow = () => (TEAM ? [...(host?.agents.values() ?? [])] : swarm?.agents ?? []);
 const isRunning = () => (TEAM ? Boolean(cloud?.running) : Boolean(swarm?.running));
 
+// Move an app's window to `rect`. The desktop driver does it when it is running, because it already
+// holds the Accessibility permission. Otherwise System Events does, which needs that permission
+// granted to whatever launched Senju. Resolves { ok, previous } or { ok: false, denied }.
+async function arrange(server, target, rect) {
+  const conn = (TEAM ? host?.shared : swarm?.shared)?.get(server);
+  if (target.id && conn?.tools?.some((t) => t.name === 'set_window_frame')) {
+    const res = await callTool(conn, 'set_window_frame', { pid: target.pid, window_id: target.id, x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.w), height: Math.round(rect.h) });
+    if (!res.isError) return { ok: true, previous: { x: target.x, y: target.y, w: target.w, h: target.h } };
+  }
+  return placeWindow(target.pid, rect);
+}
+
 function restoreWindows() {
-  if (config.restoreWindows !== false) for (const [pid, frame] of moved) placeWindow(pid, frame);
+  if (config.restoreWindows !== false) for (const [pid, was] of moved) arrange(was.server, { pid, id: was.id }, was.frame).catch(() => {});
   moved.clear();
 }
 
@@ -132,16 +148,63 @@ function deviceIdentity() {
   return { id, name, platform: process.platform };
 }
 
+const HUB = String(config.cloud?.url || DEFAULT_HUB).replace(/\/+$/, '');
+let teamRetry = null;
 async function startTeamMode() {
+  if (!TEAM) return;
   host = new ToolHost({ config, workspace, layout, idle: () => powerMonitor.getSystemIdleTime(), emit: send });
+  const mine = host;
   try {
-    const auth = await supabaseAuth(config.cloud.url, path.join(app.getPath('userData'), 'session.json'));
-    cloud = new CloudClient({ url: config.cloud.url, auth, host, device: deviceIdentity(), send, onSessionOver: restoreWindows });
+    const auth = await supabaseAuth(HUB, path.join(app.getPath('userData'), 'session.json'));
+    if (!TEAM || host !== mine) return;   // switched away while connecting
+    cloud = new CloudClient({ url: HUB, auth, host, device: deviceIdentity(), send, onSessionOver: restoreWindows });
     await cloud.start();
   } catch (err) {
-    send({ type: 'account', state: 'offline', url: config.cloud.url, error: `Could not reach the team server: ${err?.message ?? err}` });
-    setTimeout(startTeamMode, 15000);
+    if (!TEAM || host !== mine) return;
+    send({ type: 'account', state: 'offline', url: HUB, error: `Could not reach the team server: ${err?.message ?? err}` });
+    teamRetry = setTimeout(startTeamMode, 15000);
   }
+}
+
+// The last choice is remembered only to put it first next time; the question is asked on every launch
+// unless "mode" in swarm.config.json is "local" or "team".
+const modeFile = () => path.join(app.getPath('userData'), 'mode.json');
+function lastMode() { try { return JSON.parse(fs.readFileSync(modeFile(), 'utf8')).mode === 'team' ? 'team' : 'local'; } catch { return 'local'; } }
+
+async function setMode(next) {
+  next = next === 'team' ? 'team' : 'local';
+  if (DEMO) next = 'local';
+  if (next === mode) return send({ type: 'mode', mode, team: TEAM });
+  if (isRunning()) return send({ type: 'notice', message: 'A job is running. Stop it before switching.' });
+  // Leave the old mode completely before entering the new one.
+  clearTimeout(teamRetry);
+  const oldCloud = cloud, oldHost = host;
+  cloud = null; host = null;
+  TEAM = next === 'team';
+  mode = next;
+  try { await (oldCloud ? oldCloud.shutdown() : oldHost?.shutdown()); } catch { /* already gone */ }
+  if (!TEAM && swarm) { try { await swarm.shutdown(); } catch { /* nothing to close */ } swarm = null; }
+  try { fs.writeFileSync(modeFile(), JSON.stringify({ mode })); } catch { /* the choice just is not remembered */ }
+  buildTray();
+  send({ type: 'mode', mode, team: TEAM });
+  if (TEAM) startTeamMode();
+}
+
+function buildTray() {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: `Show prompt${hotkey ? `   ${pretty(hotkey)}` : ''}`, click: summon },
+    { label: 'Hide', click: dismiss },
+    { type: 'separator' },
+    { label: 'On this Mac', type: 'radio', checked: mode === 'local', click: () => { setMode('local'); summon(); } },
+    { label: 'With my team', type: 'radio', checked: mode === 'team', enabled: !DEMO, click: () => { setMode('team'); summon(); } },
+    { type: 'separator' },
+    { label: 'Open settings folder', click: () => shell.openPath(dataDir()) },
+    { label: 'Stop current job', click: () => (TEAM ? cloud?.cancel() : swarm?.cancel()) },
+    ...(TEAM ? [{ label: 'Sign out', click: () => cloud?.signOut() }] : []),
+    { type: 'separator' },
+    { label: 'Quit Senju', click: () => app.quit() },
+  ]));
 }
 
 function createWindow() {
@@ -165,7 +228,7 @@ function summon() {
   if (!win) return;
   win.show();
   win.focus();
-  send({ type: 'summon', demo: DEMO, hotkey: pretty(hotkey), team: TEAM });
+  send({ type: 'summon', demo: DEMO, hotkey: pretty(hotkey), team: TEAM, mode, lastMode: mode ? mode : lastMode() });
 }
 
 // Hide the overlay. A running job keeps going in the background unless
@@ -224,14 +287,14 @@ function startTracking() {
       const isDesktop = config.servers[agent.server]?.kind === 'desktop';
       if (isDesktop && agent.live && agent.slot && w && w !== agent.slot && w.pid && agent.placedPid !== w.pid && !tilingDenied) {
         agent.placedPid = w.pid;
-        const pid = w.pid;
-        placeWindow(pid, agent.slot).then((res) => {
-          if (res.ok) { if (!moved.has(pid)) moved.set(pid, res.previous); }
+        const pid = w.pid, server = agent.server;
+        arrange(server, w, agent.slot).then((res) => {
+          if (res.ok) { if (!moved.has(pid)) moved.set(pid, { frame: res.previous, id: w.id, server }); }
           else if (res.denied) {
             tilingDenied = true;
-            send({ type: 'notice', message: 'Could not arrange app windows. In System Settings > Privacy & Security, allow your terminal under Accessibility and under Automation > System Events.' });
+            send({ type: 'notice', message: 'Could not arrange app windows, so they stay where they are. Agents still work. To allow it, add the app you start Senju from to System Settings > Privacy & Security > Accessibility, then quit and reopen that app.' });
           }
-        });
+        }).catch(() => {});
       }
       if (!w) { targets[agent.id] = { app: appName ?? null }; return; }
       const tiled = w === agent.slot || own;
@@ -266,15 +329,8 @@ app.whenReady().then(() => {
   tray = new Tray(nativeImage.createEmpty());
   tray.setTitle('◎');
   tray.setToolTip('Senju');
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: `Show prompt${hotkey ? `   ${pretty(hotkey)}` : ''}`, click: summon },
-    { label: 'Hide', click: dismiss },
-    { label: 'Open settings folder', click: () => shell.openPath(dataDir()) },
-    { label: 'Stop current job', click: () => (TEAM ? cloud?.cancel() : swarm?.cancel()) },
-    ...(TEAM ? [{ label: 'Sign out', click: () => cloud?.signOut() }] : []),
-    { type: 'separator' },
-    { label: 'Quit Senju', click: () => app.quit() },
-  ]));
+  buildTray();
+  ipcMain.on('app:mode', (_e, next) => setMode(next));
 
   ipcMain.on('overlay:interactive', (_e, on) => win?.setIgnoreMouseEvents(!on, { forward: true }));
   ipcMain.on('swarm:dismiss', dismiss);
@@ -299,6 +355,7 @@ app.whenReady().then(() => {
   });
   ipcMain.on('swarm:submit', async (_e, goal) => {
     goal = String(goal ?? '').trim();
+    if (!mode) return;   // the way of working has not been chosen yet
     if (TEAM) { if (goal) cloud?.startSession(goal); return; }
     if (!goal || swarm?.running) return;
     if (!swarm) {
@@ -324,7 +381,9 @@ app.whenReady().then(() => {
     }
   });
 
-  if (TEAM) win.webContents.once('did-finish-load', startTeamMode);
+  // Demo and a fixed "mode" in the settings skip the question; otherwise the bar asks on every launch.
+  const fixed = DEMO ? 'local' : ['local', 'team'].includes(config.mode) ? config.mode : null;
+  if (fixed) win.webContents.once('did-finish-load', () => setMode(fixed));
 });
 
 app.on('will-quit', async () => {
