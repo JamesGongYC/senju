@@ -15,6 +15,13 @@ import { listSkills, readSkill, saveSkill } from './skills.js';
 
 const COLORS = ['#ff5d5d', '#4da3ff', '#39d98a', '#ffb648', '#b78bff', '#ff7ac8'];
 
+// One reply policy for the lead and every worker when the user writes in mid-job: answer first, in plain text
+// addressed to them, then act. A reply that acts without answering is discarded and asked again.
+const USER_FIRST = 'The user comes first. They may write to you at any moment mid-job, and their message is the most current instruction. Whenever a message from the user appears, your very next reply must start with one or two lines of plain text answering them, before any tool call.';
+const ANSWER_NOW = '(Answer the user now. Your visible reply must begin with one or two lines of plain text addressed to them, with the actual answer in it. Reasoning privately does not count: they only see your reply text. Then make your tool calls.)';
+const ANSWER_AGAIN = 'You made tool calls without answering the user, so that reply was discarded. Their message is above. Write your answer to them as plain text first (what is done, what is in progress, what is blocked, or whatever they asked), then make your tool calls.';
+const MAX_REPLY_NUDGES = 2;
+
 const LEAD_SYSTEM = (maxAgents, team = false) => `You are the lead of a swarm of agents working on the user's computer. The user keeps using the computer while the swarm works. You do not act on apps yourself. You spawn workers, watch what they find, and adjust the plan as you learn more.
 
 # Your loop
@@ -52,7 +59,7 @@ After each job you write down what the swarm learned as a skill, and at the star
 - Do not call save_skill during the job. You will be asked for a retrospective when it is over.
 
 # Talking with the user
-The user comes first. They may write to you at any moment mid-job, and their message is the most current instruction. Whenever a message from the user appears, your very next reply must start with one or two lines of plain text answering them, before any tool call. Then change the plan to match (spawn, redirect, or stop workers). If they ask about progress, say what is done, in progress, and blocked.
+${USER_FIRST} Then change the plan to match (spawn, redirect, or stop workers). If they ask about progress, say what is done, in progress, and blocked.
 Use ask_user only for a decision you cannot make and that would be costly to guess. Workers handle their own sign-ins and confirmations.
 Use user_task when the job needs the user to do something no worker can: connect or power a device, do something in the physical world, or act in an app no worker controls. Ask for it as early as you can, before workers start depending on it.
 Workers cooperate on their own too: they message each other with tell_agent, claim shared things so they do not collide, and post to the board. You do not need to relay between them.
@@ -147,7 +154,7 @@ The user is busy with other work, so each question costs them attention. Ask onl
 Before any action that cannot be undone or that other people will see (sending, posting, submitting a form, buying, deleting, overwriting a file you did not create), stop and call ask_user. Show exactly what will happen: the recipient, the final text, the amount, or the file names. Prepare everything first, so that a "yes" needs only one more step. "Yes" covers that one action only. If the user says no or changes something, apply the change and show the new version before acting.
 
 # Messages while you work
-The user or the lead agent may send you a message mid-job. It arrives marked "Message from the user" or "Message from the lead". Treat it as the most current instruction. Answer a user message with reply_to_user before your next action: a direct answer to what they asked, written to them ("I'm comparing Soundcore prices on Walmart; Amazon and Best Buy are done."), not a note to yourself. Only reply_to_user reaches them; your other text does not.
+The user or the lead agent may send you a message mid-job. It arrives marked "Message from the user" or "Message from the lead", and it is your most current instruction. ${USER_FIRST} Write it to them, not as a note to yourself ("I'm comparing Soundcore prices on Walmart; Amazon and Best Buy are done.").
 - If it corrects or narrows your subtask, adjust and keep going. Keep the work that is still valid; do not restart.
 - If it conflicts with your original subtask, the new message wins.
 - If it asks about progress, answer in one or two lines with what is done, what is in progress, and what is blocked, then continue.
@@ -174,11 +181,6 @@ const BOARD_TOOLS = [
 ];
 
 const HUMAN_TOOLS = [
-  {
-    name: 'reply_to_user',
-    description: 'Answer a message the user sent you mid-job. The text is shown to them in the chat, so write it to them: a direct answer to what they asked, in one to three plain sentences (what you are doing and why, what you found, what is left). Then carry on with your work in the same reply.',
-    input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-  },
   {
     name: 'ask_user',
     description: 'Ask the user a question and wait for the answer. Use for decisions you cannot make yourself and for confirming irreversible actions.',
@@ -323,7 +325,7 @@ const leadTools = (serverNames, memory = false) => [
 const NOTE = (items) => items.map((m) => m.from === 'board' ? `New on the shared board from "${m.name}": ${m.text}`
   : m.from === 'agent' ? `Message from agent "${m.name}": ${m.text}`
   : m.from === 'system' ? `Notice: ${m.text}`
-  : m.from === 'user' ? `Message from the user${m.name ? ` ${m.name}` : ''}: ${m.text}\n(Answer it now with reply_to_user, written to them, before your next action. Only that text reaches them.)`
+  : m.from === 'user' ? `Message from the user${m.name ? ` ${m.name}` : ''}: ${m.text}`
   : `Message from the lead: ${m.text}`).join('\n');
 
 
@@ -785,7 +787,7 @@ export class Swarm {
       return `"${e.name}" ${e.status}. Its report:\n${e.report}`;
     });
     const hasUser = lines.some((l) => l.startsWith('Message from the user'));
-    return lines.join('\n\n') + (hasUser ? '\n\n(Answer the user now. Your visible reply must begin with one or two lines of plain text addressed to them, with the actual answer in it. Reasoning privately does not count: they only see your reply text. Then make your tool calls.)' : '');
+    return lines.join('\n\n') + (hasUser ? `\n\n${ANSWER_NOW}` : '');
   }
 
   async waitForEvents(signal) {
@@ -931,8 +933,9 @@ export class Swarm {
     };
     const takeInbox = () => {
       const items = agent.inbox.splice(0);
-      if (items.some((m) => m.from === 'user')) agent.chatPending = 2;   // turns left to answer
-      return NOTE(items);
+      const fromUser = items.some((m) => m.from === 'user');
+      if (fromUser) agent.chatPending = true;
+      return NOTE(items) + (fromUser ? `\n\n${ANSWER_NOW}` : '');
     };
     const own = [];
     try {
@@ -962,6 +965,7 @@ export class Swarm {
       let cutoffs = 0;
       let shrunk = false;
       let reported = false;
+      let replyNudges = 0;
       const request = () => {
         if (agent.inbox.length) {
           const last = messages.at(-1);
@@ -1008,23 +1012,30 @@ export class Swarm {
           messages.push({ role: 'user', content: 'Your last reply hit the output limit and was cut off before its tool call was complete, so nothing was done. Carry on from where you were, and split long content across several smaller tool calls.' });
           continue;
         }
-        messages.push({ role: 'assistant', content: res.content });
-
         const text = res.content.filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
+        const calls = res.content.filter((b) => b.type === 'tool_use');
+        if (agent.chatPending && !text && replyNudges < MAX_REPLY_NUDGES && !res.content.some((b) => b.type === 'compaction')) {
+          // Same policy as the lead: the user wrote in and this reply acted without answering them. It is
+          // thrown away (its tool calls have not run) and the worker is asked again, more firmly.
+          replyNudges++;
+          this.trace(agent.name, 'interrupt', { note: 'reply had no text for the user; asking again' });
+          const last = messages.at(-1);
+          if (typeof last.content === 'string') last.content = [{ type: 'text', text: last.content }];
+          last.content.push({ type: 'text', text: ANSWER_AGAIN });
+          continue;
+        }
+        messages.push({ role: 'assistant', content: res.content });
         if (text) {
           finalText = text;
           update({ label: text.slice(0, 80) });
         }
-
-        const calls = res.content.filter((b) => b.type === 'tool_use');
-        // The person's answer comes through reply_to_user. A turn that only writes text (no tools) is a reply
-        // too; text written alongside tool calls is the worker's own note and stays out of the chat.
-        const replied = calls.some((c) => c.name === 'reply_to_user');
-        if (agent.chatPending && !replied) {
-          if (text && calls.length === 0) { agent.chatPending = 0; this.emit({ type: 'chat', from: agent.id, name: agent.name, text }); }
-          else agent.chatPending -= 1;
+        if (agent.chatPending) {
+          agent.chatPending = false;
+          replyNudges = 0;
+          // Last resort if it still said nothing, as for the lead: a factual line from what it is doing.
+          const next = calls.map((c) => c.name.replace(/^.*__/, '').replace(/_/g, ' '));
+          this.emit({ type: 'chat', from: agent.id, name: agent.name, text: text || `Working on: ${agent.goal.slice(0, 200)}${next.length ? ` Next step: ${next.join(', ')}.` : ''}` });
         }
-        const remind = Boolean(agent.chatPending) && !replied && calls.length > 0;
         if (calls.length === 0) {
           // A message that arrived during the final turn still gets a response.
           if (agent.inbox.length) { messages.push({ role: 'user', content: takeInbox() }); continue; }
@@ -1038,11 +1049,7 @@ export class Swarm {
           await this.gate(agent, update, signal);
           const say = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
           let out;
-          if (call.name === 'reply_to_user') {
-            const said = String(call.input?.text ?? '').trim();
-            if (said) { agent.chatPending = 0; this.emit({ type: 'chat', from: agent.id, name: agent.name, text: said }); this.trace(agent.name, 'message', { note: `to user: ${said}` }); }
-            out = say(said ? 'Sent to the user. Carry on.' : 'Nothing was sent: the text was empty.', !said);
-          } else if (call.name === 'board_post') {
+          if (call.name === 'board_post') {
             this.board.push({ from: agent.name, note: String(call.input?.note ?? '') });
             this.emit({ type: 'board', from: agent.name, note: String(call.input?.note ?? '') });
             // Blackboard push: every other working agent sees the post on its next step.
@@ -1188,7 +1195,6 @@ export class Swarm {
           this.trace(agent.name, 'tool', { name: call.name, isError: Boolean(out.isError), result: out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' ').slice(0, 1500) });
           results.push({ type: 'tool_result', tool_use_id: call.id, content: out.content, is_error: out.isError });
         }
-        if (remind) results.push({ type: 'text', text: 'The user is still waiting for an answer to their message. Answer it with reply_to_user now.' });
         messages.push({ role: 'user', content: results });
       }
 
@@ -1270,14 +1276,14 @@ export class Swarm {
       }
       const text = res.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
       const calls = res.content.filter((b) => b.type === 'tool_use');
-      if (this.leadChat && !text && replyNudges < 2 && !res.content.some((b) => b.type === 'compaction')) {
+      if (this.leadChat && !text && replyNudges < MAX_REPLY_NUDGES && !res.content.some((b) => b.type === 'compaction')) {
         // The user wrote in and the model acted without saying anything to them. That reply is
         // thrown away (its tool calls have not run) and the model is asked again, more firmly.
         replyNudges++;
         this.trace('lead', 'interrupt', { note: 'reply had no text for the user; asking again' });
         const last = messages.at(-1);
         if (typeof last.content === 'string') last.content = [{ type: 'text', text: last.content }];
-        last.content.push({ type: 'text', text: 'You made tool calls without answering the user, so that reply was discarded. Their message is above. Write your answer to them as plain text first (what is done, what is in progress, what is blocked, or whatever they asked), then make your tool calls.' });
+        last.content.push({ type: 'text', text: ANSWER_AGAIN });
         continue;
       }
       messages.push({ role: 'assistant', content: res.content });
