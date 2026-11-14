@@ -410,6 +410,17 @@ app.whenReady().then(() => {
 
   ipcMain.on('overlay:interactive', (_e, on) => win?.setIgnoreMouseEvents(!on, { forward: true }));
   ipcMain.on('swarm:dismiss', dismiss);
+  // Reset: back to a fresh bar. Forget the last job, close the windows finished workers left open and put
+  // moved app windows back. Never during a job.
+  ipcMain.on('swarm:reset', async () => {
+    if (isRunning()) return send({ type: 'notice', message: 'A job is running. Stop it first, then reset.' });
+    pointing.clear();
+    chromeTops.clear();
+    lastTargets = {};
+    if (!TEAM && swarm) { swarm.lastJob = null; await swarm.closeKept().catch(() => {}); }
+    restoreWindows();
+    send({ type: 'reset' });
+  });
   ipcMain.on('solo:key', (_e, key) => {
     const problem = saveKey(String(key ?? '').trim());
     send(problem ? { type: 'need_key', error: problem } : { type: 'key_saved' });
