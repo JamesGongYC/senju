@@ -146,8 +146,9 @@ await sleep(100);
 const ev = jamesMac.events;
 assert.equal(ev.find((e) => e.type === 'done').summary, 'Copied across both computers.');
 // One worker used both computers, and each call ran on the right one.
-assert.deepEqual(lindaMac.calls.map((c) => [c.tool, c.args.pid]), [['click', 7]]);
-assert.deepEqual(jamesMac.calls.map((c) => [c.tool, c.args.pid]), [['click', 9]]);
+// After each action the window is looked at on the same computer (list_windows finds it: this fake has none).
+assert.deepEqual(lindaMac.calls.map((c) => [c.tool, c.args.pid]), [['click', 7], ['list_windows', 7]]);
+assert.deepEqual(jamesMac.calls.map((c) => [c.tool, c.args.pid]), [['click', 9], ['list_windows', 9]]);
 assert.equal(lindaMac.opens[0].agent.name, 'Mover');
 // The cursor's computer follows the worker: Linda's first, then James's.
 const where = ev.filter((e) => e.type === 'agent' && e.status === 'acting' && e.device).map((e) => e.deviceName);

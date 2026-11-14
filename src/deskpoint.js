@@ -83,3 +83,24 @@ export async function showLaunched(conn, res) {
 
 // A desktop action refused because its window is on another Space or not on screen.
 export const OFF_SPACE = /off_space|not among the process's current AXWindows|Needs a visible window|not on screen|other Space/i;
+
+// After a desktop action: read the window it acted on, so the worker sees the result in the same tool result
+// instead of spending another model turn on get_window_state (the driver's own advice: act and observe in one
+// call). Returns the window state's tool result, or null when there is no window to read.
+export const ACTS = ACTIONS;
+export async function lookAfter(conn, agent, signal) {
+  let pid = agent.target?.pid, windowId = agent.target?.windowId;
+  if (!Number.isInteger(pid)) return null;
+  try {
+    if (!Number.isInteger(windowId)) {
+      const wins = (await callTool(conn, 'list_windows', { pid }, signal))?.structured?.windows?.filter((w) => w.pid === pid) ?? [];
+      windowId = (wins.find((w) => w.on_current_space && w.is_on_screen) ?? wins[0])?.window_id;
+      if (!Number.isInteger(windowId)) return null;
+      agent.target = { ...agent.target, windowId };
+    }
+    const res = await callTool(conn, 'get_window_state', widenWindowState('get_window_state', { pid, window_id: windowId }), signal);
+    if (!res || res.isError) return null;
+    rememberFrames(agent, 'get_window_state', res);
+    return res;
+  } catch { return null; }
+}

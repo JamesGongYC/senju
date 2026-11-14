@@ -566,5 +566,32 @@ function make(scripts, extra = {}) {
   await swarm.shutdown();
 }
 
+// Desktop: a batch of known actions in one reply runs in order, one call each, and the window is read once,
+// after the last of them; that reading comes back with the last result (no extra model turn to look).
+{
+  const desk = { command: process.execPath, args: [path.join(here, 'fake-desktop.mjs')], kind: 'desktop', shared: true, serial: true, about: 'fake Mac apps' };
+  const seen = {};
+  const swarm = new Swarm({
+    llm: fakeLlm({
+      lead: ({ turn, lastText }) => turn === 1 ? use('spawn_agent', { name: 'Calc', goal: 'compute 7+8', servers: ['desk'] })
+        : /No workers are running/.test(lastText) ? say('15') : use('wait'),
+      Calc: ({ turn, lastText, params }) => {
+        if (turn === 1) { seen.rules = params.system[0].text; return use('desk__get_window_state', { pid: 7, window_id: 70 }); }
+        if (turn === 2) return ['7', '+', '8', '='].map((key) => use('desk__press_key', { pid: 7, window_id: 70, key }));
+        seen.after = params.messages.at(-1).content;
+        return say('15');
+      },
+    }),
+    config: { model: 'fake', maxAgents: 2, maxSteps: 8, servers: { desk } }, workspace: '/tmp', emit: () => {},
+  });
+  await swarm.run('compute');
+  const texts = seen.after.filter((b) => b.type === 'tool_result').map((b) => b.content.map((c) => c.text).join(' | '));
+  assert.equal(texts.length, 4);
+  assert.deepEqual(texts.slice(0, 3), ['Pressed 7', 'Pressed +', 'Pressed 8']);   // no reading between known steps
+  assert.match(texts[3], /^Pressed = \| The window now .* \| STATE #2 display=7\+8=$/);   // one reading, after the last
+  assert.match(seen.rules, /make them all in one reply/);
+  await swarm.shutdown();
+}
+
 console.log('smoke test passed');
 process.exit(0);

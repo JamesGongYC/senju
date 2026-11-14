@@ -8,7 +8,7 @@ import { pointBefore } from './point.js';
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds, onYouTube } from './adskip.js';
-import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE } from './deskpoint.js';
+import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS } from './deskpoint.js';
 import { READ_ONLY, noteTarget, userActive } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
 import { listSkills, readSkill, saveSkill } from './skills.js';
@@ -68,7 +68,8 @@ Text you write is shown to the user, so keep it short and plain.${team ? TEAM_LE
 const DESKTOP_RULES = `
 # Working in desktop apps
 You can drive native Mac apps (the user's real apps, with their real accounts) through the desktop tools. The user is using this computer at the same time.
-- Work in one window at a time. Read its state before you act, and read it again after any action that should change it. Never assume an action worked: some apps echo a write without applying it, so check the result on screen.
+- Work in one window at a time. Read its state before you first act. After your actions the window's new state comes back with the last action's result, so check the result there instead of calling get_window_state again. Never assume an action worked: some apps echo a write without applying it, so check the result on screen.
+- When you already know the next several actions and none depends on what the one before shows (keys on a keypad, the fields of a form, a menu and then its item), make them all in one reply: one action per tool call, in order. Each still happens visibly, one after another, and the window is read once after the last. Element tokens stay valid only until the window is read again, so take them all from the same reading, and do not batch past a step that opens a dialog, changes the page or decides what you do next.
 - Act on elements in the background whenever the tools allow it. If an app ignores background input, you may bring it to the front for that single action, then let focus go back. Keep any such moment as short as possible and never hold the front window across several steps.
 - If the app is not open, open it. If it shows a sign-in, a permission prompt or a system dialog, hand off to the user.
 - Stay inside the apps your subtask needs. Do not touch Terminal or other shells, System Settings, password managers, banking or payment apps, or the Senju bar and cards, unless the user's goal names them explicitly. Leave other agents' windows alone.
@@ -1044,7 +1045,7 @@ export class Swarm {
         }
 
         const results = [];
-        for (const call of calls) {
+        for (const [callIndex, call] of calls.entries()) {
           if (signal.aborted) throw new Error('cancelled');
           await this.gate(agent, update, signal);
           const say = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
@@ -1177,6 +1178,13 @@ export class Swarm {
                     if (shown?.windowId) this.noteTarget(agent, { pid, window_id: shown.windowId });
                     if (shown?.note) res = { ...res, content: [...res.content, { type: 'text', text: shown.note }] };
                   }
+                }
+                // Act and look in one step: after the last desktop action of this reply, read the window and hand it
+                // back with the result, so the worker does not spend a model turn on get_window_state to check.
+                if (spec.kind === 'desktop' && ACTS.test(hit.tool) && !res.isError && this.config.lookAfterActions !== false
+                  && !calls.slice(callIndex + 1).some((c) => lookup.get(c.name)?.conn === hit.conn)) {
+                  const seen = await lookAfter(hit.conn, agent, signal);
+                  if (seen) res = { ...res, content: [...res.content, { type: 'text', text: 'The window now (read for you after this action, with fresh element tokens; no need to call get_window_state to check):' }, ...seen.content], structured: res.structured };
                 }
                 // A page that just opened under a cookie banner or pop-up: close it the way a person would, with
                 // the cursor, and give the worker the page as it is now.

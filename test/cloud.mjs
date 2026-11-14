@@ -95,8 +95,9 @@ for (const d of [J, L]) {
   assert.equal(d.ui.find((e) => e.type === 'done').summary, 'Carried over.');
 }
 // Each call ran on the right computer.
-assert.deepEqual(L.calls.map((c) => c[0]), ['get_window_state', 'type_text']);
-assert.deepEqual(J.calls.map((c) => c[0]), ['click']);
+// After each action the window is read again on the same computer, and handed back with the action's result.
+assert.deepEqual(L.calls.map((c) => c[0]), ['get_window_state', 'type_text', 'get_window_state']);
+assert.deepEqual(J.calls.map((c) => c[0]).filter((t) => t !== 'list_windows' && t !== 'get_window_state'), ['click']);
 // Docking: the agent's computer is named in its events, so the other screen can hide its cursor.
 const onLinda = J.ui.find((e) => e.type === 'agent' && e.device === 'd-linda');
 assert.deepEqual([onLinda.deviceName, onLinda.server], ['Linda Mac', 'desktop']);
