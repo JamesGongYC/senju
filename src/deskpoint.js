@@ -86,21 +86,35 @@ export const OFF_SPACE = /off_space|not among the process's current AXWindows|Ne
 
 // After a desktop action: read the window it acted on, so the worker sees the result in the same tool result
 // instead of spending another model turn on get_window_state (the driver's own advice: act and observe in one
-// call). Returns the window state's tool result, or null when there is no window to read.
+// call). The app's window list is checked too, so a window that closed or opened is said plainly instead of
+// the worker being shown a stale picture. Returns { res, note } or null when there is no window to read.
 export const ACTS = ACTIONS;
 export async function lookAfter(conn, agent, signal) {
-  let pid = agent.target?.pid, windowId = agent.target?.windowId;
+  const pid = agent.target?.pid;
   if (!Number.isInteger(pid)) return null;
   try {
-    if (!Number.isInteger(windowId)) {
-      const wins = (await callTool(conn, 'list_windows', { pid }, signal))?.structured?.windows?.filter((w) => w.pid === pid) ?? [];
-      windowId = (wins.find((w) => w.on_current_space && w.is_on_screen) ?? wins[0])?.window_id;
-      if (!Number.isInteger(windowId)) return null;
-      agent.target = { ...agent.target, windowId };
+    const wins = (await callTool(conn, 'list_windows', { pid }, signal))?.structured?.windows?.filter((w) => w.pid === pid) ?? [];
+    const known = (agent.knownWindows ??= new Map());
+    const isNew = (w) => known.has(pid) && !known.get(pid).has(w.window_id);
+    let windowId = agent.target?.windowId;
+    const notes = [];
+    if (wins.length) {
+      const stillThere = Number.isInteger(windowId) && wins.some((w) => w.window_id === windowId);
+      const fresh = wins.filter(isNew);
+      if (!stillThere) {
+        const next = fresh[0] ?? wins.find((w) => w.on_current_space && w.is_on_screen) ?? wins[0];
+        if (Number.isInteger(windowId)) notes.push(`The window you were working in (window_id ${windowId}) is no longer open. This is "${next.title ?? ''}" (window_id ${next.window_id}).`);
+        windowId = next.window_id;
+      } else if (fresh.length) {
+        notes.push(`New window${fresh.length > 1 ? 's' : ''} opened in this app: ${fresh.map((w) => `"${w.title ?? ''}" (window_id ${w.window_id})`).join(', ')}. Shown below is still window_id ${windowId}; read the new one with get_window_state if your work moved there.`);
+      }
+      known.set(pid, new Set(wins.map((w) => w.window_id)));
     }
+    if (!Number.isInteger(windowId)) return null;
+    agent.target = { ...agent.target, windowId };
     const res = await callTool(conn, 'get_window_state', widenWindowState('get_window_state', { pid, window_id: windowId }), signal);
     if (!res || res.isError) return null;
     rememberFrames(agent, 'get_window_state', res);
-    return res;
+    return { res, note: notes.join(' ') };
   } catch { return null; }
 }

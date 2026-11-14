@@ -1045,6 +1045,7 @@ export class Swarm {
         }
 
         const results = [];
+        let batchStopped = null;   // the desktop server whose batch stopped at a failure in this reply
         for (const [callIndex, call] of calls.entries()) {
           if (signal.aborted) throw new Error('cancelled');
           await this.gate(agent, update, signal);
@@ -1127,11 +1128,14 @@ export class Swarm {
               update({ status: 'acting', server: hit.conn.name, label: `${hit.conn.name}: ${hit.tool}` });
               const spec = this.config.servers[hit.conn.name] ?? {};
               const desktopAct = spec.kind === 'desktop' && !READ_ONLY.test(hit.tool);
-              if (spec.kind === 'desktop') this.noteTarget(agent, call.input);
+              // A batch of known actions stops at its first failure, so later steps never act out of order.
+              const skipped = batchStopped === hit.conn && desktopAct;
+              if (spec.kind === 'desktop' && !skipped) this.noteTarget(agent, call.input);
               // The person watches each cursor: a script that clicks, types or changes the page would act unseen.
               const scripted = hit.tool === 'browser_evaluate' && /\.click\(|dispatchEvent|\.value\s*=|\.submit\(|\.focus\(|innerHTML\s*=|textContent\s*=/.test(String(call.input?.function ?? ''));
-              if (scripted) { out = say('Not run: browser_evaluate is for reading the page only. Do each click with browser_click, each entry with browser_type and each key with browser_press_key, one action per call, so the person can watch your cursor do it.', true); }
-              const run = scripted ? null : async () => {
+              if (skipped) out = say('Not run: an earlier action in this reply failed, so the rest of the batch was stopped. Look at the window state returned with that failure and decide again.', true);
+              else if (scripted) { out = say('Not run: browser_evaluate is for reading the page only. Do each click with browser_click, each entry with browser_type and each key with browser_press_key, one action per call, so the person can watch your cursor do it.', true); }
+              const run = scripted || skipped ? null : async () => {
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 if (desktopAct) { await this.quiet(agent, update, signal); this.lastDesktopAction = Date.now(); }
@@ -1179,12 +1183,14 @@ export class Swarm {
                     if (shown?.note) res = { ...res, content: [...res.content, { type: 'text', text: shown.note }] };
                   }
                 }
-                // Act and look in one step: after the last desktop action of this reply, read the window and hand it
-                // back with the result, so the worker does not spend a model turn on get_window_state to check.
-                if (spec.kind === 'desktop' && ACTS.test(hit.tool) && !res.isError && this.config.lookAfterActions !== false
-                  && !calls.slice(callIndex + 1).some((c) => lookup.get(c.name)?.conn === hit.conn)) {
+                // Act and look in one step: after the last desktop action of this reply (or the one that failed, which
+                // ends the batch), read the window and hand it back with the result, so the worker does not spend a
+                // model turn on get_window_state to check.
+                const lastHere = !calls.slice(callIndex + 1).some((c) => lookup.get(c.name)?.conn === hit.conn);
+                if (spec.kind === 'desktop' && ACTS.test(hit.tool) && res.isError) batchStopped = hit.conn;
+                if (spec.kind === 'desktop' && ACTS.test(hit.tool) && (lastHere || res.isError) && this.config.lookAfterActions !== false) {
                   const seen = await lookAfter(hit.conn, agent, signal);
-                  if (seen) res = { ...res, content: [...res.content, { type: 'text', text: 'The window now (read for you after this action, with fresh element tokens; no need to call get_window_state to check):' }, ...seen.content], structured: res.structured };
+                  if (seen) res = { ...res, content: [...res.content, { type: 'text', text: `${seen.note ? `${seen.note}\n` : ''}The window now (read for you after this action, with fresh element tokens; no need to call get_window_state to check):` }, ...seen.res.content], structured: res.structured };
                 }
                 // A page that just opened under a cookie banner or pop-up: close it the way a person would, with
                 // the cursor, and give the worker the page as it is now.
