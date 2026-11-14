@@ -147,7 +147,7 @@ The user is busy with other work, so each question costs them attention. Ask onl
 Before any action that cannot be undone or that other people will see (sending, posting, submitting a form, buying, deleting, overwriting a file you did not create), stop and call ask_user. Show exactly what will happen: the recipient, the final text, the amount, or the file names. Prepare everything first, so that a "yes" needs only one more step. "Yes" covers that one action only. If the user says no or changes something, apply the change and show the new version before acting.
 
 # Messages while you work
-The user or the lead agent may send you a message mid-job. It arrives marked "Message from the user" or "Message from the lead". Treat it as the most current instruction. Reply to a user message in one or two plain lines before you carry on; your reply is shown to them.
+The user or the lead agent may send you a message mid-job. It arrives marked "Message from the user" or "Message from the lead". Treat it as the most current instruction. Answer a user message with reply_to_user before your next action: a direct answer to what they asked, written to them ("I'm comparing Soundcore prices on Walmart; Amazon and Best Buy are done."), not a note to yourself. Only reply_to_user reaches them; your other text does not.
 - If it corrects or narrows your subtask, adjust and keep going. Keep the work that is still valid; do not restart.
 - If it conflicts with your original subtask, the new message wins.
 - If it asks about progress, answer in one or two lines with what is done, what is in progress, and what is blocked, then continue.
@@ -174,6 +174,11 @@ const BOARD_TOOLS = [
 ];
 
 const HUMAN_TOOLS = [
+  {
+    name: 'reply_to_user',
+    description: 'Answer a message the user sent you mid-job. The text is shown to them in the chat, so write it to them: a direct answer to what they asked, in one to three plain sentences (what you are doing and why, what you found, what is left). Then carry on with your work in the same reply.',
+    input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+  },
   {
     name: 'ask_user',
     description: 'Ask the user a question and wait for the answer. Use for decisions you cannot make yourself and for confirming irreversible actions.',
@@ -318,7 +323,7 @@ const leadTools = (serverNames, memory = false) => [
 const NOTE = (items) => items.map((m) => m.from === 'board' ? `New on the shared board from "${m.name}": ${m.text}`
   : m.from === 'agent' ? `Message from agent "${m.name}": ${m.text}`
   : m.from === 'system' ? `Notice: ${m.text}`
-  : m.from === 'user' ? `Message from the user${m.name ? ` ${m.name}` : ''}: ${m.text}`
+  : m.from === 'user' ? `Message from the user${m.name ? ` ${m.name}` : ''}: ${m.text}\n(Answer it now with reply_to_user, written to them, before your next action. Only that text reaches them.)`
   : `Message from the lead: ${m.text}`).join('\n');
 
 
@@ -926,7 +931,7 @@ export class Swarm {
     };
     const takeInbox = () => {
       const items = agent.inbox.splice(0);
-      if (items.some((m) => m.from === 'user')) agent.chatPending = true;
+      if (items.some((m) => m.from === 'user')) agent.chatPending = 2;   // turns left to answer
       return NOTE(items);
     };
     const own = [];
@@ -1009,10 +1014,17 @@ export class Swarm {
         if (text) {
           finalText = text;
           update({ label: text.slice(0, 80) });
-          if (agent.chatPending) { agent.chatPending = false; this.emit({ type: 'chat', from: agent.id, name: agent.name, text }); }
         }
 
         const calls = res.content.filter((b) => b.type === 'tool_use');
+        // The person's answer comes through reply_to_user. A turn that only writes text (no tools) is a reply
+        // too; text written alongside tool calls is the worker's own note and stays out of the chat.
+        const replied = calls.some((c) => c.name === 'reply_to_user');
+        if (agent.chatPending && !replied) {
+          if (text && calls.length === 0) { agent.chatPending = 0; this.emit({ type: 'chat', from: agent.id, name: agent.name, text }); }
+          else agent.chatPending -= 1;
+        }
+        const remind = Boolean(agent.chatPending) && !replied && calls.length > 0;
         if (calls.length === 0) {
           // A message that arrived during the final turn still gets a response.
           if (agent.inbox.length) { messages.push({ role: 'user', content: takeInbox() }); continue; }
@@ -1026,7 +1038,11 @@ export class Swarm {
           await this.gate(agent, update, signal);
           const say = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
           let out;
-          if (call.name === 'board_post') {
+          if (call.name === 'reply_to_user') {
+            const said = String(call.input?.text ?? '').trim();
+            if (said) { agent.chatPending = 0; this.emit({ type: 'chat', from: agent.id, name: agent.name, text: said }); this.trace(agent.name, 'message', { note: `to user: ${said}` }); }
+            out = say(said ? 'Sent to the user. Carry on.' : 'Nothing was sent: the text was empty.', !said);
+          } else if (call.name === 'board_post') {
             this.board.push({ from: agent.name, note: String(call.input?.note ?? '') });
             this.emit({ type: 'board', from: agent.name, note: String(call.input?.note ?? '') });
             // Blackboard push: every other working agent sees the post on its next step.
@@ -1172,6 +1188,7 @@ export class Swarm {
           this.trace(agent.name, 'tool', { name: call.name, isError: Boolean(out.isError), result: out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' ').slice(0, 1500) });
           results.push({ type: 'tool_result', tool_use_id: call.id, content: out.content, is_error: out.isError });
         }
+        if (remind) results.push({ type: 'text', text: 'The user is still waiting for an answer to their message. Answer it with reply_to_user now.' });
         messages.push({ role: 'user', content: results });
       }
 
