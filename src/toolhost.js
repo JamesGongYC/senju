@@ -38,7 +38,7 @@ export class ToolHost {
       await Promise.all(Object.entries(this.config.servers ?? {}).map(async ([name, spec]) => {
         try {
           const conn = await this.connect(name, resolveSpec(spec, this.workspace));
-          out[name] = { about: spec.about ?? name, kind: spec.kind ?? null, app: spec.app ?? null, tools: conn.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) };
+          out[name] = { about: spec.about ?? name, kind: spec.kind ?? null, app: spec.app ?? null, tile: spec.tile ?? null, tools: conn.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) };
           if (spec.shared) this.shared.set(name, conn); else await conn.close();
         } catch (err) {
           this.emit({ type: 'notice', message: spec.setup && /ENOENT|not found/i.test(String(err?.message ?? err))

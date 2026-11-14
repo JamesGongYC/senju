@@ -253,6 +253,13 @@ function reset() {
 }
 
 function spawn(info) {
+  // Team mode replays a session's spawns when someone joins or reconnects, after they may already have seen
+  // them live: keep the one chip and cursor per worker instead of drawing a second, frozen pair.
+  const known = agents.get(info.id);
+  if (known) {
+    Object.assign(known, { name: info.name ?? known.name, color: info.color ?? known.color, goal: info.goal ?? known.goal });
+    return;
+  }
   const el = document.createElement('div');
   el.className = 'cursor gone';
   el.innerHTML = `<div class="body">${cursorSvg(info.color)}<div class="tag" style="background:${info.color}"></div></div>`;
@@ -391,6 +398,8 @@ function placeCards() {
 }
 
 function addQuestion(q) {
+  // Team mode replays open questions when someone joins or reconnects: one card per question.
+  if (q.qid != null && questions.some((x) => x.qid === q.qid)) return;
   q.el = makeCard(q);
   questions.push(q);
   placeCards();

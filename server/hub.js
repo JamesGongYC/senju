@@ -333,6 +333,8 @@ export class Hub {
       s.swarm.addServer(full, {
         about: `${info.about ?? server}. Runs on "${client.device.name}", ${client.user.name}'s computer`,
         kind: info.kind, app: info.app, shared: false,
+        // A browser server: the swarm moves the cursor and types visibly only for tiled browsers.
+        tile: info.tile ?? ((info.tools ?? []).some((t) => t.name === 'browser_navigate') ? 'playwright' : undefined),
       }, info.tools ?? []);
     }
   }
@@ -363,7 +365,7 @@ export class Hub {
       client: {
         callTool: async ({ name, arguments: args }, _schema, opts) => {
           const res = await this.rpc(at.client, { t: 'call', conn, tool: name, args }, opts?.signal);
-          return { content: res.content ?? [], isError: Boolean(res.isError) };
+          return { content: res.content ?? [], isError: Boolean(res.isError), structuredContent: res.structured };
         },
       },
       close: async () => this.send(at.client, { t: 'close', conn }),
