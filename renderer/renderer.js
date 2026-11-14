@@ -1,7 +1,7 @@
 // Overlay UI: prompt bar, agent chips (also the chat targets), chat thread,
 // request cards over each agent's window, result card, and the ghost cursors.
 const $ = (id) => document.getElementById(id);
-const bar = $('bar'), prompt = $('prompt'), go = $('go'), stop = $('stop');
+const bar = $('bar'), prompt = $('prompt'), go = $('go'), stop = $('stop'), resetBtn = $('reset');
 const chips = $('chips'), card = $('card'), toasts = $('toasts'), cursorsEl = $('cursors'), dot = $('state-dot');
 const thread = $('thread');
 
@@ -422,6 +422,7 @@ function refreshBar() {
   const busy = state !== 'idle';
   prompt.disabled = state === 'planning';
   stop.hidden = !busy;
+  resetBtn.hidden = busy || !(agents.size || [...logs.values()].some((l) => l.length) || !card.hidden);
   go.hidden = state === 'planning';
   if (state === 'idle') {
     go.textContent = 'Run';
@@ -597,7 +598,7 @@ window.swarm.onEvent((e) => {
       refreshBar();
       if (!prompt.disabled) prompt.focus();
       break;
-    case 'reset': reset(); break;
+    case 'reset': reset(); refreshBar(); recheckHit(); break;
     case 'account': renderAccount(e); break;
     case 'need_key': renderKeyPrompt(e); break;
     case 'key_saved': {
@@ -684,8 +685,10 @@ bar.addEventListener('submit', (ev) => {
   prompt.value = '';
 });
 stop.addEventListener('click', () => window.swarm.cancel());
+// Back to a fresh bar: the app clears its side (last job, leftover windows), and says reset.
+resetBtn.addEventListener('click', () => { if (state === 'idle') window.swarm.reset(); });
 $('dismiss').addEventListener('click', () => window.swarm.dismiss());
-$('card-close').addEventListener('click', () => { card.hidden = true; recheckHit(); });
+$('card-close').addEventListener('click', () => { card.hidden = true; recheckHit(); refreshBar(); });
 window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') window.swarm.dismiss(); });
 window.addEventListener('resize', placeAll);
 new ResizeObserver(placeAll).observe($('dock'));

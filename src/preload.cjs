@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('swarm', {
   pause: (id, paused) => ipcRenderer.send('swarm:pause', { id, paused }),
   stopAgent: (id) => ipcRenderer.send('swarm:stop-agent', id),
   dismiss: () => ipcRenderer.send('swarm:dismiss'),
+  reset: () => ipcRenderer.send('swarm:reset'),
   signIn: (email, password) => ipcRenderer.send('team:signin', { email, password }),
   signOut: () => ipcRenderer.send('team:signout'),
   consent: (allow, watch = false) => ipcRenderer.send('team:consent', { allow, watch }),
