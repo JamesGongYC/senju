@@ -5,6 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { connectServer, buildToolset, callTool, resolveSpec } from './mcp.js';
 import { pointBefore } from './point.js';
+import { clearPopups } from './popups.js';
+import { clickOnScreenKey } from './keys.js';
+import { watchAds, onYouTube } from './adskip.js';
+import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE } from './deskpoint.js';
 import { READ_ONLY, noteTarget, userActive } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
 import { listSkills, readSkill, saveSkill } from './skills.js';
@@ -32,6 +36,8 @@ Your first plan is a guess. Change it whenever a report or message shows the gue
 
 # Spawning well
 - Give each worker a short name of one or two words, a self-contained goal with everything it needs to know, and only the tool servers it needs.
+- When the user asks to find a website, page or link, the worker's goal must say to open it on screen by clicking the result, not only report its address.
+- Keep each goal short (under about 80 words): what to do, where, and what to report. A long goal is slow to write and every worker waits for it. To pass on a method from a skill, list the skill in the worker's skills instead of copying it into the goal.
 - If a worker needs another worker's output, list that worker in depends_on. A dependent worker still starts right away, does its own setup (such as getting the user signed in to its site), and then waits for the result. Declare real dependencies, but do not serialize work that could run in parallel. No circular dependencies.
 - Set needs_user for a worker likely to need the user (a site that needs sign-in, a purchase, a message sent in their name), and word its goal so it reaches that step early. The user should be asked near the start, not interrupted repeatedly.
 - Each browser worker has its own separate browser session, so each one that needs a signed-in site needs its own sign-in from the user. Prefer giving all work on one signed-in site to a single worker unless splitting it saves real time.
@@ -93,6 +99,11 @@ Shared workspace folder for files: ${workspace}
 
 # How to work
 - Act through your tools. Do only your subtask. Do not redo another agent's work.
+- A browser worker's window is already open on a blank tab. Start with browser_navigate; do not list tabs first.
+- When a game or tool shows its own on-screen keyboard or keypad (Wordle, a calculator), click its keys with browser_click, one key per call, and click its Enter key to submit each row, rather than typing on the keyboard.
+- When your subtask is to find a website, page, profile or link, finish by opening it the way a person would: click the matching search result's link with browser_click (not browser_navigate to the address), check the page that opens is the right one, and leave it open on screen. Do not stop at reading or reporting the address.
+- Clear anything that covers the page yourself, without asking the user: a cookie banner (accept or reject it), a newsletter or sign-up pop-up, an ad overlay or a chat bubble in the way. Click its close, "No thanks" or accept button with browser_click so the person sees the cursor do it, then carry on. Never close a box that asks the user to approve, pay or sign in for your task.
+- The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate, but never use a script to click, type or play for you, and never do many actions in one call.
 - The swarm shares a board. Use board_post to share a finding or partial result another agent could use now, without waiting until you finish. Posts by others reach you automatically on your next step, marked "New on the shared board"; use them if relevant and ignore them otherwise. board_read shows the whole board.
 - Before each tool call, say in at most eight words what you are doing.
 - Long content goes in pieces. When you have to enter a lot of text (a write-up, a long document), put it in through several tool calls of at most about 800 words each, not one giant call. A single oversized call gets cut off and nothing is saved.
@@ -425,6 +436,14 @@ export class Swarm {
    * - compact the whole history into a summary at a higher threshold,
    * - cache the conversation prefix so each step re-reads it at a fraction of the cost.
    */
+  // How hard the model thinks per call ("effort" in swarm.config.json: a level, or { lead, worker }).
+  // Lower effort answers sooner; the default (no setting) is the model's own.
+  effortParams(role) {
+    const e = this.config.effort;
+    const level = typeof e === 'string' ? e : e?.[role];
+    return level ? { output_config: { effort: level } } : {};
+  }
+
   longRunParams() {
     const c = this.config.context ?? {};
     if (!this.serverContext || c.enabled === false) return {};
@@ -945,7 +964,7 @@ export class Swarm {
           last.content.push({ type: 'text', text: takeInbox() });
         }
         if (!this.serverContext || this.config.context?.enabled === false) prune(messages);   // client-side fallback only
-        return { model: this.config.model, max_tokens: WORKER_MAX_TOKENS, system, tools: allTools, messages, ...this.longRunParams() };
+        return { model: this.config.workerModel ?? this.config.model, max_tokens: WORKER_MAX_TOKENS, system, tools: allTools, messages, ...this.longRunParams(), ...this.effortParams('worker') };
       };
 
       for (let step = 0; step < maxSteps; step++) {
@@ -1085,17 +1104,69 @@ export class Swarm {
               const spec = this.config.servers[hit.conn.name] ?? {};
               const desktopAct = spec.kind === 'desktop' && !READ_ONLY.test(hit.tool);
               if (spec.kind === 'desktop') this.noteTarget(agent, call.input);
-              const run = async () => {
+              // The person watches each cursor: a script that clicks, types or changes the page would act unseen.
+              const scripted = hit.tool === 'browser_evaluate' && /\.click\(|dispatchEvent|\.value\s*=|\.submit\(|\.focus\(|innerHTML\s*=|textContent\s*=/.test(String(call.input?.function ?? ''));
+              if (scripted) { out = say('Not run: browser_evaluate is for reading the page only. Do each click with browser_click, each entry with browser_type and each key with browser_press_key, one action per call, so the person can watch your cursor do it.', true); }
+              const run = scripted ? null : async () => {
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 if (desktopAct) { await this.quiet(agent, update, signal); this.lastDesktopAction = Date.now(); }
+                // A key the page shows as an on-screen button (a game keyboard, a calculator keypad): tap it with the cursor.
+                if (spec.tile === 'playwright' && hit.tool === 'browser_press_key' && this.config.pointing !== false) {
+                  const tapped = await clickOnScreenKey(hit.conn, call.input?.key, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
+                  if (tapped) return { ...tapped, content: [{ type: 'text', text: `Clicked the on-screen "${call.input?.key}" key.` }, ...tapped.content] };
+                }
                 // A browser window of its own: send the ghost cursor to where this action lands first.
                 if (spec.tile === 'playwright' && this.config.pointing !== false) await pointBefore(hit.conn, hit.tool, call.input, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
-                const res = await callTool(hit.conn, hit.tool, call.input, signal);
+                const deskEmit = (point) => this.emit({ type: 'point', agentId: agent.id, point });
+                // Only on this Mac, through the real desktop driver: never take over a teammate's screen.
+                const canShow = spec.kind === 'desktop' && !this.team && hit.conn.tools?.some((t) => t.name === 'bring_to_front');
+                // The first time a worker reads or acts on an app it did not launch (already open, maybe on another
+                // desktop), take the person's screen there so they can watch.
+                const firstPid = Number.isInteger(call.input?.pid) ? call.input.pid : null;
+                if (canShow && firstPid && hit.tool !== 'launch_app' && this.config.showApps !== false && !(agent.shownPids ??= new Set()).has(firstPid) && /^(get_window_state|click|double_click|right_click|type_text|set_value|press_key|hotkey|scroll)$/.test(hit.tool)) {
+                  agent.shownPids.add(firstPid);
+                  const shown = await reveal(hit.conn, firstPid, call.input?.window_id ?? null, true).catch(() => null);
+                  if (shown?.windowId) this.noteTarget(agent, { pid: firstPid, window_id: shown.windowId });
+                }
+                if (spec.kind === 'desktop' && this.config.pointing !== false) await pointDesk(agent, hit.tool, call.input, deskEmit);
+                const input = spec.kind === 'desktop' ? widenWindowState(hit.tool, call.input) : call.input;
+                let res = await callTool(hit.conn, hit.tool, input, signal);
                 if (desktopAct) this.lastDesktopAction = Date.now();
+                // On YouTube: from now on, skip each video ad with the cursor as soon as its Skip button shows.
+                if (spec.tile === 'playwright' && !res.isError && !hit.conn.adWatch && this.config.skipAds !== false && onYouTube(res, call.input)) {
+                  watchAds(hit.conn, (point) => this.emit({ type: 'point', agentId: agent.id, point }), (label) => this.trace(agent.name, 'note', { note: `skipped a video ad ("${label}")` }));
+                }
+                if (spec.kind === 'desktop') {
+                  rememberFrames(agent, hit.tool, res);
+                  // A launched app should be seen opening: show its window and let the cursor and slot follow it.
+                  if (canShow && hit.tool === 'launch_app' && !res.isError) {
+                    const shown = await showLaunched(hit.conn, res);
+                    if (shown?.pid) { (agent.shownPids ??= new Set()).add(shown.pid); this.noteTarget(agent, { pid: shown.pid, ...(shown.windowId ? { window_id: shown.windowId } : {}) }); }
+                    if (shown?.note) res = { ...res, content: [...res.content, { type: 'text', text: shown.note }] };
+                  }
+                  // Refused because the window is on another Space: bring it here, and say so, so the retry works.
+                  const errText = res.isError ? res.content.filter((c) => c.type === 'text').map((c) => c.text).join(' ') : '';
+                  const pid = Number.isInteger(call.input?.pid) ? call.input.pid : agent.target?.pid;
+                  if (canShow && errText && OFF_SPACE.test(errText) && pid && (agent.revealTries ?? 0) < 3) {
+                    agent.revealTries = (agent.revealTries ?? 0) + 1;
+                    const shown = await reveal(hit.conn, pid, call.input?.window_id ?? agent.target?.windowId ?? null).catch(() => null);
+                    if (shown?.windowId) this.noteTarget(agent, { pid, window_id: shown.windowId });
+                    if (shown?.note) res = { ...res, content: [...res.content, { type: 'text', text: shown.note }] };
+                  }
+                }
+                // A page that just opened under a cookie banner or pop-up: close it the way a person would, with
+                // the cursor, and give the worker the page as it is now.
+                if (spec.tile === 'playwright' && hit.tool === 'browser_navigate' && !res.isError && this.config.closePopups !== false) {
+                  const cleared = await clearPopups(hit.conn, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
+                  if (cleared?.result) {
+                    this.trace(agent.name, 'note', { note: `closed ${cleared.closed.join(', ')}` });
+                    return { ...cleared.result, content: [{ type: 'text', text: `Opened ${call.input?.url ?? 'the page'}. It opened under a ${cleared.closed.join(' and then a ')}, so that was closed for you. The page now:` }, ...cleared.result.content] };
+                  }
+                }
                 return res;
               };
-              out = spec.serial ? await this.inTurn(hit.conn, run) : await run();
+              if (run) out = spec.serial ? await this.inTurn(hit.conn, run) : await run();
             }
           }
           this.trace(agent.name, 'tool', { name: call.name, isError: Boolean(out.isError), result: out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' ').slice(0, 1500) });
@@ -1152,10 +1223,10 @@ export class Swarm {
     const skills = this.skills ? await this.skills.list() : [];
     const memoryNotes = this.memory ? await this.memory.notes() : '';
     const skillList = skills.length ? `\n\nSkills from earlier jobs (read the ones that fit before you plan):\n${skills.map((k) => `- ${k.name}: ${k.description}`).join('\n')}` : '';
-    const messages = [{ role: 'user', content: `Tool servers workers can use:\n${serverList || '(none)'}\nShared workspace folder for files: ${this.workspace}${this.team?.brief ? `\n\n${this.team.brief}` : ''}${memoryNotes ? `\n\nRemembered from earlier sessions:\n${memoryNotes}` : ''}${skillList}\n\nGoal: ${goal}` }];
+    const messages = [{ role: 'user', content: `Tool servers workers can use:\n${serverList || '(none)'}\nShared workspace folder for files: ${this.workspace}${this.team?.brief ? `\n\n${this.team.brief}` : ''}${memoryNotes ? `\n\nRemembered from earlier sessions:\n${memoryNotes}` : ''}${skillList}${this.lastJob ? `\n\nThe previous job, for context only (the new goal may follow on from it, e.g. "continue", "do it again", "now send that to Bob"; if it does not, ignore this):\nGoal: ${this.lastJob.goal}\nResult: ${this.lastJob.summary}` : ''}\n\nGoal: ${goal}` }];
     this.leadCtx = { messages, system };
-    let nudges = 0;
     let replyNudges = 0;
+    let nudged = false;   // told once that workers are still running; after that a text-only reply just keeps waiting
     let lastText = '';
 
     const request = () => {
@@ -1166,7 +1237,7 @@ export class Swarm {
         last.content.push({ type: 'text', text: `Updates:\n${this.drainEvents()}` });
       }
       if (this.leadChat) lead('thinking', 'reading your message');
-      return { model: this.config.plannerModel ?? this.config.model, max_tokens: LEAD_MAX_TOKENS, system, tools: this.leadToolset(), messages, ...this.longRunParams() };
+      return { model: this.config.plannerModel ?? this.config.model, max_tokens: LEAD_MAX_TOKENS, system, tools: this.leadToolset(), messages, ...this.longRunParams(), ...this.effortParams('lead') };
     };
 
     for (let turn = 0; turn < MAX_LEAD_TURNS; turn++) {
@@ -1209,10 +1280,18 @@ export class Swarm {
 
       if (calls.length === 0) {
         if (this.events.length) { messages.push({ role: 'user', content: `Updates:\n${this.drainEvents()}` }); continue; }
-        const live = this.live();
-        if (live.length && nudges < 2) {
-          nudges++;
-          messages.push({ role: 'user', content: `${live.length} worker${live.length > 1 ? 's are' : ' is'} still running (${live.map((a) => a.name).join(', ')}). Call wait to keep supervising, or stop them, before you finish.` });
+        // Workers still running: a reply with no tool call (often an answer to the user's chat) does not end
+        // the job. The swarm waits for the next event on the lead's behalf, as if it had called wait.
+        if (this.live().length && !nudged) {
+          nudged = true;
+          messages.push({ role: 'user', content: `${this.live().length} worker${this.live().length > 1 ? 's are' : ' is'} still running (${this.live().map((a) => a.name).join(', ')}). Call wait to keep supervising, or stop them, before you finish.` });
+          continue;
+        }
+        if (this.live().length) {
+          lead('waiting', `watching ${this.live().length} worker${this.live().length > 1 ? 's' : ''}`);
+          await this.waitForEvents(signal);
+          const news = this.drainEvents();
+          messages.push({ role: 'user', content: `You replied without a tool call while workers are still running, so the swarm kept waiting for you. ${news ? `Updates:\n${news}` : 'Nothing new.'}\n\n${this.roster()}${this.live().length ? '\nCall wait to keep supervising, or stop_agent to end a worker.' : '\nNo workers are running.'}` });
           continue;
         }
         return lastText || 'Finished.';
@@ -1295,7 +1374,7 @@ export class Swarm {
       await this.closeKept();
       this.emit({ type: 'reset' });
       this.emit({ type: 'state', state: 'planning' });
-      if (this.learning) await this.learning;   // let the last job's retrospective land first
+      if (this.learning) await Promise.race([this.learning, new Promise((r) => setTimeout(r, 3000))]);   // give the last retrospective a moment, never a long wait
       this.tracer = this.traceDir ? new Tracer(this.traceDir, goal) : null;
       if (!this.catalog) await this.loadCatalog();
       this.emit({ type: 'state', state: 'running' });
@@ -1303,10 +1382,13 @@ export class Swarm {
       this.trace('lead', 'end', { reason: 'reported', report: summary });
       this.trace('swarm', 'usage', { note: JSON.stringify(this.usage) });
       this.emit({ type: 'done', summary });
+      this.lastJob = { goal, summary: String(summary).slice(0, 2000) };
       finished = true;
     } catch (err) {
       this.trace('lead', 'error', { message: signal.aborted ? 'cancelled by the user' : `${err?.status ? `HTTP ${err.status} ` : ''}${err?.message ?? err}` });
       this.emit({ type: 'error', message: signal.aborted ? 'Cancelled.' : String(err?.message ?? err) });
+      const progress = this.agents.map((a) => `${a.name}: ${a.status}${a.label ? ` (${a.label})` : ''}`).join('; ');
+      this.lastJob = { goal, summary: `${signal.aborted ? 'Stopped by the user before finishing.' : `Failed: ${err?.message ?? err}.`}${progress ? ` Workers then: ${progress}` : ''}`.slice(0, 2000) };
     } finally {
       // The lead is done or gone: stop whatever is still running and let it clean up.
       this.abort.abort();
