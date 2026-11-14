@@ -566,8 +566,6 @@ window.swarm.onEvent((e) => {
   switch (e.type) {
     case 'summon':
       demo = Boolean(e.demo);
-      $('running-on').hidden = !e.runningOn;
-      $('running-on').textContent = e.runningOn ? `Running on ${e.runningOn}` : '';
       team.on = Boolean(e.team);
       if (e.hotkey) {
         returnKey = e.hotkey;

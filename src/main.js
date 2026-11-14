@@ -132,9 +132,6 @@ function cursorMove(agentId, point) {
   return { ...spot, kind: 'click', ms: 0 };
 }
 
-// "runningOn" in swarm.config.json (or SENJU_RUNNING_ON) puts a "Running on <name>" tag on the bar.
-const RUNNING_ON = String(process.env.SENJU_RUNNING_ON ?? config.runningOn ?? '').trim().slice(0, 40);
-
 const send = (event) => {
   if (!win || win.isDestroyed()) return;
   if (event.type === 'point') {
@@ -288,7 +285,7 @@ function summon() {
   if (!win) return;
   win.show();
   win.focus();
-  send({ type: 'summon', runningOn: RUNNING_ON, demo: DEMO, hotkey: pretty(hotkey), team: TEAM, mode, lastMode: mode ? mode : lastMode() });
+  send({ type: 'summon', demo: DEMO, hotkey: pretty(hotkey), team: TEAM, mode, lastMode: mode ? mode : lastMode() });
 }
 
 // Hide the overlay. A running job keeps going in the background unless

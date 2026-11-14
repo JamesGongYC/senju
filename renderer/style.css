@@ -16,9 +16,6 @@ html, body { margin: 0; height: 100%; background: transparent; overflow: hidden;
 #prompt:disabled { color: var(--dim); }
 button { font: inherit; font-size: 13px; color: var(--text); border: 1px solid var(--line); background: rgba(255, 255, 255, 0.06); border-radius: 999px; padding: 6px 12px; cursor: pointer; }
 button:hover { background: rgba(255, 255, 255, 0.14); }
-#running-on { flex: none; display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(57, 255, 20, 0.45); background: rgba(57, 255, 20, 0.1); color: #b9ffab; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
-#running-on::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: #39ff14; box-shadow: 0 0 8px #39ff14; }
-#running-on[hidden] { display: none; }
 #go { background: #f2f3f5; color: #16171c; border-color: transparent; font-weight: 600; }
 #go:hover { background: #fff; }
 #stop { border-color: rgba(255, 93, 93, 0.6); color: #ff8d8d; }

@@ -1,8 +1,7 @@
 {
-  "runningOn": "Ripple",
   "model": "claude-sonnet-5-5",
   "plannerModel": "claude-sonnet-5-5",
-  "maxAgents": 4,
+  "maxAgents": 100,
   "maxSteps": 300,
   "tokenBudget": 40000000,
   "context": {
