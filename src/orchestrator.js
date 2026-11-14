@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { connectServer, buildToolset, callTool, resolveSpec } from './mcp.js';
+import { pointBefore } from './point.js';
 import { READ_ONLY, noteTarget, userActive } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
 import { listSkills, readSkill, saveSkill } from './skills.js';
@@ -385,6 +386,7 @@ export class Swarm {
     this.layout = layout;
     this.catalog = null;      // server name -> [{name, description}]
     this.shared = new Map();  // long-lived connections for servers marked shared
+    this.kept = new Set();    // finished workers' own connections, kept open until the next job
     this.abort = null;
     this.agents = [];
     this.board = [];
@@ -1087,6 +1089,8 @@ export class Swarm {
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 if (desktopAct) { await this.quiet(agent, update, signal); this.lastDesktopAction = Date.now(); }
+                // A browser window of its own: send the ghost cursor to where this action lands first.
+                if (spec.tile === 'playwright' && this.config.pointing !== false) await pointBefore(hit.conn, hit.tool, call.input, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
                 const res = await callTool(hit.conn, hit.tool, call.input, signal);
                 if (desktopAct) this.lastDesktopAction = Date.now();
                 return res;
@@ -1132,7 +1136,9 @@ export class Swarm {
       update({ status: cancelled ? 'cancelled' : 'error', label: cancelled ? 'stopped' : String(err?.message ?? err).slice(0, 80) });
       return cancelled ? 'Stopped before finishing.' : `Failed: ${err?.message ?? err}`;
     } finally {
-      await Promise.all(own.map((c) => c.close()));
+      // A finished worker's own windows stay on screen so the result can be seen; the next job or shutdown closes them.
+      if (this.config.keepWindows === false || signal.aborted) await Promise.all(own.map((c) => c.close().catch(() => {})));
+      else for (const c of own) this.kept.add(c);
       agent.pids = [];
     }
   }
@@ -1286,6 +1292,7 @@ export class Swarm {
     this.leadCtx = null;
     let finished = false;
     try {
+      await this.closeKept();
       this.emit({ type: 'reset' });
       this.emit({ type: 'state', state: 'planning' });
       if (this.learning) await this.learning;   // let the last job's retrospective land first
@@ -1320,8 +1327,15 @@ export class Swarm {
     this.abort?.abort();
   }
 
+  async closeKept() {
+    const all = [...this.kept];
+    this.kept.clear();
+    await Promise.all(all.map((c) => Promise.resolve(c.close()).catch(() => {})));
+  }
+
   async shutdown() {
     this.cancel();
+    await this.closeKept();
     this.learnAbort?.abort();
     await Promise.all([...this.shared.values()].map((c) => c.close()));
     this.shared.clear();

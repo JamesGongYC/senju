@@ -32,6 +32,27 @@ function recheckHit() {
 }
 document.querySelectorAll('.hit').forEach(wireHit);
 
+// enter/leave alone can leave the overlay stuck taking the mouse: a card that moves or disappears
+// from under the pointer never fires mouseleave, and then your clicks stop reaching your apps.
+// So also decide from what is actually under the pointer, on every (forwarded) mouse move and
+// whenever the overlay's contents change.
+let lastPointer = null;
+function hitAt(x, y) { return Boolean(document.elementFromPoint(x, y)?.closest('.hit')); }
+function syncHit() {
+  if (dragging) return;
+  const want = lastPointer ? hitAt(lastPointer.x, lastPointer.y) : false;
+  if (want !== overHit) { overHit = want; window.swarm.setInteractive(want); }
+}
+document.addEventListener('mousemove', (e) => { lastPointer = { x: e.clientX, y: e.clientY }; syncHit(); }, { passive: true });
+document.addEventListener('mouseleave', () => { lastPointer = null; if (!dragging) { overHit = false; window.swarm.setInteractive(false); } });
+window.addEventListener('blur', () => { if (!dragging && !document.querySelector('.hit:hover')) { overHit = false; window.swarm.setInteractive(false); } });
+let syncQueued = false;
+new MutationObserver(() => {
+  if (syncQueued) return;
+  syncQueued = true;
+  requestAnimationFrame(() => { syncQueued = false; syncHit(); });
+}).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
+
 const add = (parent, tag, cls, text) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -43,7 +64,64 @@ const add = (parent, tag, cls, text) => {
 // ---- Cursors ------------------------------------------------------------------
 
 function cursorSvg(color) {
-  return `<svg viewBox="0 0 24 24"><path d="M4 2.5l15.5 8.2-6.6 1.9-2.6 6.6z" fill="${color}" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
+  return `<svg class="arrow" viewBox="0 0 24 24"><path d="M4 2.5l15.5 8.2-6.6 1.9-2.6 6.6z" fill="${color}" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>` +
+    `<svg class="ibeam" viewBox="0 0 24 24"><path d="M8 3.5h8M12 3.5v17M8 20.5h8" fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/>` +
+    `<path d="M8 3.5h8M12 3.5v17M8 20.5h8" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round"/></svg>`;
+}
+
+// One continuous glide from wherever the cursor is now (CSS restarts a transition from the current spot, even
+// mid-flight). Quick but easy to follow: 160 to 380 ms by distance. Returns the glide time.
+function moveCursor(agent, spot, ms, easing = 'cubic-bezier(0.25, 0.8, 0.35, 1)') {
+  const x = Math.round(spot.x), y = Math.round(spot.y);
+  const p = agent.pos;
+  if (p && Math.abs(p.x - x) < 1 && Math.abs(p.y - y) < 1) return 0;
+  const dur = ms ?? (p ? Math.round(Math.min(380, 160 + Math.hypot(x - p.x, y - p.y) * 0.22)) : 300);
+  agent.el.style.transition = `transform ${dur}ms ${easing}, opacity 0.4s`;
+  agent.el.style.transform = `translate(${x}px, ${y}px)`;
+  agent.pos = { x, y };
+  return dur;
+}
+
+// Plays one action from main ('cursor' event): glide there, then a tap for a click, or for typing an I-beam that
+// runs along the field (or the address bar, with the url appearing in it) while the letters go in.
+function playCursor(agent, e) {
+  agent.target = { ...(agent.target ?? {}), x: e.x, y: e.y };
+  agent.el.classList.add('pinned');
+  clearTimeout(agent.playTimer);
+  agent.el.classList.remove('typing', 'tapping');
+  if (e.kind === 'type' && e.from) {
+    const glide = moveCursor(agent, e.from);
+    const ms = Math.max(80, e.ms || 0);
+    agent.busyUntil = Date.now() + glide + ms + 60;
+    agent.playTimer = setTimeout(() => {
+      agent.el.classList.add('typing');
+      if (e.text) typeBubble(e.from, e.text, ms);
+      moveCursor(agent, e, ms, 'linear');
+      agent.playTimer = setTimeout(() => { agent.el.classList.remove('typing'); agent.busyUntil = 0; }, ms + 60);
+    }, glide);
+    return;
+  }
+  const glide = moveCursor(agent, e);
+  agent.busyUntil = Date.now() + glide;
+  agent.playTimer = setTimeout(() => {
+    agent.busyUntil = 0;
+    agent.el.classList.add('tapping');
+    agent.playTimer = setTimeout(() => agent.el.classList.remove('tapping'), 220);
+  }, glide);
+}
+
+// The url being typed into the browser's address bar: a pill over it whose letters appear over `ms`.
+function typeBubble(at, text, ms) {
+  const pill = add(cursorsEl, 'div', 'type-bubble');
+  pill.style.transform = `translate(${Math.round(at.x - 12)}px, ${Math.round(at.y - 13)}px)`;
+  const started = performance.now();
+  const step = () => {
+    const n = Math.min(text.length, Math.ceil((text.length * (performance.now() - started)) / ms));
+    pill.textContent = text.slice(0, n);
+    if (n < text.length) requestAnimationFrame(step);
+    else setTimeout(() => pill.remove(), 700);
+  };
+  requestAnimationFrame(step);
 }
 
 function restSpot(index, count) {
@@ -73,7 +151,9 @@ function place(agent, index) {
   else if (agent.target && agent.target.x != null) spot = agent.target;
   else if (agent.target) spot = laneSpot(index);          // has an app but no visible window
   else spot = restSpot(index, agents.size);                // not using any app yet
-  agent.el.style.transform = `translate(${Math.round(spot.x)}px, ${Math.round(spot.y)}px)`;
+  // Mid-action (gliding to an element, typing) the action owns the cursor; otherwise glide to the spot.
+  if (!(agent.busyUntil > Date.now())) moveCursor(agent, spot);
+  if (resting || !active) agent.el.classList.remove('pinned');
   agent.el.classList.toggle('resting', resting || !active);
   agent.el.dataset.status = resting ? 'rest' : agent.status;
   const where = active && agent.target?.app ? agent.target.app : '';
@@ -179,7 +259,7 @@ function spawn(info) {
   // Start at the prompt bar so cursors appear to fly out of it.
   el.style.transform = `translate(${window.innerWidth / 2}px, 30px)`;
   cursorsEl.append(el);
-  const agent = { ...info, status: 'starting', label: '', el, chip: null, target: null };
+  const agent = { ...info, status: 'starting', label: '', el, chip: null, target: null, pos: { x: window.innerWidth / 2, y: 30 } };
   agents.set(info.id, agent);
   makeChip(agent);
   requestAnimationFrame(() => requestAnimationFrame(() => { el.classList.remove('gone'); placeAll(); }));
@@ -486,6 +566,8 @@ window.swarm.onEvent((e) => {
   switch (e.type) {
     case 'summon':
       demo = Boolean(e.demo);
+      $('running-on').hidden = !e.runningOn;
+      $('running-on').textContent = e.runningOn ? `Running on ${e.runningOn}` : '';
       team.on = Boolean(e.team);
       if (e.hotkey) {
         returnKey = e.hotkey;
@@ -539,6 +621,7 @@ window.swarm.onEvent((e) => {
       if (e.id === target && wasActive !== ACTIVE.includes(a.status)) renderThread();
       break;
     }
+    case 'cursor': { const a = agents.get(e.agentId); if (a) playCursor(a, e); break; }
     case 'targets':
       for (const [id, t] of Object.entries(e.targets)) { const a = agents.get(id); if (a) a.target = t; }
       placeAll();

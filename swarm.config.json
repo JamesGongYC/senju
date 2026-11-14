@@ -1,4 +1,5 @@
 {
+  "runningOn": "Ripple",
   "model": "claude-sonnet-5-5",
   "plannerModel": "claude-sonnet-5-5",
   "maxAgents": 4,
@@ -17,7 +18,9 @@
       "command": "bundled",
       "args": [
         "node_modules/@playwright/mcp/cli.js",
-        "--isolated"
+        "--isolated",
+        "--timeout-settle",
+        "100"
       ],
       "app": "Google Chrome",
       "shared": false,

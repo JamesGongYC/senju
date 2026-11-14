@@ -84,8 +84,68 @@ function notify(title, body) {
   new Notification({ title, body: String(body ?? '').slice(0, 240), silent: true }).show();
 }
 
+// Ghost cursors on what an agent is doing.
+// The orchestrator emits (src/point.js) { type: 'point', agentId, point } just before an action: an element's centre for click, type and
+// select, or just the verb for open (address bar), back (back button) and key (stay put). The cursor glides there
+// and STAYS, relative to that agent's window, until the next point: it never snaps back to a parking spot.
+const pointing = new Map();   // agentId -> { dx, dy } from its window's top-left, or { x, y } when there is no window
+const chromeTops = new Map(); // agentId -> height of the tab and address bars in that window, from measured points
+let lastTargets = {};
+const clampX = (x) => Math.max(0, Math.min(area.width - 20, x));
+const clampY = (y) => Math.max(0, Math.min(area.height - 20, y));
+function pointTarget(agentId, point) {
+  const t = lastTargets[agentId];
+  let x, y;
+  if (Number.isFinite(point?.screenX) && Number.isFinite(point?.screenY)) { x = point.screenX - area.x; y = point.screenY - area.y; }
+  else if (t?.rect && Number.isFinite(point?.x) && point.windowW) { x = t.rect.x + point.x * (t.rect.w / point.windowW); y = t.rect.y + point.y * (t.rect.h / (point.windowH || t.rect.h)); }
+  else return null;
+  return { x: clampX(x), y: clampY(y) };
+}
+
+// -> { x, y, from?, kind, ms, text? } in overlay px: where the cursor goes for this point, and how to play it.
+function cursorMove(agentId, point) {
+  const t = lastTargets[agentId];
+  const scale = t?.rect && point?.windowW ? t.rect.w / point.windowW : 1;
+  if (Number.isFinite(point?.chromeTop)) chromeTops.set(agentId, point.chromeTop);
+  const verb = point?.verb;
+  if (verb === 'open' || verb === 'back') {
+    if (!t?.rect) return null;
+    // Chrome's address bar sits about 25 px above the page; the back button is at its left end.
+    const y = t.rect.y + ((chromeTops.get(agentId) ?? 87) - 25) * scale;
+    if (verb === 'back') return { x: clampX(t.rect.x + 23 * scale), y: clampY(y), kind: 'click', ms: 0 };
+    const x = t.rect.x + Math.min(t.rect.w * 0.3, 360 * scale);
+    return { x: clampX(x), y: clampY(y), kind: 'type', ms: Number(point.typeMs) || 0, text: String(point.url ?? ''), from: { x: clampX(t.rect.x + 150 * scale), y: clampY(y) } };
+  }
+  if (verb === 'key') {
+    const at = lastTargets[agentId];
+    return at && Number.isFinite(at.x) ? { x: at.x, y: at.y, kind: 'key', ms: 0 } : null;
+  }
+  const spot = pointTarget(agentId, point);
+  if (!spot) return null;
+  if (verb === 'type' && point.w) {
+    // Start at the left of the field and run right as the letters appear, about 7 px a letter.
+    const half = (point.w * scale) / 2;
+    const from = { x: clampX(spot.x - half + 8 * scale), y: spot.y };
+    const end = Math.min(spot.x + half - 8 * scale, from.x + (point.chars ?? 0) * 7 * scale);
+    return { x: clampX(Math.max(from.x, end)), y: spot.y, from, kind: 'type', ms: Number(point.typeMs) || 0 };
+  }
+  return { ...spot, kind: 'click', ms: 0 };
+}
+
+// "runningOn" in swarm.config.json (or SENJU_RUNNING_ON) puts a "Running on <name>" tag on the bar.
+const RUNNING_ON = String(process.env.SENJU_RUNNING_ON ?? config.runningOn ?? '').trim().slice(0, 40);
+
 const send = (event) => {
   if (!win || win.isDestroyed()) return;
+  if (event.type === 'point') {
+    const move = cursorMove(event.agentId, event.point);
+    if (!move) return;
+    const rect = lastTargets[event.agentId]?.rect;
+    pointing.set(event.agentId, rect ? { dx: move.x - rect.x, dy: move.y - rect.y } : { x: move.x, y: move.y });
+    lastTargets = { ...lastTargets, [event.agentId]: { ...(lastTargets[event.agentId] ?? {}), x: move.x, y: move.y } };
+    win.webContents.send('swarm:event', { type: 'cursor', agentId: event.agentId, ...move });
+    return;
+  }
   // Hidden while a job runs: come back when the user is needed or the job is over.
   if ((event.type === 'ask' || event.type === 'done' || event.type === 'error' || event.type === 'consent') && !win.isVisible()) summon();
   if (event.type === 'consent') { shell.beep(); notify(`${event.session.owner.name} wants to use this Mac`, event.session.goal); }
@@ -228,7 +288,7 @@ function summon() {
   if (!win) return;
   win.show();
   win.focus();
-  send({ type: 'summon', demo: DEMO, hotkey: pretty(hotkey), team: TEAM, mode, lastMode: mode ? mode : lastMode() });
+  send({ type: 'summon', runningOn: RUNNING_ON, demo: DEMO, hotkey: pretty(hotkey), team: TEAM, mode, lastMode: mode ? mode : lastMode() });
 }
 
 // Hide the overlay. A running job keeps going in the background unless
@@ -272,6 +332,8 @@ function layout(count) {
 // While a job runs, keep each ghost cursor on the window of the app its agent is using.
 function startTracking() {
   stopTracking();
+  pointing.clear();   // a new job: cursors start from their windows again
+  chromeTops.clear();
   const tick = async () => {
     if (!isRunning() || !win?.isVisible()) return;
     const [windows, parents] = await Promise.all([listWindows(), processParents()]);
@@ -308,6 +370,14 @@ function startTracking() {
         rect: { x: w.x - area.x, y: w.y - area.y, w: w.w, h: w.h },
       };
     });
+    // An agent's cursor stays where it last acted, and moves with its window.
+    for (const [id, p] of pointing) {
+      const t = targets[id];
+      if (!t) continue;
+      if (t.rect && Number.isFinite(p.dx)) targets[id] = { ...t, x: clampX(t.rect.x + p.dx), y: clampY(t.rect.y + p.dy) };
+      else if (Number.isFinite(p.x)) targets[id] = { ...t, x: p.x, y: p.y };
+    }
+    lastTargets = targets;
     send({ type: 'targets', targets });
   };
   tick();

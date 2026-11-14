@@ -16,6 +16,9 @@ html, body { margin: 0; height: 100%; background: transparent; overflow: hidden;
 #prompt:disabled { color: var(--dim); }
 button { font: inherit; font-size: 13px; color: var(--text); border: 1px solid var(--line); background: rgba(255, 255, 255, 0.06); border-radius: 999px; padding: 6px 12px; cursor: pointer; }
 button:hover { background: rgba(255, 255, 255, 0.14); }
+#running-on { flex: none; display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(57, 255, 20, 0.45); background: rgba(57, 255, 20, 0.1); color: #b9ffab; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+#running-on::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: #39ff14; box-shadow: 0 0 8px #39ff14; }
+#running-on[hidden] { display: none; }
 #go { background: #f2f3f5; color: #16171c; border-color: transparent; font-weight: 600; }
 #go:hover { background: #fff; }
 #stop { border-color: rgba(255, 93, 93, 0.6); color: #ff8d8d; }
@@ -48,7 +51,16 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 
 /* Ghost cursors */
 #cursors { position: fixed; inset: 0; pointer-events: none; }
-.cursor { position: absolute; left: 0; top: 0; transition: transform 1.1s cubic-bezier(0.22, 0.8, 0.2, 1), opacity 0.4s; will-change: transform; }
+.cursor { position: absolute; left: 0; top: 0; transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.35, 1), opacity 0.4s; will-change: transform; }
+/* On an element: hold still (no drift or tap loop), tap once per click, show an I-beam while typing. */
+.cursor.pinned .body, .cursor.pinned[data-status] .body { animation: none; }
+.cursor.tapping svg.arrow { animation: press 0.2s ease-out; }
+.cursor .ibeam { display: none; margin: -11px 0 0 -11px; }
+.cursor.typing svg.arrow { display: none; }
+.cursor.typing .ibeam { display: block; }
+.cursor.typing .tag { margin-left: -6px; }
+@keyframes press { 50% { transform: translate(1px, 1px) scale(0.78); } }
+.type-bubble { position: absolute; left: 0; top: 0; min-width: 40px; max-width: 520px; padding: 4px 10px; border-radius: 13px; background: #fff; color: #1f1f1f; font: 13px/18px -apple-system, system-ui, sans-serif; white-space: nowrap; overflow: hidden; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25); pointer-events: none; }
 .cursor .body { display: flex; align-items: flex-start; animation: drift 5s ease-in-out infinite; }
 .cursor svg { width: 22px; height: 22px; flex: none; filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.45)); }
 .cursor .tag { margin: 16px 0 0 2px; padding: 3px 9px; border-radius: 4px 12px 12px 12px; font-size: 12px; font-weight: 600; color: #101114; white-space: nowrap; max-width: 280px; overflow: hidden; text-overflow: ellipsis; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3); }
