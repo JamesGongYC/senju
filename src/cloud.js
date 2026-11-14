@@ -101,7 +101,7 @@ export class CloudClient {
         return;
       case 'call': {
         const res = await this.host.call(m.conn, m.tool, m.args);
-        return this.say({ t: 'result', rid: m.rid, content: res.content, isError: res.isError });
+        return this.say({ t: 'result', rid: m.rid, content: res.content, isError: res.isError, structured: res.structured });
       }
       case 'close':
         return this.host.close(m.conn);
