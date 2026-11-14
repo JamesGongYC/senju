@@ -541,5 +541,30 @@ function make(scripts, extra = {}) {
   assert.deepEqual(events.filter((e) => e.type === 'chat').map((e) => e.text), ['Reading you now.']);
 }
 
+// Workers answer the user the way the lead does: the same "answer now" note comes with the message, and a reply
+// that acts without a word to the user is thrown away unrun and asked again. Its answer then reaches the chat.
+{
+  const seen = { shouts: [] };
+  const { swarm, events } = make({
+    lead: ({ turn, lastText }) => {
+      if (turn === 1) return use('spawn_agent', { name: 'Doc', goal: 'make a Pages document', servers: ['echo'] });
+      if (/No workers are running/.test(lastText)) return say('Made it.');
+      return use('wait');
+    },
+    Doc: async ({ turn, lastText }) => {
+      if (/discarded/.test(lastText)) { seen.again = lastText; return [say("I'm making the Pages document: the Open dialog is up, so I'm clicking New Document."), use('echo__shout', { text: 'go' })]; }
+      if (/Message from the user: what are you working on/.test(lastText)) { seen.got = lastText; return use('echo__shout', { text: 'skipped' }); }
+      if (turn === 1) { await sleep(150); return use('echo__shout', { text: 'open' }); }
+      return say('done');
+    },
+  }, { onEvent: (e, s) => { if (e.type === 'spawn') setTimeout(() => s.tell('what are you working on', e.agent.id), 40); } });
+  await swarm.run('make a doc');
+  assert.match(seen.got, /Message from the user: what are you working on\n\n\(Answer the user now\./);
+  assert.match(seen.again, /You made tool calls without answering the user, so that reply was discarded/);
+  assert.doesNotMatch(seen.again, /SKIPPED/);   // the discarded reply's tool call never ran
+  assert.deepEqual(events.filter((e) => e.type === 'chat' && e.from !== 'lead').map((e) => e.text), ["I'm making the Pages document: the Open dialog is up, so I'm clicking New Document."]);
+  await swarm.shutdown();
+}
+
 console.log('smoke test passed');
 process.exit(0);
