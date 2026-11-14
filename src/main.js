@@ -427,7 +427,8 @@ app.whenReady().then(() => {
     goal = String(goal ?? '').trim();
     if (!mode) return;   // the way of working has not been chosen yet
     if (TEAM) { if (goal) cloud?.startSession(goal); return; }
-    if (!goal || swarm?.running) return;
+    if (!goal) return;
+    if (swarm?.running) return send({ type: 'notice', message: 'The last job is still wrapping up. Send it again in a moment.' });
     if (!swarm) {
       const llm = makeLlm();
       if (!llm) return send({ type: 'need_key', goal });   // the bar asks for the key, then runs the goal

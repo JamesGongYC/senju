@@ -36,11 +36,15 @@ export function toolName(server, tool) {
 }
 
 // Build the Claude tool list plus a lookup from Claude tool name to (connection, MCP tool).
+// Tools agents never get: a script that drives the page does many things at once, with no cursor to watch.
+const HIDDEN_TOOLS = new Set(['browser_run_code_unsafe', 'browser_run_code']);
+
 export function buildToolset(connections) {
   const tools = [];
   const lookup = new Map();
   for (const conn of connections) {
     for (const t of conn.tools) {
+      if (HIDDEN_TOOLS.has(t.name)) continue;
       const name = toolName(conn.name, t.name);
       if (lookup.has(name)) continue;
       lookup.set(name, { conn, tool: t.name });
@@ -59,6 +63,8 @@ export function buildToolset(connections) {
 
 // Run one MCP call and convert the result into Claude tool_result content.
 export async function callTool(conn, tool, args, signal) {
+  // How many calls are running on this connection now (background helpers wait for 0).
+  conn.inflight = (conn.inflight ?? 0) + 1;
   try {
     const res = await conn.client.callTool({ name: tool, arguments: args ?? {} }, undefined, { signal, timeout: 120000 });
     const content = [];
@@ -75,9 +81,12 @@ export async function callTool(conn, tool, args, signal) {
       }
     }
     if (content.length === 0) content.push({ type: 'text', text: 'OK' });
-    return { content, isError: Boolean(res.isError) };
+    // structuredContent stays out of what the model reads; the app uses it (element frames, window lists).
+    return { content, isError: Boolean(res.isError), structured: res.structuredContent };
   } catch (err) {
     return { content: [{ type: 'text', text: `Tool call failed: ${err?.message ?? err}` }], isError: true };
+  } finally {
+    conn.inflight -= 1;
   }
 }
 
