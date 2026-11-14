@@ -1,5 +1,5 @@
 // Electron main process: the overlay window, hotkey, and the bridge between UI and swarm.
-import { app, BrowserWindow, globalShortcut, ipcMain, safeStorage, screen, shell, Tray, Menu, nativeImage, Notification, powerMonitor, powerSaveBlocker } from 'electron';
+import { app, BrowserWindow, globalShortcut, ipcMain, safeStorage, screen, shell, Tray, Menu, nativeImage, Notification, powerMonitor, powerSaveBlocker, systemPreferences } from 'electron';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -68,6 +68,7 @@ let host = null;            // team mode: runs this computer's tools for agents 
 let awake = null;
 let area = { x: 0, y: 0, width: 1280, height: 800 };
 let tracker = null;
+let retrack = null;   // re-check window positions now (the user switched desktops)
 const moved = new Map();    // pid -> the frame an app's window had before we tiled it
 let tilingDenied = false;
 let hotkey = null;          // the accelerator that actually registered
@@ -135,6 +136,7 @@ function cursorMove(agentId, point) {
 const send = (event) => {
   if (!win || win.isDestroyed()) return;
   if (event.type === 'point') {
+    if (lastTargets[event.agentId]?.elsewhere) return;   // acting on another desktop: nothing to show here
     const move = cursorMove(event.agentId, event.point);
     if (!move) return;
     const rect = lastTargets[event.agentId]?.rect;
@@ -333,7 +335,7 @@ function startTracking() {
   chromeTops.clear();
   const tick = async () => {
     if (!isRunning() || !win?.isVisible()) return;
-    const [windows, parents] = await Promise.all([listWindows(), processParents()]);
+    const [windows, parents] = await Promise.all([listWindows({ all: true }), processParents()]);
     const targets = {};
     agentsNow().forEach((agent, i) => {
       // In a team, an agent working on someone else's computer has nothing to place here.
@@ -342,6 +344,9 @@ function startTracking() {
       // The agent's own window if it has one, else the app's window, else its tile slot.
       const own = agent.pids.length ? pickWindow(agent, null, windows, parents, i) : null;
       const w = own ?? (agent.server ? pickWindow(agent, appName, windows, parents, i) : null) ?? agent.slot;
+      // Its window is on another desktop (Space), or minimized: the overlay shows on every desktop,
+      // so hide the cursor rather than leave it over windows it is not working in.
+      if (w && w.onScreen === false) { targets[agent.id] = { app: w.app ?? appName ?? null, elsewhere: true }; return; }
       // A desktop agent's app window is moved into the agent's slot the first time it is used.
       const isDesktop = config.servers[agent.server]?.kind === 'desktop';
       if (isDesktop && agent.live && agent.slot && w && w !== agent.slot && w.pid && agent.placedPid !== w.pid && !tilingDenied) {
@@ -370,7 +375,7 @@ function startTracking() {
     // An agent's cursor stays where it last acted, and moves with its window.
     for (const [id, p] of pointing) {
       const t = targets[id];
-      if (!t) continue;
+      if (!t || t.elsewhere) continue;
       if (t.rect && Number.isFinite(p.dx)) targets[id] = { ...t, x: clampX(t.rect.x + p.dx), y: clampY(t.rect.y + p.dy) };
       else if (Number.isFinite(p.x)) targets[id] = { ...t, x: p.x, y: p.y };
     }
@@ -379,17 +384,21 @@ function startTracking() {
   };
   tick();
   tracker = setInterval(tick, 1500);
+  retrack = tick;
 }
 
 function stopTracking() {
   if (tracker) clearInterval(tracker);
   tracker = null;
+  retrack = null;
 }
 
 app.whenReady().then(() => {
   if (isMac) app.dock?.hide();
   loadSavedKey();
   createWindow();
+  // Switching desktops (Spaces): hide or show cursors for the desktop now in front right away, not on the next tick.
+  if (isMac) systemPreferences.subscribeWorkspaceNotification('NSWorkspaceActiveSpaceDidChangeNotification', () => retrack?.());
 
   bindHotkey();
 

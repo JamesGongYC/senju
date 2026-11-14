@@ -20,13 +20,43 @@ export async function connectServer(name, spec) {
   const client = new Client({ name: 'senju', version: '0.1.0' });
   await client.connect(transport);
   const { tools } = await client.listTools();
-  return {
+  const conn = {
     name,
     spec,
     client,
     tools,
     pid: transport.pid ?? null,
     close: () => client.close().catch(() => {}),
+  };
+  await hideDriverCursor(conn);
+  return conn;
+}
+
+// cua-driver draws its own agent cursor on top of Senju's ghost cursors. Run every call on this
+// connection in one driver session of our own and hide that session's cursor. Set "driverCursor": true
+// on the server in swarm.config.json to keep the driver's cursor.
+const CURSOR_TOOLS = new Set(['start_session', 'end_session', 'set_agent_cursor_enabled']);
+let cursorSeq = 0;
+
+async function hideDriverCursor(conn) {
+  if (conn.spec.driverCursor === true) return;
+  if (!conn.tools.some((t) => t.name === 'set_agent_cursor_enabled')) return;
+  const session = `senju-${process.pid}-${++cursorSeq}`;
+  try {
+    await conn.client.callTool({ name: 'start_session', arguments: { session } }, undefined, { timeout: 15000 });
+    const res = await conn.client.callTool({ name: 'set_agent_cursor_enabled', arguments: { session, enabled: false } }, undefined, { timeout: 15000 });
+    if (res.isError) return;
+  } catch {
+    return;   // an older driver: keep its cursor rather than fail to connect
+  }
+  conn.cursorSession = session;
+  // Calls that take a session label all go to ours; agents never end it or turn its cursor back on.
+  conn.tools = conn.tools.filter((t) => !CURSOR_TOOLS.has(t.name));
+  conn.sessionTools = new Set(conn.tools.filter((t) => t.inputSchema?.properties?.session).map((t) => t.name));
+  const close = conn.close;
+  conn.close = async () => {
+    await conn.client.callTool({ name: 'end_session', arguments: { session } }, undefined, { timeout: 5000 }).catch(() => {});
+    await close();
   };
 }
 
@@ -65,6 +95,7 @@ export function buildToolset(connections) {
 export async function callTool(conn, tool, args, signal) {
   // How many calls are running on this connection now (background helpers wait for 0).
   conn.inflight = (conn.inflight ?? 0) + 1;
+  if (conn.cursorSession && conn.sessionTools?.has(tool)) args = { ...args, session: conn.cursorSession };
   try {
     const res = await conn.client.callTool({ name: tool, arguments: args ?? {} }, undefined, { signal, timeout: 120000 });
     const content = [];

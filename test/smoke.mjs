@@ -439,6 +439,13 @@ function make(scripts, extra = {}) {
   assert.equal(pickWindow(slacker, null, wins, new Map(), 0).id, 77);
   assert.equal(pickWindow(coder, null, wins, new Map(), 1).id, 80);
   assert.equal(pickWindow({ target: { pid: null, windowId: null, app: 'cursor' }, pids: [] }, null, wins, new Map(), 0).id, 80);
+  // Windows on another desktop (Space): a showing window wins; an agent whose only window is elsewhere gets that one,
+  // marked off screen, so the app hides its cursor instead of parking it over this desktop.
+  const spaced = [{ app: 'Slack', pid: 501, id: 90, x: 0, y: 0, w: 500, h: 400, onScreen: false }, { app: 'Slack', pid: 501, id: 91, x: 0, y: 0, w: 500, h: 400, onScreen: true }, { app: 'Notes', pid: 600, id: 95, x: 0, y: 0, w: 500, h: 400, onScreen: false }];
+  assert.equal(pickWindow({ target: { pid: 501 }, pids: [] }, null, spaced, new Map(), 0).id, 91);
+  assert.equal(pickWindow({ target: { pid: 501, windowId: 90 }, pids: [] }, null, spaced, new Map(), 0).onScreen, false);
+  assert.equal(pickWindow({ target: { pid: 600 }, pids: [] }, null, spaced, new Map(), 0).onScreen, false);
+  assert.equal(pickWindow({ pids: [] }, 'slack', spaced, new Map(), 0).id, 91);
 }
 
 // 13. Cooperation: peer messages, claims, a task for the user elsewhere, pause and resume,

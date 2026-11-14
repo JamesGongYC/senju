@@ -92,6 +92,7 @@ npm run doctor
 
 - **One app per worker.** The lead gives each desktop worker its own app, and desktop calls run one at a time across workers, since they share one keyboard.
 - **Windows are arranged.** The first time a worker uses an app, that app's window is moved into the worker's slot so nothing overlaps, and put back when the job ends (`"restoreWindows": false` to leave them). The desktop driver moves the windows, using the permission you already gave it. Without the driver, this falls back to System Events, which needs the app you start Senju from allowed under Privacy & Security > Accessibility.
+- **One cursor.** Cua Driver draws its own agent cursor; Senju hides it so only Senju's ghost cursors show. Senju runs its calls in a driver session of its own, so other tools that use Cua Driver keep their cursor. Set `"driverCursor": true` on the `desktop` server to show it anyway.
 - **Focus.** Workers act in the background where they can. For an app that ignores background input, a worker may bring it to the front for a single action, and never while you are typing.
 - **Messaging and mail.** Workers may read and draft. Every send needs your click on a card that shows the exact text and recipient. Note that Discord's terms prohibit automating a user account.
 - **Off limits unless you name them.** Terminal, System Settings, password managers, and banking apps.

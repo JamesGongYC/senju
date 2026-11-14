@@ -143,7 +143,8 @@ function place(agent, index) {
   const active = ACTIVE.includes(agent.status);
   // Team mode: an agent called to another computer shows its cursor there, not here.
   // Docked agents (resting, or not yet on any computer) show on every screen.
-  const away = team.on && !resting && active && agent.device && agent.device !== team.device;
+  const away = (team.on && !resting && active && agent.device && agent.device !== team.device)
+    || (!resting && active && agent.target?.elsewhere);   // its window is on another desktop (Space) or minimized
   agent.el.classList.toggle('away', Boolean(away));
   if (away) return;
   let spot;
