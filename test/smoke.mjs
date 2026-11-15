@@ -566,5 +566,46 @@ function make(scripts, extra = {}) {
   await swarm.shutdown();
 }
 
+// Desktop: a batch of known actions in one reply runs in order, one call each, and the window is read once,
+// after the last of them; that reading comes back with the last result (no extra model turn to look).
+// A batch stops at its first failure (later steps never run out of order), and a window that opened or closed
+// is said plainly instead of showing a stale picture.
+{
+  const desk = { command: process.execPath, args: [path.join(here, 'fake-desktop.mjs')], kind: 'desktop', shared: true, serial: true, about: 'fake Mac apps' };
+  const seen = {};
+  const results = (params) => params.messages.at(-1).content.filter((b) => b.type === 'tool_result').map((b) => b.content.map((c) => c.text).join(' | '));
+  const keys = (list) => list.map((key) => use('desk__press_key', { pid: 7, window_id: 70, key }));
+  const swarm = new Swarm({
+    llm: fakeLlm({
+      lead: ({ turn, lastText }) => turn === 1 ? use('spawn_agent', { name: 'Calc', goal: 'compute 7+8', servers: ['desk'] })
+        : /No workers are running/.test(lastText) ? say('15') : use('wait'),
+      Calc: ({ turn, params }) => {
+        if (turn === 1) { seen.rules = params.system[0].text; return use('desk__get_window_state', { pid: 7, window_id: 70 }); }
+        if (turn === 2) return keys(['7', '+', '8', '=']);
+        if (turn === 3) { seen.batch = results(params); return keys(['1', 'X', '2']); }
+        if (turn === 4) { seen.failed = results(params); return keys(['n']); }
+        if (turn === 5) { seen.opened = results(params); return keys(['w']); }
+        seen.closed = results(params);
+        return say('15');
+      },
+    }),
+    config: { model: 'fake', maxAgents: 2, maxSteps: 10, servers: { desk } }, workspace: '/tmp', emit: () => {},
+  });
+  await swarm.run('compute');
+  assert.match(seen.rules, /make them all in one reply/);
+  // Four known keys: no reading between them, one after the last, attached to its result.
+  assert.deepEqual(seen.batch.slice(0, 3), ['Pressed 7', 'Pressed +', 'Pressed 8']);
+  assert.match(seen.batch[3], /^Pressed = \| The window now .* \| STATE #2 window=70 display=7\+8=$/);
+  // The batch stops at the failed "X": "2" never runs, and the window is read at the failure.
+  assert.equal(seen.failed[0], 'Pressed 1');
+  assert.match(seen.failed[1], /^press_key failed: no such key \| The window now .* \| STATE #3 window=70 display=7\+8=1$/);
+  assert.match(seen.failed[2], /^Not run: an earlier action in this reply failed/);
+  // A new window is named; the reading stays on the window the worker was using.
+  assert.match(seen.opened[0], /New window opened in this app: "Untitled" \(window_id 71\)\. Shown below is still window_id 70[\s\S]* STATE #4 window=70/);
+  // The worker's window closed: it is said so, and the window that is open is read instead.
+  assert.match(seen.closed[0], /The window you were working in \(window_id 70\) is no longer open\. This is "Untitled" \(window_id 71\)[\s\S]* STATE #5 window=71/);
+  await swarm.shutdown();
+}
+
 console.log('smoke test passed');
 process.exit(0);

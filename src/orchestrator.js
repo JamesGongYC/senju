@@ -8,7 +8,7 @@ import { pointBefore } from './point.js';
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds, onYouTube } from './adskip.js';
-import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE } from './deskpoint.js';
+import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS } from './deskpoint.js';
 import { READ_ONLY, noteTarget, userActive } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
 import { listSkills, readSkill, saveSkill } from './skills.js';
@@ -68,7 +68,8 @@ Text you write is shown to the user, so keep it short and plain.${team ? TEAM_LE
 const DESKTOP_RULES = `
 # Working in desktop apps
 You can drive native Mac apps (the user's real apps, with their real accounts) through the desktop tools. The user is using this computer at the same time.
-- Work in one window at a time. Read its state before you act, and read it again after any action that should change it. Never assume an action worked: some apps echo a write without applying it, so check the result on screen.
+- Work in one window at a time. Read its state before you first act. After your actions the window's new state comes back with the last action's result, so check the result there instead of calling get_window_state again. Never assume an action worked: some apps echo a write without applying it, so check the result on screen.
+- When you already know the next several actions and none depends on what the one before shows (keys on a keypad, the fields of a form, a menu and then its item), make them all in one reply: one action per tool call, in order. Each still happens visibly, one after another, and the window is read once after the last. Element tokens stay valid only until the window is read again, so take them all from the same reading, and do not batch past a step that opens a dialog, changes the page or decides what you do next.
 - Act on elements in the background whenever the tools allow it. If an app ignores background input, you may bring it to the front for that single action, then let focus go back. Keep any such moment as short as possible and never hold the front window across several steps.
 - If the app is not open, open it. If it shows a sign-in, a permission prompt or a system dialog, hand off to the user.
 - Stay inside the apps your subtask needs. Do not touch Terminal or other shells, System Settings, password managers, banking or payment apps, or the Senju bar and cards, unless the user's goal names them explicitly. Leave other agents' windows alone.
@@ -1044,7 +1045,8 @@ export class Swarm {
         }
 
         const results = [];
-        for (const call of calls) {
+        let batchStopped = null;   // the desktop server whose batch stopped at a failure in this reply
+        for (const [callIndex, call] of calls.entries()) {
           if (signal.aborted) throw new Error('cancelled');
           await this.gate(agent, update, signal);
           const say = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
@@ -1126,11 +1128,14 @@ export class Swarm {
               update({ status: 'acting', server: hit.conn.name, label: `${hit.conn.name}: ${hit.tool}` });
               const spec = this.config.servers[hit.conn.name] ?? {};
               const desktopAct = spec.kind === 'desktop' && !READ_ONLY.test(hit.tool);
-              if (spec.kind === 'desktop') this.noteTarget(agent, call.input);
+              // A batch of known actions stops at its first failure, so later steps never act out of order.
+              const skipped = batchStopped === hit.conn && desktopAct;
+              if (spec.kind === 'desktop' && !skipped) this.noteTarget(agent, call.input);
               // The person watches each cursor: a script that clicks, types or changes the page would act unseen.
               const scripted = hit.tool === 'browser_evaluate' && /\.click\(|dispatchEvent|\.value\s*=|\.submit\(|\.focus\(|innerHTML\s*=|textContent\s*=/.test(String(call.input?.function ?? ''));
-              if (scripted) { out = say('Not run: browser_evaluate is for reading the page only. Do each click with browser_click, each entry with browser_type and each key with browser_press_key, one action per call, so the person can watch your cursor do it.', true); }
-              const run = scripted ? null : async () => {
+              if (skipped) out = say('Not run: an earlier action in this reply failed, so the rest of the batch was stopped. Look at the window state returned with that failure and decide again.', true);
+              else if (scripted) { out = say('Not run: browser_evaluate is for reading the page only. Do each click with browser_click, each entry with browser_type and each key with browser_press_key, one action per call, so the person can watch your cursor do it.', true); }
+              const run = scripted || skipped ? null : async () => {
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 if (desktopAct) { await this.quiet(agent, update, signal); this.lastDesktopAction = Date.now(); }
@@ -1177,6 +1182,15 @@ export class Swarm {
                     if (shown?.windowId) this.noteTarget(agent, { pid, window_id: shown.windowId });
                     if (shown?.note) res = { ...res, content: [...res.content, { type: 'text', text: shown.note }] };
                   }
+                }
+                // Act and look in one step: after the last desktop action of this reply (or the one that failed, which
+                // ends the batch), read the window and hand it back with the result, so the worker does not spend a
+                // model turn on get_window_state to check.
+                const lastHere = !calls.slice(callIndex + 1).some((c) => lookup.get(c.name)?.conn === hit.conn);
+                if (spec.kind === 'desktop' && ACTS.test(hit.tool) && res.isError) batchStopped = hit.conn;
+                if (spec.kind === 'desktop' && ACTS.test(hit.tool) && (lastHere || res.isError) && this.config.lookAfterActions !== false) {
+                  const seen = await lookAfter(hit.conn, agent, signal);
+                  if (seen) res = { ...res, content: [...res.content, { type: 'text', text: `${seen.note ? `${seen.note}\n` : ''}The window now (read for you after this action, with fresh element tokens; no need to call get_window_state to check):` }, ...seen.res.content], structured: res.structured };
                 }
                 // A page that just opened under a cookie banner or pop-up: close it the way a person would, with
                 // the cursor, and give the worker the page as it is now.
