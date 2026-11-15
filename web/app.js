@@ -1,23 +1,30 @@
-// Senju web app: sign up, teams, your API key, team and personal memory,
-// and a live view of the team's session where anyone can talk to the lead.
-const $ = (sel, root = document) => root.querySelector(sel);
-const h = (tag, attrs = {}, ...kids) => {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === 'class') el.className = v;
-    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
-    else if (v !== false && v != null) el.setAttribute(k, v === true ? '' : v);
-  }
-  for (const kid of kids.flat(Infinity)) if (kid != null && kid !== false) el.append(kid);
-  return el;
+// Senju's web page: the team's control page. Sign in, manage the team, read sessions, and edit
+// skills and memory. Sessions are started, continued and steered only from the desktop app;
+// here they can be watched, never driven. Plans and payments live here too.
+import { h, sticker, scribbleArrow } from './shared/brand.js';
+import { createTraceView } from './shared/trace-view.js';
+import { renderLibrary } from './shared/library-view.js';
+
+const app = document.getElementById('app');
+const state = {
+  sb: null, user: null, token: null, name: '',
+  team: null,            // from /api/team
+  hasKey: false, billing: null,
+  ws: null, people: [], liveSession: null,   // presence from the hub
+  page: 'sessions', sessions: [], selected: null, detail: null, tv: null, watching: false,
 };
-const app = $('#app');
-const state = { sb: null, user: null, token: null, name: '', team: null, hasKey: false, billing: null, ws: null, people: [], tab: 'people', live: null, target: 'lead', memory: [], history: [] };
 
 function toast(message) {
   const t = h('div', { class: 'toast' }, message);
   document.body.append(t);
   setTimeout(() => t.remove(), 6000);
+}
+
+async function api(method, path, body) {
+  const res = await fetch(path, { method, headers: { authorization: `Bearer ${state.token}`, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(out.error ?? `The server answered ${res.status}.`);
+  return out;
 }
 
 // ---- Start-up and sign-in -----------------------------------------------------------------
@@ -41,47 +48,36 @@ async function onSession(session) {
 }
 
 async function loadAccount() {
-  const sb = state.sb;
-  const { data: profile } = await sb.from('profiles').select('name').eq('id', state.user.id).maybeSingle();
+  const { data: profile } = await state.sb.from('profiles').select('name').eq('id', state.user.id).maybeSingle();
   state.name = profile?.name ?? state.user.email;
-  const { data: rows, error } = await sb.from('team_members').select('role, teams(id, name, invite_code)').eq('user_id', state.user.id).order('joined_at').limit(1);
-  if (error) return toast(error.message);
-  state.team = rows?.[0]?.teams ?? null;
+  try { state.team = (await api('GET', '/api/team')).team; } catch { state.team = null; }
   if (!state.team) return viewOnboarding();
-  state.hasKey = Boolean((await sb.rpc('has_api_key')).data);
+  state.hasKey = Boolean((await state.sb.rpc('has_api_key')).data);
   await loadBilling();
   connect();
-  viewMain();
-  // Back from paying: Stripe tells the server a moment later, so look again a few times.
   const back = new URLSearchParams(location.search).get('billing');
   if (back) {
     history.replaceState(null, '', location.pathname);
-    state.tab = 'settings';
+    state.page = 'billing';
     toast(back === 'done' ? 'Payment received. Your balance updates in a few seconds.' : 'Nothing was charged.');
-    if (back === 'done') for (const wait of [1500, 4000, 9000]) setTimeout(async () => { await loadBilling(); render(); }, wait);
-    render();
+    if (back === 'done') for (const wait of [1500, 4000, 9000]) setTimeout(async () => { await loadBilling(); if (state.page === 'billing') render(); }, wait);
   }
+  render();
 }
 
-// Plan, balance and what is for sale. Null when the server sells nothing.
 async function loadBilling() {
   try {
     const res = await fetch('/api/billing', { headers: { authorization: `Bearer ${state.token}` } });
     state.billing = res.ok ? await res.json() : null;
   } catch { state.billing = null; }
 }
-// A session can start on your own key, or on credits if you subscribe.
-function startBlocker() {
-  const b = state.billing;
-  if (state.hasKey) return null;
-  if (!b?.hosted) return 'Add your API key under Settings before you start a session.';
-  if (!b.active) return 'Subscribe under Settings to start a session, or save your own API key there to run for free.';
-  if (b.credits <= 0) return 'You are out of credits. Add more under Settings.';
-  return null;
+
+function stageTop(extra) {
+  return h('header', { class: 'stage-top' }, h('span', { class: 'logo display' }, 'Senju'), extra);
 }
 
 function viewAuth(mode = 'in') {
-  const err = h('div', { class: 'error' });
+  const err = h('p', { class: 'error-text' });
   const submit = async (ev) => {
     ev.preventDefault();
     err.textContent = '';
@@ -93,38 +89,44 @@ function viewAuth(mode = 'in') {
     if (res.error) err.textContent = res.error.message;
     else if (mode === 'up' && !res.data.session) err.textContent = 'Check your email to confirm your account, then sign in.';
   };
-  app.replaceChildren(h('div', { class: 'card narrow' },
-    h('h1', {}, 'Senju'),
-    h('p', { class: 'muted' }, mode === 'up' ? 'Create your account.' : 'Sign in to your team.'),
-    h('form', { onsubmit: submit },
-      mode === 'up' && h('input', { name: 'name', placeholder: 'Your name', required: true }),
-      h('input', { name: 'email', type: 'email', placeholder: 'Email', required: true }),
-      h('input', { name: 'password', type: 'password', placeholder: 'Password', required: true, minlength: 8 }),
-      h('button', { class: 'primary', type: 'submit' }, mode === 'up' ? 'Create account' : 'Sign in'),
-      err),
-    h('p', { class: 'small muted' }, mode === 'up' ? 'Already have an account? ' : 'New here? ',
-      h('button', { class: 'link', onclick: () => viewAuth(mode === 'up' ? 'in' : 'up') }, mode === 'up' ? 'Sign in' : 'Create an account'))));
+  app.replaceChildren(h('main', { class: 'stage auth' },
+    stageTop(),
+    h('div', { class: 'auth-grid' },
+      h('section', { class: 'hero' },
+        h('h1', { class: 'display hero-title' }, h('span', { class: 'hash' }, '#'), 'Swarm', h('br'), 'your', h('br'), 'screen'),
+        h('p', { class: 'hero-sub' }, 'Your team’s control room: who is in, what the agents did, and what they have learned.'),
+        sticker(), scribbleArrow()),
+      h('form', { class: 'panel-card', onsubmit: submit },
+        h('div', { class: 'kicker' }, mode === 'up' ? 'New here' : 'Welcome back'),
+        h('h2', { class: 'display card-title' }, mode === 'up' ? 'Create account' : 'Sign in'),
+        mode === 'up' && h('input', { class: 'field', name: 'name', placeholder: 'Your name', required: true }),
+        h('input', { class: 'field', name: 'email', type: 'email', placeholder: 'Email', required: true, autocomplete: 'username' }),
+        h('input', { class: 'field', name: 'password', type: 'password', placeholder: 'Password', required: true, minlength: 8, autocomplete: mode === 'up' ? 'new-password' : 'current-password' }),
+        err,
+        h('button', { class: 'btn btn-punk', type: 'submit' }, mode === 'up' ? 'Create account →' : 'Sign in →'),
+        h('p', { class: 'small dim' }, mode === 'up' ? 'Already have an account? ' : 'New here? ',
+          h('button', { class: 'link', type: 'button', onclick: () => viewAuth(mode === 'up' ? 'in' : 'up') }, mode === 'up' ? 'Sign in' : 'Create an account'))))));
 }
 
 function viewOnboarding() {
-  const err = h('div', { class: 'error' });
+  const err = h('p', { class: 'error-text' });
   const run = (fn, arg) => async (ev) => {
     ev.preventDefault();
     const { error } = await state.sb.rpc(fn, { [arg]: new FormData(ev.target).get('v') });
     if (error) err.textContent = error.message; else loadAccount();
   };
-  app.replaceChildren(h('div', { class: 'card narrow' },
-    h('h1', {}, `Welcome, ${state.name}`),
-    h('p', { class: 'muted' }, 'A team shares sessions, skills and team memory. Create one, or join with an invite code.'),
-    h('h3', {}, 'Create a team'),
-    h('form', { onsubmit: run('create_team', 'team_name') }, h('div', { class: 'row' }, h('input', { name: 'v', placeholder: 'Team name', required: true }), h('button', { class: 'primary' }, 'Create'))),
-    h('h3', {}, 'Join a team'),
-    h('form', { onsubmit: run('join_team', 'code') }, h('div', { class: 'row' }, h('input', { name: 'v', placeholder: 'Invite code', required: true }), h('button', {}, 'Join'))),
-    err,
-    h('p', { class: 'small' }, h('button', { class: 'link', onclick: () => state.sb.auth.signOut() }, 'Sign out'))));
+  app.replaceChildren(h('main', { class: 'stage auth' },
+    stageTop(h('button', { class: 'btn btn-outline-white btn-sm', onclick: () => state.sb.auth.signOut() }, 'Sign out')),
+    h('div', { class: 'panel-card wide' },
+      h('div', { class: 'kicker' }, `Welcome, ${state.name}`),
+      h('h2', { class: 'display card-title' }, 'Join a team'),
+      h('p', { class: 'dim' }, 'A team shares sessions, skills and team memory, and its members can lend each other their computers. Create one, or join with an invite code.'),
+      h('form', { class: 'inline', onsubmit: run('create_team', 'team_name') }, h('input', { class: 'field', name: 'v', placeholder: 'New team name', required: true }), h('button', { class: 'btn btn-punk' }, 'Create')),
+      h('form', { class: 'inline', onsubmit: run('join_team', 'code') }, h('input', { class: 'field', name: 'v', placeholder: 'Invite code', required: true }), h('button', { class: 'btn btn-ink' }, 'Join')),
+      err)));
 }
 
-// ---- Live connection to the team's hub --------------------------------------------------------
+// ---- Live connection to the hub: presence, and watching a running session -------------------------
 
 function connect() {
   const ws = new WebSocket(location.origin.replace(/^http/, 'ws'));
@@ -135,231 +137,195 @@ function connect() {
 }
 const say = (msg) => state.ws?.readyState === 1 && state.ws.send(JSON.stringify(msg));
 
-function newLive(s) { return { id: s.id, goal: s.goal, owner: s.owner, agents: new Map(), lines: [], asks: new Map(), summary: null, lead: '', running: true }; }
-
 function onHub(msg) {
-  if (msg.t === 'welcome') {
-    state.live = msg.session ? newLive(msg.session) : state.live;
-    for (const e of msg.session?.replay ?? []) onEvent(e, true);
-  } else if (msg.t === 'joined') {
-    state.live = newLive(msg.session);
-    for (const e of msg.session.replay ?? []) onEvent(e, true);
-  } else if (msg.t === 'presence') {
+  if (msg.t === 'presence') {
+    const was = state.liveSession?.id ?? null;
     state.people = msg.people;
-    if (msg.session && state.live?.id !== msg.session.id) state.live = newLive(msg.session);
-    if (!msg.session && state.live) state.live.running = false;
-  } else if (msg.t === 'event') {
-    onEvent(msg.event);
-  } else if (msg.t === 'error') {
-    toast(msg.message);
-  }
-  render();
+    state.liveSession = msg.session;
+    if (was !== (msg.session?.id ?? null)) { loadSessions(); if (!msg.session) state.watching = false; }
+    if (state.page === 'team') render();
+  } else if (msg.t === 'welcome') {
+    state.liveSession = msg.session ? { id: msg.session.id, goal: msg.session.goal, owner: msg.session.owner } : null;
+    state.watching = Boolean(msg.session?.joined);
+  } else if (msg.t === 'joined') {
+    state.watching = true;
+    if (state.selected === msg.session.id) openSession(msg.session.id);   // reload with the full picture
+  } else if (msg.t === 'event' && state.tv && msg.sessionId === state.selected) {
+    if (msg.event.type === 'session' && (msg.event.turn ?? 0) >= state.tv.turnCount) state.tv.startTurn(msg.event.goal, msg.event.owner?.name ?? null);
+    state.tv.push({ turn: msg.event.turn ?? Math.max(0, state.tv.turnCount - 1), at: new Date().toISOString(), event: msg.event });
+  } else if (msg.t === 'error' && msg.code !== 'view_only') toast(msg.message);
 }
 
-function onEvent(e) {
-  if (e.type === 'session') { state.live = newLive(e); state.target = 'lead'; return; }
-  const L = state.live;
-  if (!L) return;
-  if (e.type === 'credits') { if (state.billing) { state.billing.credits = e.balance; state.billing.creditsText = e.text; } return; }
-  if (e.type === 'spawn') L.agents.set(e.agent.id, { ...e.agent, status: 'starting', label: '' });
-  else if (e.type === 'agent') { const a = L.agents.get(e.id); if (a) Object.assign(a, { status: e.status, label: e.label, deviceName: e.deviceName ?? a.deviceName }); }
-  else if (e.type === 'lead') L.lead = e.label || e.status;
-  else if (e.type === 'said') L.lines.push({ who: e.from.name, me: e.from.id === state.user.id, to: e.target, text: e.text });
-  else if (e.type === 'chat') L.lines.push({ who: e.name, to: e.from, reply: true, text: e.text });
-  else if (e.type === 'ask') L.asks.set(e.qid, e);
-  else if (e.type === 'answered') L.asks.delete(e.qid);
-  else if (e.type === 'done') { L.summary = e.summary; L.running = false; }
-  else if (e.type === 'state' && e.state === 'idle') { L.running = false; L.asks.clear(); }
-  else if (e.type === 'skill') L.lines.push({ who: 'Lead', reply: true, to: 'lead', text: `${e.created ? 'Learned a new skill' : 'Improved a skill'}: ${e.name}` });
-  else if (e.type === 'remembered') L.lines.push({ who: 'Lead', reply: true, to: 'lead', text: `Remembered for ${e.scope === 'team' ? 'the team' : e.person}: ${e.note}` });
-  else if (e.type === 'error') L.lines.push({ who: 'System', reply: true, to: 'lead', text: e.message });
-}
+// ---- The shell ----------------------------------------------------------------------------
 
-// ---- Main view ------------------------------------------------------------------------------------
-
-let draft = '';
-function viewMain() { render(); loadMemory(); loadHistory(); }
+const PAGES = [['sessions', 'Sessions'], ['team', 'Team'], ['library', 'Skills & memory'], ['billing', 'Billing']];
 
 function render() {
-  if (!state.team || !state.user) return;
-  const focused = document.activeElement?.id;
-  if (focused === 'chat-input' || focused === 'goal-input') draft = document.activeElement.value;
-  app.replaceChildren(
-    h('header', {},
-      h('h1', {}, 'Senju'), h('span', { class: 'muted' }, state.team.name), h('span', { class: 'spacer' }),
-      h('span', { class: 'muted small' }, state.name), h('button', { onclick: () => state.sb.auth.signOut() }, 'Sign out')),
-    h('main', {}, sessionPanel(), sidePanel()));
-  if (focused) { const el = document.getElementById(focused); if (el) { el.focus(); el.value = draft; } }
+  const nav = h('nav', { class: 'nav' }, PAGES.map(([id, label]) => h('button', { class: `nav-pill${state.page === id ? ' on' : ''}`, onclick: () => { state.page = id; render(); } }, label)));
+  const top = h('header', { class: 'stage bar' },
+    h('div', { class: 'bar-left' }, h('span', { class: 'logo display' }, 'Senju'), h('span', { class: 'team-tag' }, state.team.name)),
+    nav,
+    h('div', { class: 'bar-right' }, h('span', { class: 'me' }, state.name), h('button', { class: 'btn btn-outline-white btn-sm', onclick: () => state.sb.auth.signOut() }, 'Sign out')));
+  const page = state.page === 'team' ? teamPage() : state.page === 'library' ? libraryPage() : state.page === 'billing' ? billingPage() : sessionsPage();
+  app.replaceChildren(h('div', { class: 'shell' }, top, h('main', { class: 'content' }, page)));
 }
 
-function sessionPanel() {
-  const L = state.live;
-  if (!L || (!L.running && !L.summary)) {
-    return h('section', { class: 'card' },
-      h('h2', {}, 'Start a session'),
-      h('p', { class: 'muted small' }, state.hasKey || !state.billing?.hosted
-        ? 'The lead plans the work and sends agents to the computers your team has connected. A session runs on the API key of whoever starts it.'
-        : `The lead plans the work and sends agents to the computers your team has connected. Whoever starts a session pays for it. You have ${state.billing.creditsText} of credits.`),
-      startBlocker() && h('p', { class: 'error' }, startBlocker()),
-      h('form', { onsubmit: (ev) => { ev.preventDefault(); const goal = $('#goal-input').value.trim(); if (goal) { say({ t: 'start', goal }); draft = ''; } } },
-        h('textarea', { id: 'goal-input', rows: 3, placeholder: 'What should the swarm do?' }),
-        h('div', {}, h('button', { class: 'primary', type: 'submit', disabled: Boolean(startBlocker()) }, 'Start'))));
+// ---- Sessions -------------------------------------------------------------------------------
+
+async function loadSessions() {
+  try { state.sessions = (await api('GET', '/api/sessions')).sessions; } catch (err) { toast(err.message); state.sessions = []; }
+  const list = document.querySelector('.session-list');
+  if (list) list.replaceWith(sessionList());
+}
+
+function sessionList() {
+  const box = h('div', { class: 'session-list' });
+  if (!state.sessions.length) box.append(h('p', { class: 'dim pad' }, 'No sessions yet. Start one from the Senju desktop app.'));
+  for (const s of state.sessions) {
+    box.append(h('button', { class: `session-row${state.selected === s.id ? ' on' : ''}`, onclick: () => openSession(s.id) },
+      h('span', { class: 'session-row-title' }, s.title || s.goal),
+      h('span', { class: 'session-row-meta' },
+        s.live ? h('span', { class: 'pill live' }, 'live') : h('span', { class: `pill ${s.status === 'done' ? 'done' : s.status === 'stopped' ? 'stopped' : ''}` }, s.status),
+        ` ${s.ownerName} · ${new Date(s.startedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} · ${s.turnCount} turn${s.turnCount === 1 ? '' : 's'}`)));
   }
-  // A teammate's session you have not joined: you are told it exists, and nothing of what is in it.
-  const me = state.people.find((p) => p.id === state.user.id);
-  if (L.running && me && !me.joined) {
-    return h('section', { class: 'card' },
-      h('h2', {}, L.goal),
-      h('p', { class: 'muted small' }, `Started by ${L.owner.name}. ${L.agents.size} ${L.agents.size === 1 ? 'agent is' : 'agents are'} working.`),
-      h('p', { class: 'small' }, 'Join to see the conversation and talk to the lead. Joining does not share your computer, and what is remembered about other people stays with them.'),
-      h('div', {}, h('button', { class: 'primary', onclick: () => say({ t: 'join' }) }, 'Join session')));
+  return box;
+}
+
+function sessionsPage() {
+  if (!state.sessions.length) loadSessions();
+  const viewer = h('section', { class: 'card viewer' });
+  const page = h('div', { class: 'sessions' },
+    h('aside', { class: 'card list-card' }, h('div', { class: 'card-head' }, h('h2', { class: 'display' }, 'Sessions'), h('span', { class: 'dim small' }, 'read-only')), sessionList()),
+    viewer);
+  if (state.selected) queueMicrotask(() => openSession(state.selected));
+  else viewer.append(h('div', { class: 'viewer-empty' },
+    h('h3', { class: 'display' }, 'Pick a session'),
+    h('p', { class: 'dim' }, 'Every step the agents took, who asked what, and what came of it. To start or continue a session, use the Senju desktop app.')));
+  return page;
+}
+
+async function openSession(id) {
+  state.selected = id;
+  document.querySelectorAll('.session-row').forEach((r, i) => r.classList.toggle('on', state.sessions[i]?.id === id));
+  const viewer = document.querySelector('.viewer');
+  if (!viewer) return;
+  viewer.replaceChildren(h('p', { class: 'dim pad' }, 'Loading…'));
+  let data;
+  try { data = await api('GET', `/api/sessions/${encodeURIComponent(id)}`); } catch (err) { return viewer.replaceChildren(h('p', { class: 'error-text pad' }, err.message)); }
+  if (state.selected !== id) return;
+  state.detail = data.session;
+  const d = data.session;
+  const title = h('h2', { class: 'viewer-title display' }, d.title || d.goal);
+  const actions = h('div', { class: 'viewer-actions' });
+  if (d.live && !state.watching) actions.append(h('button', { class: 'btn btn-punk btn-sm', onclick: () => say({ t: 'join' }) }, 'Watch live'));
+  if (d.canManage) {
+    actions.append(h('button', { class: 'btn btn-ghost btn-sm', onclick: async () => {
+      const name = prompt('Rename this session', d.title);
+      if (!name) return;
+      try { await api('PATCH', `/api/sessions/${encodeURIComponent(id)}`, { title: name }); await loadSessions(); openSession(id); } catch (err) { toast(err.message); }
+    } }, 'Rename'));
+    if (!d.live) actions.append(h('button', { class: 'btn btn-danger btn-sm', onclick: async () => {
+      if (!confirm('Delete this session and its history for the whole team?')) return;
+      try { await api('DELETE', `/api/sessions/${encodeURIComponent(id)}`); state.selected = null; await loadSessions(); render(); } catch (err) { toast(err.message); }
+    } }, 'Delete'));
   }
-  const mine = [...L.asks.values()].filter((a) => !a.audience || a.audience.userId === state.user.id);
-  const others = [...L.asks.values()].filter((a) => a.audience && a.audience.userId !== state.user.id);
-  const isOwner = L.owner.id === state.user.id;
-  return h('section', { class: 'card' },
-    h('div', { class: 'row' }, h('h2', { style: 'flex:1;margin:0' }, L.goal),
-      L.running && isOwner && h('button', { class: 'danger', onclick: () => say({ t: 'cancel' }) }, 'Stop'),
-      !L.running && h('button', { onclick: () => { state.live = null; render(); } }, 'New session')),
-    h('p', { class: 'muted small' }, `Started by ${L.owner.name}${L.running ? `. Lead: ${L.lead || 'working'}` : '. Finished.'}`),
-    L.summary && h('div', { class: 'summary' }, L.summary),
-    h('h3', {}, 'Agents'),
-    h('div', {},
-      agentRow({ id: 'lead', name: 'Lead', color: '#f2f3f5', status: '', label: L.lead }),
-      [...L.agents.values()].map(agentRow)),
-    mine.map(askCard),
-    others.map((a) => h('p', { class: 'muted small' }, `${L.agents.get(a.agentId)?.name ?? 'An agent'} is waiting for ${a.audience.userName} at their computer.`)),
-    h('h3', {}, `Chat with ${state.target === 'lead' ? 'the lead' : L.agents.get(state.target)?.name ?? 'the lead'}`),
-    h('div', { class: 'thread' }, L.lines.filter((l) => l.to === state.target).map((l) =>
-      h('div', { class: l.me ? 'line me' : 'line' }, h('b', {}, l.me ? 'You' : l.who), l.text))),
-    L.running && h('form', { style: 'margin-top:8px', onsubmit: (ev) => { ev.preventDefault(); const text = $('#chat-input').value.trim(); if (text) { say({ t: 'chat', text, target: state.target }); draft = ''; $('#chat-input').value = ''; } } },
-      h('div', { class: 'row' }, h('input', { id: 'chat-input', placeholder: 'Ask for progress or change the plan. Click an agent to talk to it instead.' }), h('button', { class: 'primary' }, 'Send'))));
+  const host = h('div', { class: 'tv-host' });
+  viewer.replaceChildren(
+    h('header', { class: 'viewer-head' },
+      h('div', {}, title, h('div', { class: 'viewer-sub dim' }, d.live ? h('span', { class: 'pill live' }, 'live') : null, ` Started by ${d.ownerName} · ${d.turns.length} turn${d.turns.length === 1 ? '' : 's'}${d.participant ? '' : ' · you were not in it, so you see the outline only'}`)),
+      actions),
+    h('div', { class: 'tv-scroll' }, host),
+    h('footer', { class: 'viewer-foot dim' }, 'Continue this session from the Senju desktop app: the lead remembers everything so far.'));
+  state.tv = createTraceView(host);
+  state.tv.load(d, data.events, { canShowResults: false });
 }
 
-function agentRow(a) {
-  return h('div', { class: `agent pick${state.target === a.id ? ' sel' : ''}`, onclick: () => { state.target = a.id; render(); } },
-    h('span', { class: 'dot', style: `background:${a.color}` }), h('b', {}, a.name),
-    h('span', { class: 'label' }, a.status === 'waiting' ? 'needs someone' : a.label || a.status),
-    a.deviceName && h('span', { class: 'where' }, `on ${a.deviceName}`));
+// ---- Team -----------------------------------------------------------------------------------
+
+function teamPage() {
+  const t = state.team;
+  const online = new Map(state.people.map((p) => [p.id, p]));
+  const err = h('p', { class: 'error-text' });
+  const act = (fn) => async () => { err.textContent = ''; try { await fn(); state.team = (await api('GET', '/api/team')).team; render(); } catch (x) { err.textContent = x.message; } };
+  return h('div', { class: 'team' },
+    h('section', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h2', { class: 'display' }, t.name), t.isOwner ? h('button', { class: 'btn btn-ghost btn-sm', onclick: act(async () => { const name = prompt('Team name', t.name); if (name) await api('PATCH', '/api/team', { name }); }) }, 'Rename') : null),
+      h('div', { class: 'invite' },
+        h('div', {}, h('div', { class: 'kicker' }, 'Invite code'), h('code', { class: 'code' }, t.inviteCode)),
+        h('button', { class: 'btn btn-punk btn-sm', onclick: () => { navigator.clipboard.writeText(t.inviteCode); toast('Invite code copied.'); } }, 'Copy'),
+        t.isOwner ? h('button', { class: 'btn btn-ghost btn-sm', onclick: act(async () => { if (confirm('Make a new code? The old one stops working.')) await api('POST', '/api/team/invite'); }) }, 'New code') : null),
+      h('p', { class: 'dim small' }, 'Teammates join from this page with the code, then sign in to the desktop app with the same account.')),
+    h('section', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h2', { class: 'display' }, 'People'), state.liveSession ? h('span', { class: 'pill live' }, `${state.liveSession.owner?.name ?? 'Someone'}’s session is running`) : null),
+      h('div', { class: 'members' }, t.members.map((m) => {
+        const p = online.get(m.id);
+        return h('div', { class: 'member' },
+          h('span', { class: `presence ${p ? 'on' : ''}` }),
+          h('div', { class: 'member-name' }, h('b', {}, m.name, m.id === t.me ? ' (you)' : ''), h('span', { class: 'dim small' }, p ? [p.devices.map((d) => `${d.name}${d.inSession ? ' · in the session' : ''}`).join(', '), p.web ? (p.devices.length ? ' · web' : 'on the web') : ''].join('') || 'online' : 'offline')),
+          h('span', { class: 'pill' }, m.role),
+          t.isOwner && m.id !== t.me ? h('button', { class: 'link', onclick: act(async () => { if (confirm(`Remove ${m.name} from the team?`)) await api('DELETE', `/api/team/members/${encodeURIComponent(m.id)}`); }) }, 'Remove') : null);
+      })),
+      err,
+      h('div', { class: 'row' }, h('button', { class: 'btn btn-danger btn-sm', onclick: async () => {
+        if (!confirm(`Leave ${t.name}?`)) return;
+        try { await api('POST', '/api/team/leave'); loadAccount(); } catch (x) { err.textContent = x.message; }
+      } }, 'Leave team'))));
 }
 
-function askCard(a) {
-  const L = state.live;
-  const who = a.agentId === 'lead' ? 'Lead' : L.agents.get(a.agentId)?.name ?? 'Agent';
-  const answer = (text) => say({ t: 'answer', qid: a.qid, text });
-  const input = h('input', { placeholder: a.kind === 'question' ? 'Type your answer' : a.replyHint ? `Type ${a.replyHint}` : 'Optional note' });
-  return h('div', { class: 'ask' },
-    h('div', { class: 'who' }, `${who} ${a.kind === 'question' ? 'has a question' : 'needs you to do something'}${a.audience ? ' at your computer' : ''}`),
-    h('div', {}, a.kind === 'question' ? a.question : a.kind === 'task' ? a.task : a.reason),
-    a.kind !== 'question' && h('div', { class: 'steps' }, a.kind === 'task' ? [a.where && `Where: ${a.where}`, a.doneWhen && `It will check: ${a.doneWhen}`].filter(Boolean).join('\n') : `${a.steps}\nIt will check: ${a.doneWhen}`),
-    h('div', { class: 'buttons' },
-      a.kind === 'question' ? (a.options ?? []).map((o) => h('button', { onclick: () => answer(o) }, o))
-        : [h('button', { class: 'primary', onclick: () => answer('Done') }, 'Done'), h('button', { onclick: () => answer('The user cannot do this. Stop this part and report.') }, "I can't do this")]),
-    h('form', { style: 'margin-top:8px', onsubmit: (ev) => { ev.preventDefault(); if (input.value.trim() || a.kind !== 'question') answer(input.value.trim() || 'Done'); } },
-      h('div', { class: 'row' }, input, h('button', {}, 'Reply'))));
+// ---- Skills & memory --------------------------------------------------------------------------
+
+function libraryPage() {
+  const box = h('section', { class: 'card library' });
+  renderLibrary(box, {
+    skills: async () => (await api('GET', '/api/skills')).skills,
+    saveSkill: ({ name, description, body }) => api('PUT', `/api/skills/${encodeURIComponent(name)}`, { description, body }),
+    deleteSkill: (name) => api('DELETE', `/api/skills/${encodeURIComponent(name)}`),
+    notes: async () => (await api('GET', '/api/memory')).notes,
+    addNote: (note, scope) => api('POST', '/api/memory', { note, scope }),
+    deleteNote: (id) => api('DELETE', `/api/memory/${encodeURIComponent(id)}`),
+  }, { team: true });
+  return box;
 }
 
-function sidePanel() {
-  const tabs = ['people', 'memory', 'history', 'settings'];
-  return h('section', { class: 'card' },
-    h('div', { class: 'tabs' }, tabs.map((t) => h('button', { class: state.tab === t ? 'on' : '', onclick: () => { state.tab = t; if (t === 'memory') loadMemory(); if (t === 'history') loadHistory(); render(); } }, t[0].toUpperCase() + t.slice(1)))),
-    { people: peopleTab, memory: memoryTab, history: historyTab, settings: settingsTab }[state.tab]());
-}
+// ---- Billing: plan, credits, and your own key ----------------------------------------------------
 
-function peopleTab() {
-  return h('div', {},
-    h('p', { class: 'muted small' }, 'Who is online, and which computers are connected. A computer joins a session only after its owner allows it.'),
-    state.people.length === 0 && h('p', { class: 'muted' }, 'Nobody else is online.'),
-    state.people.map((p) => h('div', { class: 'item' },
-      h('b', {}, p.name), p.id === state.user.id && h('span', { class: 'pill' }, 'you'), p.web && h('span', { class: 'pill' }, 'web'),
-      p.devices.map((d) => h('div', { class: 'meta' }, d.name, h('span', { class: `pill${d.inSession ? ' on' : ''}` }, d.inSession ? 'in session' : d.asked ? 'asked to join' : 'connected'))),
-      p.devices.length === 0 && h('div', { class: 'meta' }, 'No computer connected'))),
-    h('h3', {}, 'Invite a teammate'),
-    h('p', { class: 'small' }, 'Invite code: ', h('code', {}, state.team.invite_code)));
-}
-
-async function loadMemory() {
-  const { data } = await state.sb.from('memories')
-    .select('id, kind, scope, name, description, body, revision, updated_at, author:profiles!memories_author_id_fkey(name)')
-    .order('updated_at', { ascending: false }).limit(200);
-  state.memory = data ?? [];
-  if (state.tab === 'memory') render();
-}
-
-function memoryTab() {
-  const forget = async (m) => { await state.sb.from('memories').delete().eq('id', m.id); loadMemory(); };
-  const group = (title, hint, rows) => [h('h3', {}, title), h('p', { class: 'muted small' }, hint),
-    rows.length === 0 ? h('p', { class: 'muted small' }, 'Nothing yet.') : rows.map((m) => h('div', { class: 'item' },
-      m.kind === 'skill' && h('b', {}, m.name), m.kind === 'skill' && h('span', { class: 'pill' }, `revision ${m.revision}`),
-      m.kind === 'skill' ? h('div', { class: 'small' }, m.description) : h('div', {}, m.body),
-      m.kind === 'skill' && h('details', {}, h('summary', { class: 'small muted' }, 'Show'), h('pre', {}, m.body)),
-      h('div', { class: 'meta' }, `From ${m.author?.name ?? 'someone'}, ${new Date(m.updated_at).toLocaleDateString()} `, h('button', { class: 'link', onclick: () => forget(m) }, 'Forget'))))];
-  return h('div', {},
-    group('About you', 'Only you can see these. Each one records who said it.', state.memory.filter((m) => m.kind === 'note' && m.scope === 'user')),
-    group('Team notes', 'Visible to your whole team.', state.memory.filter((m) => m.kind === 'note' && m.scope === 'team')),
-    group('Team skills', 'Written by the lead after sessions, credited to the session owner.', state.memory.filter((m) => m.kind === 'skill')));
-}
-
-async function loadHistory() {
-  const { data } = await state.sb.from('sessions').select('id, goal, status, summary, started_at, owner:profiles!sessions_owner_id_fkey(name)').order('started_at', { ascending: false }).limit(30);
-  state.history = data ?? [];
-  if (state.tab === 'history') render();
-}
-
-function historyTab() {
-  return h('div', {}, state.history.length === 0 ? h('p', { class: 'muted' }, 'No sessions yet.') : state.history.map((s) => h('div', { class: 'item' },
-    h('b', {}, s.goal), h('span', { class: 'pill' }, s.status),
-    h('div', { class: 'meta' }, `${s.owner?.name ?? 'Someone'}, ${new Date(s.started_at).toLocaleString()}`),
-    s.summary && h('details', {}, h('summary', { class: 'small muted' }, 'Summary'), h('pre', {}, s.summary)))));
-}
-
-function settingsTab() {
-  const err = h('div', { class: 'error' });
+function billingPage() {
+  const err = h('p', { class: 'error-text' });
   const keyCall = async (method, body) => {
-    const res = await fetch('/api/key', { method, headers: { authorization: `Bearer ${state.token}`, 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
-    const out = await res.json();
-    if (!res.ok) { err.textContent = out.error; return false; }
+    try { await api(method, '/api/key', body); } catch (x) { err.textContent = x.message; return; }
     state.hasKey = method === 'POST';
     await loadBilling();
     render();
-    return true;
   };
   const b = state.billing;
   const pay = async (path, body) => {
-    const res = await fetch(path, { method: 'POST', headers: { authorization: `Bearer ${state.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) });
-    const out = await res.json();
-    if (!res.ok) { err.textContent = out.error; return; }
-    location.href = out.url;   // Stripe's own page takes the card
+    try { location.href = (await api('POST', path, body ?? {})).url; } catch (x) { err.textContent = x.message; }   // Stripe's own page takes the card
   };
-  const plan = b?.hosted && h('div', {},
-    h('h3', {}, 'Plan and credits'),
+  const plan = b?.hosted ? h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', { class: 'display' }, 'Plan & credits'), b.active ? h('span', { class: 'pill done' }, 'subscribed') : null),
     !b.payments
-      ? h('p', { class: 'muted small' }, 'Payments are not set up on this server yet.')
+      ? h('p', { class: 'dim' }, 'Payments are not set up on this server yet.')
       : b.active
         ? h('div', {},
-          h('p', {}, 'Balance: ', h('b', {}, b.creditsText), b.periodEnd ? h('span', { class: 'muted small' }, `  Next ${`$${b.plan.creditsUsd}`} of credits on ${new Date(b.periodEnd).toLocaleDateString()}.`) : null),
-          h('div', { class: 'row pay' }, b.topups.map((usd) => h('button', { onclick: () => pay('/api/billing/checkout', { kind: 'topup', amount: usd }) }, `Add $${usd}`)),
+          h('div', { class: 'balance' }, h('span', { class: 'kicker' }, 'Balance'), h('span', { class: 'display big' }, b.creditsText)),
+          b.periodEnd ? h('p', { class: 'dim small' }, `Next $${b.plan.creditsUsd} of credits on ${new Date(b.periodEnd).toLocaleDateString()}.`) : null,
+          h('div', { class: 'row left' }, b.topups.map((usd) => h('button', { class: 'btn btn-punk btn-sm', onclick: () => pay('/api/billing/checkout', { kind: 'topup', amount: usd }) }, `Add $${usd}`)),
             h('button', { class: 'link', onclick: () => pay('/api/billing/portal') }, 'Change card or cancel')))
         : h('div', {},
-          h('p', { class: 'small' }, `$${b.plan.usd} a month. Each month adds $${b.plan.creditsUsd} of credits, and unused credits carry over. Sessions you start are charged for the tokens they use.`),
-          b.credits > 0 ? h('p', { class: 'muted small' }, `You still have ${b.creditsText} of credits from before. They are usable again once you subscribe.`) : null,
-          h('div', {}, h('button', { class: 'primary', onclick: () => pay('/api/billing/checkout', { kind: 'subscribe' }) }, 'Subscribe'))),
-    b.hasOwnKey ? h('p', { class: 'muted small' }, 'You have your own API key saved, so your sessions run on it and cost no credits.') : null);
-  return h('div', {},
+          h('p', {}, `$${b.plan.usd} a month. Each month adds $${b.plan.creditsUsd} of credits, and unused credits carry over. Sessions you start are charged for the tokens they use.`),
+          b.credits > 0 ? h('p', { class: 'dim small' }, `You still have ${b.creditsText} of credits from before. They are usable again once you subscribe.`) : null,
+          h('button', { class: 'btn btn-punk', onclick: () => pay('/api/billing/checkout', { kind: 'subscribe' }) }, 'Subscribe →')),
+    b.hasOwnKey ? h('p', { class: 'dim small' }, 'You have your own API key saved, so your sessions run on it and cost no credits.') : null) : null;
+  return h('div', { class: 'billing' },
     plan,
-    h('h3', {}, b?.hosted ? 'Or use your own Anthropic API key' : 'Your Anthropic API key'),
-    h('p', { class: 'muted small' }, b?.hosted
-      ? 'With a key saved, sessions you start run on it for free and use no credits. It is encrypted on the server and never shown again, and teammates cannot use it for their own sessions.'
-      : 'Sessions you start run on your key. It is encrypted on the server and never shown again, and teammates cannot use it for their own sessions.'),
-    state.hasKey
-      ? h('p', {}, 'A key is saved. ', h('button', { class: 'link', onclick: () => keyCall('DELETE') }, 'Remove it'))
-      : h('form', { onsubmit: (ev) => { ev.preventDefault(); keyCall('POST', { key: new FormData(ev.target).get('key') }); } },
-        h('div', { class: 'row' }, h('input', { name: 'key', type: 'password', placeholder: 'sk-ant-...', required: true, autocomplete: 'off' }), h('button', { class: 'primary' }, 'Save'))),
-    err,
-    h('h3', {}, 'Team'),
-    h('p', { class: 'small' }, `${state.team.name}. Invite code: `, h('code', {}, state.team.invite_code)),
-    h('h3', {}, 'Desktop app'),
-    h('p', { class: 'muted small' }, 'To connect a computer, open the Senju app on it, choose "With my team", and sign in with this account.'));
+    h('section', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h2', { class: 'display' }, b?.hosted ? 'Or bring your own key' : 'Your API key')),
+      h('p', { class: 'dim' }, 'Sessions you start run on your Anthropic key, free of credits. It is encrypted on the server and never shown again, and teammates cannot use it for their own sessions.'),
+      state.hasKey
+        ? h('p', {}, 'A key is saved. ', h('button', { class: 'link', onclick: () => keyCall('DELETE') }, 'Remove it'))
+        : h('form', { class: 'inline', onsubmit: (ev) => { ev.preventDefault(); keyCall('POST', { key: new FormData(ev.target).get('key') }); } },
+          h('input', { class: 'field', name: 'key', type: 'password', placeholder: 'sk-ant-…', required: true, autocomplete: 'off' }), h('button', { class: 'btn btn-punk' }, 'Save')),
+      err));
 }
 
-boot().catch((err) => { app.replaceChildren(h('p', { class: 'center error' }, `Could not start: ${err.message}`)); });
+boot().catch((err) => { app.replaceChildren(h('p', { class: 'error-text pad' }, `Could not start: ${err.message}`)); });

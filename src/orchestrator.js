@@ -22,6 +22,44 @@ const ANSWER_NOW = '(Answer the user now. Your visible reply must begin with one
 const ANSWER_AGAIN = 'You made tool calls without answering the user, so that reply was discarded. Their message is above. Write your answer to them as plain text first (what is done, what is in progress, what is blocked, or whatever they asked), then make your tool calls.';
 const MAX_REPLY_NUDGES = 2;
 
+// ---- Session traces ---------------------------------------------------------------
+// Every model reply and tool call becomes a "step" event, so a session can be read back later.
+
+const clip = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' ').trim(); return s.length > n ? `${s.slice(0, n - 1)}…` : s; };
+
+// A short, human description of what a tool call aims at: the page, the element, the key, the app.
+export function stepLabel(name, input = {}) {
+  if (!input || typeof input !== 'object') return '';
+  const pick = (...keys) => { for (const k of keys) if (input[k] != null && String(input[k]).trim()) return String(input[k]); return ''; };
+  const tool = String(name).replace(/^.*__/, '');
+  if (tool === 'spawn_agent') return `${pick('name')}: ${clip(pick('goal'), 120)}`;
+  if (/^(message_agent|stop_agent)$/.test(tool)) return pick('agent');
+  if (/^(ask_user|user_task|handoff)$/.test(tool)) return clip(pick('question', 'task', 'reason'), 120);
+  if (/type|set_value/.test(tool)) return `${pick('element', 'target', 'element_token') ? `${clip(pick('element', 'target', 'element_token'), 50)} ← ` : ''}"${clip(pick('text', 'value'), 60)}"`;
+  if (/key|hotkey/.test(tool)) return pick('key', 'keys', 'combo');
+  if (/navigate|open/.test(tool)) return clip(pick('url', 'app', 'path'), 120);
+  return clip(pick('element', 'target', 'url', 'app', 'app_name', 'query', 'path', 'name', 'note', 'title', 'function'), 120);
+}
+
+// The lead's conversation as it can be saved and resumed: no images, and no tool call left without a result.
+export function snapshotMessages(messages) {
+  const copy = JSON.parse(JSON.stringify(messages ?? []));
+  for (const m of copy) {
+    if (!Array.isArray(m.content)) continue;
+    m.content = m.content.filter((b) => b.type !== 'image').map((b) => b.type === 'tool_result' && Array.isArray(b.content)
+      ? { ...b, content: b.content.filter((c) => c.type !== 'image').length ? b.content.filter((c) => c.type !== 'image') : [{ type: 'text', text: '[image]' }] }
+      : b);
+  }
+  return closeOpenCalls(copy);
+}
+
+export function closeOpenCalls(messages) {
+  const last = messages.at(-1);
+  const open = last?.role === 'assistant' && Array.isArray(last.content) ? last.content.filter((b) => b.type === 'tool_use') : [];
+  if (open.length) messages.push({ role: 'user', content: open.map((c) => ({ type: 'tool_result', tool_use_id: c.id, content: [{ type: 'text', text: 'Not run: the job ended.' }] })) });
+  return messages;
+}
+
 const LEAD_SYSTEM = (maxAgents, team = false) => `You are the lead of a swarm of agents working on the user's computer. The user keeps using the computer while the swarm works. You do not act on apps yourself. You spawn workers, watch what they find, and adjust the plan as you learn more.
 
 # Your loop
@@ -541,6 +579,15 @@ export class Swarm {
 
   trace(who, kind, data) { this.tracer?.write(who, kind, data); }
 
+  // One tool call, for the session trace. Input and result are clipped; the hub strips results before
+  // anyone else sees them (tool results stay between the computer and the model).
+  emitStep(agentId, call, result, isError, t0) {
+    this.emit({
+      type: 'step', agentId, kind: 'tool', tool: call.name, label: stepLabel(call.name, call.input),
+      input: clip(JSON.stringify(call.input ?? {}), 300), result: clip(result, 600), isError, ms: Date.now() - t0, at: t0,
+    });
+  }
+
   // Calls to a server marked "serial" run one at a time across all agents, because
   // they share one screen and keyboard and must not interleave.
   inTurn(conn, fn) {
@@ -744,7 +791,7 @@ export class Swarm {
     const resolve = this.pending.get(qid);
     if (!resolve) return;
     resolve(`${String(text ?? '').trim() || 'Done'}${who ? ` (from ${who})` : ''}`);
-    this.emit({ type: 'answered', qid });
+    this.emit({ type: 'answered', qid, text: clip(String(text ?? '').trim() || 'Done', 500), by: who ?? null });
   }
 
   // A chat message from the user, to the lead (default) or to one worker by id.
@@ -1029,6 +1076,7 @@ export class Swarm {
         if (text) {
           finalText = text;
           update({ label: text.slice(0, 80) });
+          this.emit({ type: 'step', agentId: agent.id, kind: 'say', text: clip(text, 2000), at: Date.now() });
         }
         if (agent.chatPending) {
           agent.chatPending = false;
@@ -1049,6 +1097,7 @@ export class Swarm {
         for (const [callIndex, call] of calls.entries()) {
           if (signal.aborted) throw new Error('cancelled');
           await this.gate(agent, update, signal);
+          const t0 = Date.now();
           const say = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
           let out;
           if (call.name === 'board_post') {
@@ -1207,6 +1256,7 @@ export class Swarm {
             }
           }
           this.trace(agent.name, 'tool', { name: call.name, isError: Boolean(out.isError), result: out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' ').slice(0, 1500) });
+          this.emitStep(agent.id, call, out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' '), Boolean(out.isError), t0);
           results.push({ type: 'tool_result', tool_use_id: call.id, content: out.content, is_error: out.isError });
         }
         messages.push({ role: 'user', content: results });
@@ -1253,14 +1303,30 @@ export class Swarm {
 
   // ---- The lead -------------------------------------------------------------------
 
-  async runLead(goal, signal) {
+  async runLead(goal, signal, resume = null) {
     const lead = (status, label = '') => this.emit({ type: 'lead', status, label });
     const serverList = Object.keys(this.catalog).map((name) => this.describeServer(name)).join('\n');
     const system = [{ type: 'text', text: LEAD_SYSTEM(this.maxAgents, Boolean(this.team)), cache_control: { type: 'ephemeral' } }];
     const skills = this.skills ? await this.skills.list() : [];
     const memoryNotes = this.memory ? await this.memory.notes() : '';
     const skillList = skills.length ? `\n\nSkills from earlier jobs (read the ones that fit before you plan):\n${skills.map((k) => `- ${k.name}: ${k.description}`).join('\n')}` : '';
-    const messages = [{ role: 'user', content: `Tool servers workers can use:\n${serverList || '(none)'}\nShared workspace folder for files: ${this.workspace}${this.team?.brief ? `\n\n${this.team.brief}` : ''}${memoryNotes ? `\n\nRemembered from earlier sessions:\n${memoryNotes}` : ''}${skillList}${this.lastJob ? `\n\nThe previous job, for context only (the new goal may follow on from it, e.g. "continue", "do it again", "now send that to Bob"; if it does not, ignore this):\nGoal: ${this.lastJob.goal}\nResult: ${this.lastJob.summary}` : ''}\n\nGoal: ${goal}` }];
+    const setting = `Tool servers workers can use:\n${serverList || '(none)'}\nShared workspace folder for files: ${this.workspace}${this.team?.brief ? `\n\n${this.team.brief}` : ''}${memoryNotes ? `\n\nRemembered from earlier sessions:\n${memoryNotes}` : ''}${skillList}`;
+    let messages;
+    if (resume?.messages?.length) {
+      // A session picked up again: the lead keeps its whole conversation. Workers, windows and browsers
+      // from last time are gone, so it is told what it has now and plans afresh from the new message.
+      messages = closeOpenCalls(JSON.parse(JSON.stringify(resume.messages)));
+      const note = `The user has come back to this session${resume.gap ? ` after ${resume.gap}` : ''} and continues it. The workers from before have ended and their windows may be closed; spawn new workers for anything that still needs doing.\n\n${setting}\n\nNew message from the user${resume.by ? ` (${resume.by})` : ''}: ${goal}`;
+      const last = messages.at(-1);
+      if (last?.role === 'user') {
+        if (typeof last.content === 'string') last.content = [{ type: 'text', text: last.content }];
+        last.content.push({ type: 'text', text: note });
+      } else {
+        messages.push({ role: 'user', content: note });
+      }
+    } else {
+      messages = [{ role: 'user', content: `${setting}${this.lastJob ? `\n\nThe previous job, for context only (the new goal may follow on from it, e.g. "continue", "do it again", "now send that to Bob"; if it does not, ignore this):\nGoal: ${this.lastJob.goal}\nResult: ${this.lastJob.summary}` : ''}\n\nGoal: ${goal}` }];
+    }
     this.leadCtx = { messages, system };
     let replyNudges = 0;
     let nudged = false;   // told once that workers are still running; after that a text-only reply just keeps waiting
@@ -1301,7 +1367,7 @@ export class Swarm {
         continue;
       }
       messages.push({ role: 'assistant', content: res.content });
-      if (text) lastText = text;
+      if (text) { lastText = text; this.emit({ type: 'step', agentId: 'lead', kind: 'say', text: clip(text, 2000), at: Date.now() }); }
       if (this.leadChat) {
         this.leadChat = false;
         replyNudges = 0;
@@ -1340,6 +1406,7 @@ export class Swarm {
       const results = [];
       for (const call of calls) {
         if (signal.aborted) throw new Error('cancelled');
+        const t0 = Date.now();
         let textOut;
         if (call.name === 'spawn_agent') {
           textOut = spawnResults[spawns.indexOf(call)];
@@ -1384,6 +1451,7 @@ export class Swarm {
           textOut = `Unknown tool ${call.name}`;
         }
         this.trace('lead', 'tool', { name: call.name, isError: false, result: String(textOut).slice(0, 1500) });
+        this.emitStep('lead', call, textOut, false, t0);
         results.push({ type: 'tool_result', tool_use_id: call.id, content: [{ type: 'text', text: textOut }] });
       }
       messages.push({ role: 'user', content: results });
@@ -1392,7 +1460,9 @@ export class Swarm {
   }
 
   // Run one job end to end. Resolves when the swarm is idle again.
-  async run(goal) {
+  // With resume.messages, the lead carries on a saved conversation (see snapshotMessages).
+  // Afterwards this.leadSnapshot holds the conversation to save for the next resume.
+  async run(goal, { resume = null } = {}) {
     if (this.running) return;
     this.running = true;
     this.abort = new AbortController();
@@ -1406,6 +1476,7 @@ export class Swarm {
     this.usage = { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     this.budgetWarned = false;
     this.leadCtx = null;
+    this.leadSnapshot = null;
     let finished = false;
     try {
       await this.closeKept();
@@ -1415,7 +1486,7 @@ export class Swarm {
       this.tracer = this.traceDir ? new Tracer(this.traceDir, goal) : null;
       if (!this.catalog) await this.loadCatalog();
       this.emit({ type: 'state', state: 'running' });
-      const summary = await this.runLead(goal, signal);
+      const summary = await this.runLead(goal, signal, resume);
       this.trace('lead', 'end', { reason: 'reported', report: summary });
       this.trace('swarm', 'usage', { note: JSON.stringify(this.usage) });
       this.emit({ type: 'done', summary });
@@ -1427,6 +1498,8 @@ export class Swarm {
       const progress = this.agents.map((a) => `${a.name}: ${a.status}${a.label ? ` (${a.label})` : ''}`).join('; ');
       this.lastJob = { goal, summary: `${signal.aborted ? 'Stopped by the user before finishing.' : `Failed: ${err?.message ?? err}.`}${progress ? ` Workers then: ${progress}` : ''}`.slice(0, 2000) };
     } finally {
+      // Saved before the retrospective adds its own turns to the same conversation.
+      if (this.leadCtx) this.leadSnapshot = snapshotMessages(this.leadCtx.messages);
       // The lead is done or gone: stop whatever is still running and let it clean up.
       this.abort.abort();
       await Promise.all(this.agents.map((a) => a.promise));

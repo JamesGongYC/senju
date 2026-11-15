@@ -55,3 +55,23 @@ export function saveSkill(dir, { name, description, body }) {
   fs.writeFileSync(file, `---\nname: ${id}\ndescription: ${desc}\nrevision: ${revision}\nupdated: ${new Date().toISOString().slice(0, 10)}\n---\n\n${text.slice(0, MAX_BODY)}\n`);
   return { name: id, description: desc, created: !existed, revision };
 }
+
+// Everything about every skill, for the skills panel.
+export function skillDetails(dir) {
+  if (!dir || !fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort().map((f) => {
+    const { meta, body } = parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+    return { name: f.slice(0, -3), description: meta.description ?? '', body, revision: Number(meta.revision ?? 1), updated: meta.updated ?? null };
+  });
+}
+
+// Remove a skill. Its last version is kept under .history/, like an edit.
+export function deleteSkill(dir, name) {
+  const id = slug(name);
+  const file = path.join(dir ?? '', `${id}.md`);
+  if (!dir || !id || !fs.existsSync(file)) return false;
+  const history = path.join(dir, '.history');
+  fs.mkdirSync(history, { recursive: true });
+  fs.renameSync(file, path.join(history, `${id}-deleted-${Date.now()}.md`));
+  return true;
+}

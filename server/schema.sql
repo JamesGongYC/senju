@@ -273,3 +273,38 @@ grant select, update on profiles to authenticated;
 grant select on teams, devices, sessions, messages, memory_revisions to authenticated;
 grant select, delete on team_members, memories to authenticated;
 revoke all on profiles, teams, team_members, devices, user_secrets, sessions, messages, memories, memory_revisions from anon;
+
+-- ---- Persistent sessions ----------------------------------------------------------------------
+-- A session is a thread of turns, like a chat: each turn is one goal or follow-up and what came of it.
+-- It can be continued later from the desktop app; the lead picks up its saved conversation.
+-- Safe to re-run.
+
+alter table sessions add column if not exists title text;
+alter table sessions add column if not exists turns jsonb not null default '[]';           -- [{goal, ownerId, ownerName, started, ended, status, summary, usage, billing, costMicro}]
+alter table sessions add column if not exists participants uuid[] not null default '{}';  -- everyone who took part in any turn
+
+-- What happened, event by event, for viewing a session. Each row says who may see it (audience),
+-- and the server filters by it, so there are no client policies: only the server reads this table.
+create table if not exists session_events (
+  id bigint generated always as identity primary key,
+  session_id uuid not null references sessions on delete cascade,
+  turn int not null,
+  seq int not null,
+  at timestamptz not null default now(),
+  audience jsonb,            -- null: everyone in the session; {"userId": ...}: that person only
+  event jsonb not null
+);
+create index if not exists session_events_order on session_events (session_id, turn, seq);
+
+-- The lead's conversation, saved after each turn so the session can be continued.
+-- It holds tool results from people's computers, so only the server reads it.
+create table if not exists session_contexts (
+  session_id uuid primary key references sessions on delete cascade,
+  messages jsonb not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table session_events enable row level security;
+alter table session_contexts enable row level security;
+grant all on session_events, session_contexts to service_role;
+revoke all on session_events, session_contexts from anon, authenticated;

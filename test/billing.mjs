@@ -117,7 +117,7 @@ const connect = async (who) => {
   const c = { got: [], say: (m) => ws.send(JSON.stringify(m)), ws };
   ws.on('message', (d) => c.got.push(JSON.parse(d)));
   await new Promise((r) => ws.on('open', r));
-  c.say({ t: 'hello', token: tokens[who], client: 'web' });
+  c.say({ t: 'hello', token: tokens[who], role: 'device', device: { id: `d-${who}`, name: `${who} Mac`, platform: 'darwin' } });   // sessions start from the desktop app
   await until(() => c.got.find((m) => m.t === 'welcome'), `${who} welcome`);
   return c;
 };

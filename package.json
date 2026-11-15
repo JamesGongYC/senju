@@ -6,7 +6,7 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node test/smoke.mjs && node test/hub.mjs && node test/hub-browser.mjs && node test/cloud.mjs && node test/billing.mjs",
+    "test": "node test/smoke.mjs && node test/hub.mjs && node test/hub-browser.mjs && node test/cloud.mjs && node test/billing.mjs && node test/sessions.mjs",
     "demo": "electron . --demo",
     "doctor": "node scripts/doctor.mjs",
     "server": "node server/index.js",
@@ -39,10 +39,12 @@
     "files": [
       "src/**",
       "renderer/**",
+      "launcher/**",
       "swarm.config.json",
       "package.json",
       "!server/**",
       "!web/**",
+      "web/shared/**",
       "!test/**",
       "!scripts/**",
       "!traces/**",

@@ -59,8 +59,45 @@ export class SupabaseStore {
 
   // ---- Sessions and chat ----------------------------------------------------------------------
   async createSession({ id, teamId, ownerId, goal }) {
-    ok(await this.db.from('sessions').insert({ id, team_id: teamId, owner_id: ownerId, goal }));
+    ok(await this.db.from('sessions').insert({ id, team_id: teamId, owner_id: ownerId, goal, title: String(goal).slice(0, 80), participants: [ownerId] }));
   }
+
+  // ---- Session history: turns, events, and the lead's conversation for continuing ------------------
+  async startTurn(id, turn) {
+    const row = ok(await this.db.from('sessions').select('turns').eq('id', id).single());
+    ok(await this.db.from('sessions').update({ turns: [...(row.turns ?? []), { ...turn, status: 'running' }], status: 'running', goal: turn.goal, ended_at: null }).eq('id', id));
+  }
+  async finishTurn(id, { participants = [], ...turn }) {
+    const row = ok(await this.db.from('sessions').select('turns, participants').eq('id', id).single());
+    const turns = (row.turns ?? []).map((t, i, all) => i === all.length - 1 ? { ...t, ...turn } : t);
+    ok(await this.db.from('sessions').update({ turns, participants: [...new Set([...(row.participants ?? []), ...participants])] }).eq('id', id));
+  }
+  async saveLeadCtx(id, messages) {
+    ok(await this.db.from('session_contexts').upsert({ session_id: id, messages, updated_at: new Date().toISOString() }));
+  }
+  async getLeadCtx(id) {
+    return ok(await this.db.from('session_contexts').select('messages').eq('session_id', id).maybeSingle())?.messages ?? null;
+  }
+  async appendEvents(id, rows) {
+    if (rows.length) ok(await this.db.from('session_events').insert(rows.map((r) => ({ session_id: id, turn: r.turn, seq: r.seq, at: r.at, audience: r.audience, event: r.event }))));
+  }
+  async listEvents(id) {
+    const out = [];
+    for (let from = 0; ; from += 1000) {   // PostgREST pages at 1000 rows
+      const page = ok(await this.db.from('session_events').select('turn, seq, at, audience, event').eq('session_id', id).order('turn').order('seq').range(from, from + 999));
+      out.push(...page);
+      if (page.length < 1000) return out;
+    }
+  }
+  async getSession(id) {
+    const row = ok(await this.db.from('sessions').select(SESSION_COLUMNS).eq('id', id).maybeSingle());
+    return row ? sessionRow(row) : null;
+  }
+  async listSessions(teamId, limit = 100) {
+    return ok(await this.db.from('sessions').select(SESSION_COLUMNS).eq('team_id', teamId).order('started_at', { ascending: false }).limit(limit)).map(sessionRow);
+  }
+  async renameSession(id, title) { ok(await this.db.from('sessions').update({ title: String(title).slice(0, 120) }).eq('id', id)); }
+  async deleteSession(id) { ok(await this.db.from('sessions').delete().eq('id', id)); }
   async endSession(id, { status, summary, usage, billing = null, costMicro = null }) {
     ok(await this.db.from('sessions').update({ status, summary, usage, billing, cost_micro: costMicro, ended_at: new Date().toISOString() }).eq('id', id));
   }
@@ -126,4 +163,50 @@ export class SupabaseStore {
   async addMemory({ scope, teamId, subjectId, authorId, sessionId, note }) {
     ok(await this.db.from('memories').insert({ kind: 'note', scope, team_id: teamId, subject_id: subjectId, author_id: authorId, session_id: sessionId, body: note }));
   }
+
+  // ---- Managing skills and memory (control page, desktop panel) ------------------------------------
+  async skillDetails(teamId) {
+    const rows = ok(await this.db.from('memories').select('name, description, body, revision, author:profiles!memories_author_id_fkey(name)').eq('team_id', teamId).eq('kind', 'skill').order('name'));
+    return rows.map((r) => ({ name: r.name, description: r.description, body: r.body, revision: r.revision, authorName: r.author?.name ?? null }));
+  }
+  async deleteSkill(teamId, name) {
+    return ok(await this.db.from('memories').delete().eq('team_id', teamId).eq('kind', 'skill').eq('name', slug(name)).select('id')).length > 0;
+  }
+  async listMemories(teamId, userId) {
+    const rows = ok(await this.db.from('memories')
+      .select('id, scope, subject_id, body, created_at, subject:profiles!memories_subject_id_fkey(name), author:profiles!memories_author_id_fkey(name)')
+      .eq('team_id', teamId).eq('kind', 'note').order('created_at', { ascending: false }).limit(300));
+    return rows.filter((m) => m.scope === 'team' || m.subject_id === userId)
+      .map((m) => ({ id: m.id, scope: m.scope, note: m.body, subjectName: m.subject?.name ?? 'Someone', authorName: m.author?.name ?? 'Someone', at: m.created_at }));
+  }
+  async deleteMemory(teamId, userId, id) {
+    const row = ok(await this.db.from('memories').select('id, scope, subject_id').eq('id', id).eq('team_id', teamId).eq('kind', 'note').maybeSingle());
+    if (!row || (row.scope !== 'team' && row.subject_id !== userId)) return false;
+    ok(await this.db.from('memories').delete().eq('id', id));
+    return true;
+  }
+
+  // ---- Team management --------------------------------------------------------------------------
+  async teamDetails(teamId) {
+    const team = ok(await this.db.from('teams').select('id, name, invite_code').eq('id', teamId).maybeSingle());
+    if (!team) return null;
+    const members = ok(await this.db.from('team_members').select('user_id, role, joined_at, profiles(name)').eq('team_id', teamId).order('joined_at'));
+    return {
+      id: team.id, name: team.name, inviteCode: team.invite_code,
+      ownerId: members.find((m) => m.role === 'owner')?.user_id ?? null,
+      members: members.map((m) => ({ id: m.user_id, name: m.profiles?.name ?? 'Someone', role: m.role })),
+    };
+  }
+  async renameTeam(teamId, name) { ok(await this.db.from('teams').update({ name: String(name).slice(0, 80) }).eq('id', teamId)); }
+  async regenerateInvite(teamId) {
+    const code = crypto.randomBytes(6).toString('hex');
+    ok(await this.db.from('teams').update({ invite_code: code }).eq('id', teamId));
+    return code;
+  }
+  async removeMember(teamId, userId) { ok(await this.db.from('team_members').delete().eq('team_id', teamId).eq('user_id', userId)); }
+}
+
+const SESSION_COLUMNS = 'id, team_id, owner_id, title, goal, status, summary, turns, participants, started_at, ended_at, cost_micro, owner:profiles!sessions_owner_id_fkey(name)';
+function sessionRow(r) {
+  return { id: r.id, teamId: r.team_id, ownerId: r.owner_id, ownerName: r.owner?.name ?? 'Someone', title: r.title ?? String(r.goal ?? '').slice(0, 80), goal: r.goal, status: r.status, summary: r.summary, turns: r.turns ?? [], participants: r.participants ?? [], startedAt: r.started_at, endedAt: r.ended_at, costMicro: r.cost_micro };
 }

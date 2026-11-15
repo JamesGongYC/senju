@@ -14,6 +14,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Hub } from './hub.js';
+import { handleApi } from './api.js';
 import { SupabaseStore } from './store-supabase.js';
 import { Billing, verifyWebhook } from './billing.js';
 import { makeLlm } from '../src/llm.js';
@@ -47,7 +48,7 @@ const config = {
   context: { enabled: true, clearToolResultsAt: 200000, keepToolResults: 10, compactAt: 500000 },
 };
 
-const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.png': 'image/png', '.jpg': 'image/jpeg' };
 const json = (res, code, body) => { res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(body)); };
 const readRaw = (req, limit) => new Promise((resolve, reject) => {
   const chunks = []; let size = 0;
@@ -55,16 +56,18 @@ const readRaw = (req, limit) => new Promise((resolve, reject) => {
   req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
   req.on('error', reject);
 });
-const readBody = async (req) => { try { return JSON.parse((await readRaw(req, 10000)) || '{}'); } catch { throw new Error('bad json'); } };
+const readBody = async (req, limit = 10000) => { try { return JSON.parse((await readRaw(req, limit)) || '{}'); } catch { throw new Error('bad json'); } };
 const signedIn = (req) => store.verifyToken((req.headers.authorization ?? '').replace(/^Bearer\s+/i, ''));
 // Where Stripe sends people back to. Set PUBLIC_URL in production; locally the request's own address is right.
 const originOf = (req) => (env.PUBLIC_URL || `${req.headers['x-forwarded-proto'] ?? 'http'}://${req.headers.host}`).replace(/\/+$/, '');
+
+const hub = new Hub({ store, makeLlm, config, hostedKey, pricing: hostedKey ? billing.p : null, traceDir: env.SWARM_TRACE_DIR ?? null, log: (...a) => console.error(...a) });
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS' });
+      res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' });
       return res.end();
     }
     if (url.pathname === '/health') return json(res, 200, { ok: true });
@@ -82,6 +85,8 @@ const server = http.createServer(async (req, res) => {
       }
       return json(res, 405, { error: 'Use POST or DELETE.' });
     }
+    // ---- Sessions, skills, memory, team (the control page) ----
+    if (url.pathname.startsWith('/api/') && await handleApi({ req, url, user: await signedIn(req), store, hub, json: (code, body) => (json(res, code, body), true), readBody })) return;
     // ---- Plan and credits ----
     if (url.pathname === '/api/billing') {
       const user = await signedIn(req);
@@ -121,6 +126,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-new Hub({ store, makeLlm, config, hostedKey, pricing: hostedKey ? billing.p : null, traceDir: env.SWARM_TRACE_DIR ?? null, log: (...a) => console.error(...a) }).listen(server);
+hub.listen(server);
 const port = Number(env.PORT ?? 8787);
 server.listen(port, () => console.log(`Senju server on http://localhost:${port}`));

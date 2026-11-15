@@ -17,5 +17,6 @@ contextBridge.exposeInMainWorld('swarm', {
   setMode: (mode) => ipcRenderer.send('app:mode', mode),
   saveKey: (key) => ipcRenderer.send('solo:key', key),
   setInteractive: (on) => ipcRenderer.send('overlay:interactive', on),
+  openApp: () => ipcRenderer.send('app:open-launcher'),
   onEvent: (fn) => ipcRenderer.on('swarm:event', (_e, event) => fn(event)),
 });

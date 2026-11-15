@@ -18,6 +18,14 @@ const CHARGE_STEP = 250_000;   // hosted sessions are charged each time another 
 // Kept so that someone who joins late can catch up.
 const LOGGED = new Set(['said', 'chat', 'result', 'board', 'remembered', 'skill']);
 const LOG_MAX = 300;
+// Kept for good in the session's history (everything but cursor motion and running totals).
+const UNSAVED = new Set(['point', 'cursor', 'targets', 'usage', 'credits', 'reset']);
+const FLUSH_MS = 2000;
+// The web app watches and manages; only the desktop app runs or steers a session.
+const DEVICE_ONLY = new Set(['start', 'chat', 'answer', 'cancel', 'pause', 'stop_agent', 'consent', 'leave']);
+// Tools whose target text is personal (a note about someone) or typed text that may be private.
+const PRIVATE_LABEL = /(^|__)(remember)$/;
+const TYPED = /type|set_value|fill/;
 
 export class Hub {
   /**
@@ -141,8 +149,11 @@ export class Hub {
   async handle(client, msg) {
     const team = client.team;
     const s = team.session;
+    if (client.role === 'web' && DEVICE_ONLY.has(msg.t)) {
+      return this.send(client, { t: 'error', code: 'view_only', message: 'The web page is for watching and managing. Start, continue and steer sessions from the Senju desktop app.' });
+    }
     switch (msg.t) {
-      case 'start': return this.start(client, String(msg.goal ?? '').trim());
+      case 'start': return this.start(client, String(msg.goal ?? '').trim(), msg.continueId ? String(msg.continueId) : null);
       case 'opened': case 'result': { // replies to our calls into a computer
         const waiting = client.rpc.get(msg.rid);
         if (!waiting) return;
@@ -204,10 +215,16 @@ export class Hub {
 
   // ---- Sessions ---------------------------------------------------------------------------
 
-  async start(client, goal) {
+  async start(client, goal, continueId = null) {
     const team = client.team;
     if (!goal) return;
     if (team.session) return this.send(client, { t: 'error', message: `${team.session.owner.name} already has a session running. Write to its lead to change the plan.` });
+    // Continuing a session: the lead picks up its saved conversation.
+    let prior = null;
+    if (continueId) {
+      prior = await this.store.getSession(continueId);
+      if (!prior || prior.teamId !== team.id) return this.send(client, { t: 'error', code: 'no_session', message: 'That session is not in your team.' });
+    }
     // Whoever starts the session pays for it: with their own key if they saved one, otherwise from their credits.
     let key = await this.store.getKey(client.user.id);
     let hosted = false;
@@ -221,7 +238,10 @@ export class Hub {
     }
 
     const s = {
-      id: crypto.randomUUID(), team, goal,
+      id: prior?.id ?? crypto.randomUUID(), team, goal,
+      title: prior?.title ?? goal.slice(0, 80),
+      turn: prior?.turns?.length ?? 0,
+      persist: [], seq: 0, flushing: Promise.resolve(),
       owner: { id: client.user.id, name: client.user.name },
       servers: new Map(),     // "server@computer" -> { client, server }
       allowed: new Set(),     // device ids taking part
@@ -263,16 +283,28 @@ export class Hub {
     });
     s.swarm.catalog = {};
     team.session = s;
-    await store.createSession({ id: s.id, teamId: team.id, ownerId: s.owner.id, goal });
+    // Earlier participants of a continued session keep their place in its history.
+    for (const id of prior?.participants ?? []) if (!s.people.has(id)) s.history = [...(s.history ?? []), id];
+    if (!prior) await store.createSession({ id: s.id, teamId: team.id, ownerId: s.owner.id, goal });
+    const started = new Date().toISOString();
+    await store.startTurn(s.id, { goal, ownerId: s.owner.id, ownerName: s.owner.name, started });
+    const resume = prior ? { messages: await store.getLeadCtx(s.id), by: client.user.name, gap: since(prior.endedAt) } : null;
+    s.flusher = setInterval(() => this.flush(s), FLUSH_MS);
     // The owner's own computers are in from the start. Everyone else's are asked.
     for (const c of team.clients) if (c.device) this.offer(s, c);
     this.presence(team);
-    this.event(s, { type: 'session', id: s.id, goal, owner: s.owner });
+    this.event(s, { type: 'session', id: s.id, goal, owner: s.owner, turn: s.turn, title: s.title, continued: Boolean(prior) });
 
-    s.swarm.run(goal).then(async () => {
+    s.swarm.run(goal, { resume: resume?.messages?.length ? resume : null }).then(async () => {
       const done = s.done;
       if (s.billing) await this.meter(s, s.swarm.usage, true);
-      await store.endSession(s.id, { status: done ? 'done' : 'stopped', summary: done?.summary ?? null, usage: s.swarm.usage, billing: s.billing ? 'hosted' : 'own_key', costMicro: s.billing?.cost ?? null }).catch(() => {});
+      clearInterval(s.flusher);
+      await this.flush(s);
+      const status = done ? 'done' : 'stopped';
+      const turn = { status, summary: done?.summary ?? null, usage: s.swarm.usage, billing: s.billing ? 'hosted' : 'own_key', costMicro: s.billing?.cost ?? null, ended: new Date().toISOString() };
+      await store.finishTurn(s.id, { ...turn, participants: [...new Set([...(s.history ?? []), ...s.people.keys()])] }).catch((err) => this.log('history: could not save the turn', s.id, err?.message ?? err));
+      if (s.swarm.leadSnapshot) await store.saveLeadCtx(s.id, s.swarm.leadSnapshot).catch((err) => this.log('history: could not save the lead', s.id, err?.message ?? err));
+      await store.endSession(s.id, { status, summary: turn.summary, usage: turn.usage, billing: turn.billing, costMicro: turn.costMicro }).catch(() => {});
       for (const c of team.clients) if (c.device) this.send(c, { t: 'session_over', sessionId: s.id });
       team.session = null;
       this.presence(team);
@@ -376,6 +408,17 @@ export class Hub {
 
   event(s, event) {
     const e = { ...event };
+    if (e.type === 'step') {
+      // Tool results stay between the computer and the model; typed text and personal notes are not shown.
+      delete e.result;
+      delete e.input;
+      if (PRIVATE_LABEL.test(String(e.tool ?? ''))) e.label = '';
+      else if (TYPED.test(String(e.tool ?? '').replace(/^.*__/, '')) && e.label) e.label = e.label.replace(/"[^"]*"$/, '(typed text)');
+      const agent = s.swarm.agents.find((a) => a.id === e.agentId);
+      const at = agent && s.servers.get(agent.server);
+      if (at) e.deviceName = at.client.device.name;
+    }
+    if (e.type === 'answered') e.audience = s.asks.get(e.qid)?.audience ?? null;
     if (e.type === 'agent' && e.server) {
       // Which computer the agent is on right now. Its cursor shows there and nowhere else.
       const at = s.servers.get(e.server);
@@ -396,6 +439,7 @@ export class Hub {
     if (e.type === 'done') s.done = e;
     if (e.type === 'usage' && s.billing) this.meter(s, e);
     if (LOGGED.has(e.type)) { s.log.push(e); if (s.log.length > LOG_MAX) s.log.shift(); }
+    if (!UNSAVED.has(e.type)) s.persist.push({ turn: s.turn, seq: s.seq++, at: new Date().toISOString(), audience: audienceOf(e), event: e });
     for (const c of s.team.clients) {
       const seen = this.view(s, c, e);
       if (seen) this.send(c, { t: 'event', sessionId: s.id, event: seen });
@@ -406,16 +450,21 @@ export class Hub {
   // Teammates who have not joined see only that agents exist and which computer each is on,
   // so the cursors can dock on their screen. Personal things go to their person alone.
   view(s, client, e) {
-    const me = client.user.id;
-    if (!s.people.has(me)) {
-      if (e.type === 'session' || e.type === 'reset' || e.type === 'state') return e;
-      if (e.type === 'spawn') return { type: 'spawn', agent: { id: e.agent.id, name: e.agent.name, color: e.agent.color } };
-      if (e.type === 'agent') return { ...e, label: '' };
-      return null;
-    }
-    if (e.type === 'remembered' && e.scope !== 'team' && e.personId !== me) return null;
-    if (e.type === 'ask' && e.audience && e.audience.userId !== me) return { type: 'ask', qid: e.qid, agentId: e.agentId, kind: e.kind, audience: e.audience, redacted: true };
-    return e;
+    return viewEvent(e, client.user.id, s.people.has(client.user.id));
+  }
+
+  // Write what has happened since the last flush to the session's history.
+  flush(s) {
+    if (!s.persist.length) return s.flushing;
+    const rows = s.persist.splice(0);
+    s.flushing = s.flushing.then(() => this.store.appendEvents(s.id, rows)).catch((err) => this.log('history: could not save events', s.id, err?.message ?? err));
+    return s.flushing;
+  }
+
+  // A session that is running now, for the HTTP API: its id and who is in it.
+  live(teamId) {
+    const s = this.teams.get(teamId)?.session;
+    return s ? { id: s.id, people: [...s.people.keys()] } : null;
   }
 
   // The session as it stands, replayed for one person through view().
@@ -443,4 +492,34 @@ function hubBrief(s) {
   }
   const computers = [...byDevice.values()].map((d) => `- "${d.name}" (${d.owner}'s): ${d.servers.join(', ')}`).join('\n');
   return `Session owner: ${s.owner.name}. People in this session: ${[...s.people.values()].join(', ')}.\nComputers connected now:\n${computers || '(none yet)'}`;
+}
+
+// What one person may see of an event: the same rule live and in history.
+// Teammates who are not in the session see only that agents exist and which computer each is on,
+// so the cursors can dock on their screen. Personal things go to their person alone.
+export function viewEvent(e, me, joined) {
+  if (!joined) {
+    if (e.type === 'session' || e.type === 'reset' || e.type === 'state') return e;
+    if (e.type === 'spawn') return { type: 'spawn', agent: { id: e.agent.id, name: e.agent.name, color: e.agent.color } };
+    if (e.type === 'agent') return { ...e, label: '' };
+    return null;
+  }
+  if (e.type === 'remembered' && e.scope !== 'team' && e.personId !== me) return null;
+  if (e.type === 'ask' && e.audience && e.audience.userId !== me) return { type: 'ask', qid: e.qid, agentId: e.agentId, kind: e.kind, audience: e.audience, redacted: true };
+  if (e.type === 'answered' && e.audience && e.audience.userId !== me) return { type: 'answered', qid: e.qid };
+  return e;
+}
+
+// Who an event is for, stored beside it so history can be filtered the same way.
+function audienceOf(e) {
+  if (e.type === 'remembered' && e.scope !== 'team') return { userId: e.personId };
+  if ((e.type === 'ask' || e.type === 'answered') && e.audience) return { userId: e.audience.userId };
+  return null;
+}
+
+function since(iso) {
+  const ms = iso ? Date.now() - Date.parse(iso) : NaN;
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const min = Math.round(ms / 60000);
+  return min < 90 ? `${min} minutes` : min < 60 * 36 ? `${Math.round(min / 60)} hours` : `${Math.round(min / 1440)} days`;
 }

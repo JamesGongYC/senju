@@ -97,9 +97,12 @@ await Promise.all([jamesMac, lindaMac, lindaWeb, monaWeb].map((c) => c.until((m)
 const pres = await lindaWeb.until((m) => m.t === 'presence' && m.people.length === 3 && m.people.filter((p) => p.devices.length === 1).length === 2, 'presence');
 assert.deepEqual(pres.people.map((p) => p.name).sort(), ['James', 'Linda', 'Mona']);
 
-// A session runs on its starter's key, so Linda (no key) cannot start one.
+// The web page watches and manages; it cannot start or steer a session.
 lindaWeb.say({ t: 'start', goal: 'x' });
-assert.equal((await lindaWeb.until((m) => m.t === 'error', 'no key')).code, 'no_key');
+assert.equal((await lindaWeb.until((m) => m.t === 'error', 'view only')).code, 'view_only');
+// A session runs on its starter's key, so Linda (no key) cannot start one.
+lindaMac.say({ t: 'start', goal: 'x' });
+assert.equal((await lindaMac.until((m) => m.t === 'error', 'no key')).code, 'no_key');
 
 jamesMac.say({ t: 'start', goal: "Copy the text from Linda's Word into my doc" });
 const ask = (await lindaMac.until((m) => m.t === 'consent_request', 'consent request')).session;
@@ -108,13 +111,13 @@ assert.ok(!jamesMac.got.some((m) => m.t === 'consent_request'));   // the owner'
 
 // Linda writes to the lead from the browser while the job runs.
 await lindaWeb.until((m) => m.t === 'event' && m.event.type === 'spawn', 'spawn');
-lindaWeb.say({ t: 'chat', text: 'also make it bold' });
+lindaMac.say({ t: 'chat', text: 'also make it bold' });
 
 // The worker hits a sign-in on Linda's computer: the request is addressed to her.
 const handoff = (await lindaMac.until((m) => m.t === 'event' && m.event.type === 'ask', 'handoff')).event;
 assert.deepEqual(handoff.audience, { deviceId: 'd-linda', userId: 'linda', userName: 'Linda' });
-lindaWeb.say({ t: 'cancel' });                                       // only the owner may stop the session
-assert.match((await lindaWeb.until((m) => m.t === 'error' && /Only James/.test(m.message), 'cancel refused')).message, /Only James/);
+lindaMac.say({ t: 'cancel' });                                       // only the owner may stop the session
+assert.match((await lindaMac.until((m) => m.t === 'error' && /Only James/.test(m.message), 'cancel refused')).message, /Only James/);
 // The request is for Linda alone: James sees that she is needed, not what was asked, and cannot answer for her.
 const jamesSees = (await jamesMac.until((m) => m.t === 'event' && m.event.type === 'ask', 'redacted ask')).event;
 assert.deepEqual(jamesSees, { type: 'ask', qid: handoff.qid, agentId: handoff.agentId, kind: 'handoff', audience: handoff.audience, redacted: true });
@@ -137,7 +140,7 @@ assert.deepEqual([...new Set(outside.replay.map((e) => e.type))].sort(), ['agent
 assert.deepEqual(Object.keys(outside.replay.find((e) => e.type === 'spawn').agent).sort(), ['color', 'id', 'name']);
 assert.ok(outside.replay.filter((e) => e.type === 'agent').every((e) => e.label === ''));
 assert.ok(!/bold|British|Sign in to Word|copy the text/.test(JSON.stringify(monaWeb.events)));
-lindaWeb.say({ t: 'answer', qid: handoff.qid, text: '' });
+lindaMac.say({ t: 'answer', qid: handoff.qid, text: '' });
 
 await jamesMac.until((m) => m.t === 'event' && m.event.type === 'done', 'done', 8000);
 await jamesMac.until((m) => m.t === 'event' && m.event.type === 'skill', 'skill', 8000);
@@ -201,13 +204,16 @@ jamesMac.ws.close();                                                  // James's
 await sleep(100);
 // Linda declined to share her computer, so she is outside this session until she joins.
 lindaWeb.got.length = 0;
+lindaMac.got.length = 0;
 lindaWeb.say({ t: 'answer', qid: q.qid, text: 'yes' });
-await lindaWeb.until((m) => m.t === 'error' && /Join the session first/.test(m.message), 'join first');
-lindaWeb.say({ t: 'join' });
+await lindaWeb.until((m) => m.t === 'error' && m.code === 'view_only', 'web cannot answer');
+lindaMac.say({ t: 'answer', qid: q.qid, text: 'yes' });
+await lindaMac.until((m) => m.t === 'error' && /Join the session first/.test(m.message), 'join first');
+lindaWeb.say({ t: 'join' });   // watching from the web page is allowed
 const caught = (await lindaWeb.until((m) => m.t === 'joined', 'joined')).session;
 assert.equal(caught.joined, true);
 assert.equal(caught.replay.find((e) => e.type === 'ask').question, 'continue?');   // the open question came with the catch-up
-lindaWeb.say({ t: 'answer', qid: q.qid, text: 'yes' });
+lindaMac.say({ t: 'answer', qid: q.qid, text: 'yes' });
 await lindaWeb.until((m) => m.t === 'event' && m.event.type === 'done' && m.event.summary === 'stopping', 'second done', 8000);
 assert.ok(told.some((t) => /Linda declined to share "Linda Mac"/.test(t)));
 assert.ok(told.some((t) => /The tool server "desktop@james-mac" is no longer available/.test(t)));

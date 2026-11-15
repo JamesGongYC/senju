@@ -23,15 +23,16 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 #bar button[hidden] { display: none; }
 #go { color: var(--text); font-weight: 500; }
 #go::after, #dismiss::after { padding: 1px 6px; border-radius: 5px; background: rgba(255, 255, 255, 0.1); font-size: 11px; line-height: 16px; color: var(--dim); }
-#go::after { content: "↩"; }
+#go::after { content: "↩"; background: #D3FD50; color: #141414; }
+#open-app { color: var(--text); }
 #dismiss::after { content: "esc"; }
 #bar #stop { color: #ff8d8d; }
 #bar #stop:hover { background: rgba(255, 93, 93, 0.16); }
 
 #state-dot { width: 24px; height: 24px; flex: none; color: rgba(242, 243, 245, 0.55); }
 #state-dot svg { display: block; width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; }
-#state-dot[data-state="planning"] { color: #ffb648; animation: pulse 0.9s ease-in-out infinite; }
-#state-dot[data-state="running"] { color: #39d98a; animation: pulse 1.4s ease-in-out infinite; }
+#state-dot[data-state="planning"] { color: #D3FD50; animation: pulse 0.9s ease-in-out infinite; }
+#state-dot[data-state="running"] { color: #FF4A1F; animation: pulse 1.4s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.35; transform: scale(0.8); } }
 
 /* Agents listed under the field like Spotlight results: one row each, the selected one highlighted */
@@ -83,11 +84,11 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 /* Question and handoff cards: one per agent, floating over that agent's window */
 #asks { width: 100%; display: flex; flex-direction: column; gap: 8px; }
 #floats { position: fixed; inset: 0; pointer-events: none; }
-.ask { width: 100%; padding: 11px 14px 12px; background: var(--glass); border: 1.5px solid var(--agent, #ffb648); border-radius: 16px; backdrop-filter: blur(24px); box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); font-size: 13px; line-height: 1.45; user-select: text; animation: nudge 0.4s ease-out; pointer-events: auto; }
+.ask { width: 100%; padding: 11px 14px 12px; background: var(--glass); border: 1.5px solid var(--agent, #D3FD50); border-radius: 16px; backdrop-filter: blur(24px); box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); font-size: 13px; line-height: 1.45; user-select: text; animation: nudge 0.4s ease-out; pointer-events: auto; }
 .ask.floating { position: absolute; left: 0; top: 0; }
 .ask-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
 .ask-who { padding: 2px 9px; border-radius: 999px; font-weight: 600; color: #101114; background: var(--agent, #ccc); }
-.ask-kind { color: #ffb648; font-weight: 600; }
+.ask-kind { color: #D3FD50; font-weight: 600; }
 .ask-text { white-space: pre-wrap; max-height: 30vh; overflow: auto; }
 .ask-steps { margin-top: 8px; padding: 8px 10px; border-radius: 10px; background: rgba(255, 255, 255, 0.06); white-space: pre-wrap; }
 .ask-steps small { display: block; margin-top: 6px; color: var(--dim); }
@@ -100,12 +101,12 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 @keyframes nudge { 0% { opacity: 0; margin-top: -6px; } 100% { opacity: 1; margin-top: 0; } }
 
 .toast.info { background: rgba(28, 44, 66, 0.92); border-color: rgba(77, 163, 255, 0.5); }
-.chip[data-status="waiting"] span { color: #ffb648; }
+.chip[data-status="waiting"] span { color: #D3FD50; }
 
 /* A cursor waiting on the user */
 .cursor[data-status="waiting"] .body { animation: none; }
 .cursor[data-status="waiting"] svg { overflow: visible; }
-.cursor[data-status="waiting"]::before { content: ""; position: absolute; left: -9px; top: -9px; width: 30px; height: 30px; border-radius: 50%; border: 2px solid #ffb648; animation: ring 1.3s ease-out infinite; }
+.cursor[data-status="waiting"]::before { content: ""; position: absolute; left: -9px; top: -9px; width: 30px; height: 30px; border-radius: 50%; border: 2px solid #D3FD50; animation: ring 1.3s ease-out infinite; }
 @keyframes ring { 0% { transform: scale(0.5); opacity: 1; } 100% { transform: scale(1.9); opacity: 0; } }
 
 .chip[data-status="blocked"] span { color: #b78bff; }
@@ -117,7 +118,7 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 .chip:hover { background: rgba(255, 255, 255, 0.07); }
 .chip.selected { background: color-mix(in srgb, var(--agent, #f2f3f5) 24%, transparent); }
 .chip.unread { padding-right: 28px; }
-.chip.unread::after { content: ""; position: absolute; top: 50%; right: 12px; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; background: #ffb648; }
+.chip.unread::after { content: ""; position: absolute; top: 50%; right: 12px; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; background: #D3FD50; }
 .chip[data-status="cancelled"] span { color: var(--dim); }
 
 #thread { width: 100%; max-height: 28vh; overflow: auto; padding: 10px 14px; background: var(--glass); border: 1px solid var(--line); border-radius: 16px; backdrop-filter: blur(24px); font-size: 13px; line-height: 1.45; user-select: text; display: flex; flex-direction: column; gap: 6px; }
@@ -146,7 +147,7 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 .thread-ctl button { padding: 3px 11px; font-size: 12px; }
 .thread-ctl button.danger { border-color: rgba(255, 93, 93, 0.6); color: #ff8d8d; }
 .thread-ctl:last-child { border-bottom: 0; padding-bottom: 0; }
-.chip[data-status="paused"] span { color: #ffb648; }
+.chip[data-status="paused"] span { color: #D3FD50; }
 .cursor[data-status="paused"] .body { animation: none; }
 .cursor[data-status="paused"] svg { opacity: 0.6; }
 
@@ -168,5 +169,5 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 #people { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
 #people:empty { display: none; }
 .person { font-size: 11.5px; color: var(--dim); padding: 2px 9px; border-radius: 999px; background: var(--glass); border: 1px solid var(--line); pointer-events: none; }
-.person.join { pointer-events: auto; cursor: pointer; color: #fff; background: var(--you, #2F6BFF); border-color: transparent; font: inherit; font-size: 11.5px; }
+.person.join { pointer-events: auto; cursor: pointer; color: #141414; background: #D3FD50; border-color: transparent; font-weight: 600; font: inherit; font-size: 11.5px; }
 .person.in { color: #39d98a; border-color: rgba(57, 217, 138, 0.45); }

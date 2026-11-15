@@ -690,6 +690,7 @@ stop.addEventListener('click', () => window.swarm.cancel());
 // Back to a fresh bar: the app clears its side (last job, leftover windows), and says reset.
 resetBtn.addEventListener('click', () => { if (state === 'idle') window.swarm.reset(); });
 $('dismiss').addEventListener('click', () => window.swarm.dismiss());
+$('open-app').addEventListener('click', () => window.swarm.openApp());
 $('card-close').addEventListener('click', () => { card.hidden = true; recheckHit(); refreshBar(); });
 window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') window.swarm.dismiss(); });
 window.addEventListener('resize', placeAll);

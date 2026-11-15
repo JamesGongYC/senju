@@ -15,6 +15,10 @@ import { makeLlm as claude } from './llm.js';
 import { ToolHost } from './toolhost.js';
 import { CloudClient, supabaseAuth } from './cloud.js';
 import { DEFAULT_HUB } from './config.js';
+import { SessionStore } from './sessions.js';
+import { LocalMemory } from './memory.js';
+import { LocalLibrary, TeamLibrary } from './library.js';
+import { Launcher } from './launcher.js';
 
 const DEMO = process.argv.includes('--demo') || process.env.SWARM_DEMO === '1';
 
@@ -59,6 +63,16 @@ loadEnv();
 const config = loadConfig();
 if (DEMO) config.servers = demoConfigServers;
 const workspace = ensureWorkspace();
+// Personal sessions and notes live in the data folder (a scratch folder in demo mode).
+const DATA = DEMO ? path.join(os.tmpdir(), 'senju-demo') : dataDir();
+const sessions = new SessionStore(path.join(DATA, 'sessions'));
+const memory = new LocalMemory(path.join(DATA, 'memory.json'));
+const skillsDir = config.skills === false ? null : DEMO ? path.join(os.tmpdir(), 'senju-demo-skills') : path.join(dataDir(), 'skills');
+let launcher = null;
+// The session the next goal goes to. Personal: { id, turn, running, outcome }. Team: what the hub said is running.
+let current = null;
+let teamLive = null;
+let lastAccount = null;
 
 let win = null;
 let tray = null;
@@ -134,6 +148,7 @@ function cursorMove(agentId, point) {
 }
 
 const send = (event) => {
+  record(event);
   if (!win || win.isDestroyed()) return;
   if (event.type === 'point') {
     if (lastTargets[event.agentId]?.elsewhere) return;   // acting on another desktop: nothing to show here
@@ -164,6 +179,136 @@ function makeLlm() {
   if (DEMO) return demoLlm;
   return process.env.ANTHROPIC_API_KEY ? claude(process.env.ANTHROPIC_API_KEY) : null;
 }
+
+// ---- Sessions: every job belongs to one, and the launcher shows it live ----------------------------
+const LIVE_SKIP = new Set(['point', 'cursor', 'targets', 'summon', 'mode', 'need_key', 'key_saved', 'consent', 'presence', 'notice']);
+
+// Keep a personal session's events, and pass every session event to the launcher as it happens.
+function record(event) {
+  if (event.type === 'account') { lastAccount = event; return launcher?.send({ kind: 'account', account: event }); }
+  if (LIVE_SKIP.has(event.type)) return;
+  let at = null;
+  if (TEAM) {
+    if (event.type === 'session') teamLive = { id: event.id, turn: event.turn ?? 0, running: true };
+    at = teamLive;
+  } else if (current?.running) {
+    at = current;
+    if (event.type === 'done') current.outcome = { status: 'done', summary: event.summary };
+    if (event.type === 'error') current.outcome = { status: 'stopped', summary: event.message };
+    try { sessions.appendEvent(current.id, current.turn, event); } catch { /* history is best effort; the job goes on */ }
+  }
+  if (at) launcher?.send({ kind: 'live', sessionId: at.id, row: { turn: at.turn, at: new Date().toISOString(), event } });
+  if (event.type === 'state') launcher?.send({ kind: 'state', running: event.state !== 'idle', sessionId: at?.id ?? null });
+}
+
+function ensureSwarm() {
+  if (swarm) return swarm;
+  const llm = makeLlm();
+  if (!llm) return null;
+  swarm = new Swarm({
+    llm, config, workspace, emit: send, layout,
+    idle: () => powerMonitor.getSystemIdleTime(),
+    traceDir: config.trace === false ? null : path.join(dataDir(), 'traces'),
+    skillsDir,
+    memory: config.memory === false ? null : memory,
+    ...(DEMO ? { connect: demoConnect } : {}),
+  });
+  return swarm;
+}
+
+// Run a goal: a new session, or the next turn of an existing one (the lead picks up where it left off).
+// Resolves once the job has started; the job itself keeps running.
+async function runGoal(goal, sessionId = null) {
+  goal = String(goal ?? '').trim();
+  if (!goal) throw new Error('Write what the swarm should do.');
+  if (!mode) throw new Error('Choose how to work first.');
+  if (TEAM) {
+    if (!cloud) throw new Error('Not connected to your team yet.');
+    if (cloud.running) throw new Error('Your team already has a session running.');
+    cloud.startSession(goal, sessionId);
+    return { sessionId };
+  }
+  if (swarm?.running) throw new Error('The last job is still wrapping up. Send it again in a moment.');
+  if (!ensureSwarm()) { send({ type: 'need_key', goal }); throw new Error('Add your Anthropic API key first.'); }
+  let meta = sessionId ? sessions.get(sessionId) : null;
+  if (!meta) { meta = sessions.create(goal); swarm.lastJob = null; }   // a new session starts fresh, like a new chat
+  const before = meta.turns.at(-1);
+  const turn = sessions.startTurn(meta.id, goal);
+  const lead = turn > 0 ? sessions.lead(meta.id) : null;
+  current = { id: meta.id, turn, running: true, outcome: null };
+  launcher?.send({ kind: 'sessions', sessionId: meta.id });
+  record({ type: 'session', id: meta.id, goal, turn, title: meta.title, continued: turn > 0 });
+  (async () => {
+    startTracking();
+    const keepAwake = powerSaveBlocker.start('prevent-app-suspension');   // the display may still turn off
+    const job = current;
+    try {
+      await swarm.run(goal, { resume: lead?.length ? { messages: lead, gap: before?.ended ? ago(before.ended) : null } : null });
+    } finally {
+      powerSaveBlocker.stop(keepAwake);
+      stopTracking();
+      restoreWindows();   // put the user's app windows back where they were
+      try {
+        sessions.saveLead(job.id, swarm.leadSnapshot);
+        sessions.finishTurn(job.id, { ...(job.outcome ?? { status: 'stopped', summary: 'Stopped before finishing.' }), usage: swarm.usage });
+      } catch { /* the session folder was removed meanwhile */ }
+      job.running = false;
+      launcher?.send({ kind: 'sessions', sessionId: job.id });
+    }
+  })();
+  return { sessionId: meta.id };
+}
+
+function ago(iso) {
+  const min = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  if (!Number.isFinite(min) || min < 2) return null;
+  return min < 90 ? `${min} minutes` : min < 60 * 36 ? `${Math.round(min / 60)} hours` : `${Math.round(min / 1440)} days`;
+}
+
+const localLibrary = new LocalLibrary({ sessions, memory, skillsDir });
+const library = () => (TEAM ? new TeamLibrary({ url: HUB, token: async () => (cloud ? cloud.auth.token() : null) }) : localLibrary);
+
+function launcherState() {
+  return {
+    mode, team: TEAM, demo: DEMO, lastMode: lastMode(), fixedMode: DEMO ? 'local' : ['local', 'team'].includes(config.mode) ? config.mode : null,
+    hasKey: DEMO || Boolean(process.env.ANTHROPIC_API_KEY), account: lastAccount, running: isRunning(),
+    current: TEAM ? teamLive?.id ?? null : current?.id ?? null, hotkey: pretty(hotkey), webUrl: HUB,
+  };
+}
+
+const launcherHandlers = {
+  state: () => launcherState(),
+  'choose-mode': async (next) => { await setMode(next); return launcherState(); },
+  'save-key': (key) => { const problem = saveKey(String(key ?? '').trim()); if (problem) throw new Error(problem); return launcherState(); },
+  'sign-in': async (email, password) => {
+    if (!cloud) throw new Error('Still reaching the team server. Try again in a moment.');
+    await cloud.signIn(String(email ?? '').trim(), String(password ?? ''));
+    return launcherState();
+  },
+  'sign-out': async () => { await cloud?.signOut(); return launcherState(); },
+  'open-web': () => shell.openExternal(HUB),
+  sessions: () => library().sessions(),
+  session: (id) => library().session(id),
+  send: async (goal, sessionId) => {
+    const out = await runGoal(goal, sessionId || null);
+    launcher.hide();   // step aside: the agents need the screen, and the overlay runs the job
+    summon();
+    return out;
+  },
+  rename: (id, title) => library().rename(id, title),
+  remove: (id) => {
+    if ((current?.running && current.id === id) || (teamLive?.running && teamLive.id === id)) throw new Error('That session is running. Stop it first.');
+    if (current?.id === id) current = null;
+    return library().remove(id);
+  },
+  'show-overlay': () => summon(),
+  skills: () => (skillsDir || TEAM ? library().skills() : []),
+  'save-skill': (skill) => library().saveSkill(skill),
+  'delete-skill': (name) => library().deleteSkill(name),
+  notes: () => library().notes(),
+  'add-note': (note, scope) => library().addNote(note, scope),
+  'delete-note': (id) => library().deleteNote(id),
+};
 
 // Solo and team mode keep their agents in different places.
 const agentsNow = () => (TEAM ? [...(host?.agents.values() ?? [])] : swarm?.agents ?? []);
@@ -216,7 +361,15 @@ async function startTeamMode() {
   try {
     const auth = await supabaseAuth(HUB, path.join(app.getPath('userData'), 'session.json'));
     if (!TEAM || host !== mine) return;   // switched away while connecting
-    cloud = new CloudClient({ url: HUB, auth, host, device: deviceIdentity(), send, onSessionOver: restoreWindows });
+    cloud = new CloudClient({
+      url: HUB, auth, host, device: deviceIdentity(), send,
+      onSessionOver: () => {
+        restoreWindows();
+        if (teamLive) teamLive.running = false;
+        launcher?.send({ kind: 'state', running: false, sessionId: teamLive?.id ?? null });
+        launcher?.send({ kind: 'sessions', sessionId: teamLive?.id ?? null });
+      },
+    });
     await cloud.start();
   } catch (err) {
     if (!TEAM || host !== mine) return;
@@ -245,18 +398,23 @@ async function setMode(next) {
   if (!TEAM && swarm) { try { await swarm.shutdown(); } catch { /* nothing to close */ } swarm = null; }
   try { fs.writeFileSync(modeFile(), JSON.stringify({ mode })); } catch { /* the choice just is not remembered */ }
   buildTray();
+  current = null;
+  teamLive = null;
+  lastAccount = null;
   send({ type: 'mode', mode, team: TEAM });
+  launcher?.send({ kind: 'mode', state: launcherState() });
   if (TEAM) startTeamMode();
 }
 
 function buildTray() {
   if (!tray) return;
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: `Show prompt${hotkey ? `   ${pretty(hotkey)}` : ''}`, click: summon },
+    { label: 'Open Senju', click: () => launcher?.show() },
+    { label: `Show prompt bar${hotkey ? `   ${pretty(hotkey)}` : ''}`, click: summon },
     { label: 'Hide', click: dismiss },
     { type: 'separator' },
-    { label: 'On this Mac', type: 'radio', checked: mode === 'local', click: () => { setMode('local'); summon(); } },
-    { label: 'With my team', type: 'radio', checked: mode === 'team', enabled: !DEMO, click: () => { setMode('team'); summon(); } },
+    { label: 'Personal (this Mac)', type: 'radio', checked: mode === 'local', click: () => { setMode('local'); launcher?.show(); } },
+    { label: 'Team', type: 'radio', checked: mode === 'team', enabled: !DEMO, click: () => { setMode('team'); launcher?.show(); } },
     { type: 'separator' },
     { label: 'Open settings folder', click: () => shell.openPath(dataDir()) },
     { label: 'Stop current job', click: () => (TEAM ? cloud?.cancel() : swarm?.cancel()) },
@@ -280,11 +438,11 @@ function createWindow() {
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.setIgnoreMouseEvents(true, { forward: true });   // clicks pass through to your apps
   win.loadFile(path.join(ROOT, 'renderer', 'index.html'));
-  win.once('ready-to-show', () => summon());
 }
 
 function summon() {
   if (!win) return;
+  if (!mode) return launcher?.show();   // how to work is chosen in the launcher
   win.show();
   win.focus();
   send({ type: 'summon', demo: DEMO, hotkey: pretty(hotkey), team: TEAM, mode, lastMode: mode ? mode : lastMode() });
@@ -304,7 +462,12 @@ function dismiss() {
 // Bind the show/hide key. If the configured one is taken by another app, try a few others.
 function bindHotkey() {
   const wanted = [config.hotkey, 'CommandOrControl+Shift+Space', 'Alt+Space', 'CommandOrControl+Shift+K', 'CommandOrControl+Alt+S'].filter(Boolean);
-  const toggle = () => { if (win?.isVisible()) dismiss(); else summon(); };
+  // While a job runs it shows and hides the overlay; otherwise it opens and closes the launcher.
+  const toggle = () => {
+    if (win?.isVisible()) return dismiss();
+    if (isRunning()) return summon();
+    launcher?.toggle();
+  };
   for (const acc of [...new Set(wanted)]) {
     try {
       if (globalShortcut.register(acc, toggle)) { hotkey = acc; break; }
@@ -396,7 +559,10 @@ function stopTracking() {
 app.whenReady().then(() => {
   if (isMac) app.dock?.hide();
   loadSavedKey();
+  sessions.recover();   // a turn the app was quit in the middle of is marked as stopped
   createWindow();
+  launcher = new Launcher({ root: ROOT, handlers: launcherHandlers });
+  launcher.show();
   // Switching desktops (Spaces): hide or show cursors for the desktop now in front right away, not on the next tick.
   if (isMac) systemPreferences.subscribeWorkspaceNotification('NSWorkspaceActiveSpaceDidChangeNotification', () => retrack?.());
 
@@ -418,6 +584,8 @@ app.whenReady().then(() => {
     chromeTops.clear();
     lastTargets = {};
     if (!TEAM && swarm) { swarm.lastJob = null; await swarm.closeKept().catch(() => {}); }
+    current = null;   // the next goal starts a new session
+    teamLive = null;
     restoreWindows();
     send({ type: 'reset' });
   });
@@ -438,34 +606,16 @@ app.whenReady().then(() => {
   ipcMain.on('team:leave', () => cloud?.leave());
   ipcMain.on('swarm:tell', (_e, { text, target }) => {
     if (TEAM) return cloud?.chat(text, target ?? 'lead');
-    if (!swarm?.tell(text, target ?? 'lead')) send({ type: 'notice', message: 'That agent is no longer working, so the message was not delivered.' });
+    if (!swarm?.tell(text, target ?? 'lead')) return send({ type: 'notice', message: 'That agent is no longer working, so the message was not delivered.' });
+    record({ type: 'said', from: { name: 'You' }, target: target ?? 'lead', text: String(text).trim() });
   });
+  ipcMain.on('app:open-launcher', () => { dismiss(); launcher?.show(); });
+  // The bar's own box: a goal typed there continues the session on screen, or starts one.
   ipcMain.on('swarm:submit', async (_e, goal) => {
-    goal = String(goal ?? '').trim();
-    if (!mode) return;   // the way of working has not been chosen yet
-    if (TEAM) { if (goal) cloud?.startSession(goal); return; }
-    if (!goal) return;
-    if (swarm?.running) return send({ type: 'notice', message: 'The last job is still wrapping up. Send it again in a moment.' });
-    if (!swarm) {
-      const llm = makeLlm();
-      if (!llm) return send({ type: 'need_key', goal });   // the bar asks for the key, then runs the goal
-      swarm = new Swarm({
-        llm, config, workspace, emit: send, layout,
-        idle: () => powerMonitor.getSystemIdleTime(),
-        traceDir: config.trace === false ? null : path.join(dataDir(), 'traces'),
-        skillsDir: config.skills === false ? null : DEMO ? path.join(app.getPath('temp'), 'senju-demo-skills') : path.join(dataDir(), 'skills'),
-        ...(DEMO ? { connect: demoConnect } : {}),
-      });
-    }
-    startTracking();
-    // Keep the Mac from sleeping mid-job (the display may still turn off).
-    const keepAwake = powerSaveBlocker.start('prevent-app-suspension');
     try {
-      await swarm.run(goal);
-    } finally {
-      powerSaveBlocker.stop(keepAwake);
-      stopTracking();
-      restoreWindows();   // put the user's app windows back where they were
+      await runGoal(goal, TEAM ? (teamLive?.running ? null : teamLive?.id ?? null) : current?.id ?? null);
+    } catch (err) {
+      if (!/API key/.test(err.message)) send({ type: 'notice', message: err.message });
     }
   });
 
@@ -474,6 +624,7 @@ app.whenReady().then(() => {
   if (fixed) win.webContents.once('did-finish-load', () => setMode(fixed));
 });
 
+app.on('before-quit', () => { app.quitting = true; });
 app.on('will-quit', async () => {
   globalShortcut.unregisterAll();
   await swarm?.shutdown();

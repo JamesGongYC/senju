@@ -141,7 +141,7 @@ export class CloudClient {
   }
 
   // ---- What the person at this computer can do -----------------------------------------------
-  startSession(goal) { this.say({ t: 'start', goal }); }
+  startSession(goal, continueId = null) { this.say({ t: 'start', goal, ...(continueId ? { continueId } : {}) }); }
   chat(text, target) { this.say({ t: 'chat', text, target }); }
   answer(qid, text) { this.say({ t: 'answer', qid, text }); }
   cancel() { this.say({ t: 'cancel' }); }
