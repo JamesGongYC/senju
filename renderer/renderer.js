@@ -420,6 +420,7 @@ function dropQuestion(qid) {
 
 function refreshBar() {
   dot.dataset.state = state;
+  $('panel').dataset.state = state;
   const busy = state !== 'idle';
   prompt.disabled = state === 'planning';
   stop.hidden = !busy;
@@ -430,14 +431,14 @@ function refreshBar() {
     prompt.disabled = !modeChosen || (team.on && team.account !== 'signed_in');
     go.hidden = prompt.disabled;
     prompt.placeholder = !modeChosen ? 'Choose how to work to start' : team.on && team.account !== 'signed_in' ? 'Sign in to your team to start'
-      : (demo ? 'Demo mode: type anything and press Enter' : agents.size ? 'Done. What next?' : team.on ? `What should the swarm do for ${team.name}?` : 'What should the swarm do?') + (returnKey ? `   (${returnKey} hides and shows this bar)` : '');
+      : (demo ? 'Demo mode: type anything and press Enter' : agents.size ? 'Done. What next?' : 'What should the swarm do?');
   } else if (state === 'planning') {
     prompt.placeholder = 'Starting...';
   } else {
     go.textContent = 'Send';
     const name = whoIs(target)?.name ?? 'Lead';
     const needs = questions.length ? `${questions.length} agent${questions.length > 1 ? 's need' : ' needs'} you (see cards). ` : '';
-    prompt.placeholder = `${needs}Message ${name === 'Lead' ? 'the lead' : name}. Click a chip to switch.`;
+    prompt.placeholder = `${needs}Message ${name === 'Lead' ? 'the lead' : name}. Click an agent to switch.`;
   }
 }
 
