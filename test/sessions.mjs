@@ -229,5 +229,59 @@ const config = { model: 'fake', maxAgents: 2, maxSteps: 4, servers: {} };
   server.close();
 }
 
+// 6. Orgs: a personal org for everyone, several teams per person, everything scoped to the chosen org.
+{
+  const store = new MemoryStore();
+  const tok = store.addUser('ana', 'Ana');
+  store.addUser('bo', 'Bo');
+  const personal = await store.ensurePersonalOrg('ana');
+  await store.ensurePersonalOrg('bo');
+  assert.equal(await store.ensurePersonalOrg('ana'), personal);   // one each
+  const lab = await store.createTeam('ana', 'Lab');
+  store.teams.get(lab).invite = 'lab-code';
+  assert.equal(await store.joinTeam('bo', 'lab-code'), lab);
+  assert.equal(await store.joinTeam('bo', store.teams.get(personal).invite ?? 'none'), null);   // never someone's personal org
+  const mine = await store.teamsOf('ana');
+  assert.deepEqual(mine.map((t) => [t.name, t.personal]), [["Ana's org", true], ['Lab', false]]);
+  assert.equal((await store.teamOf('ana')).id, personal);              // no choice: the personal org
+  assert.equal((await store.teamOf('ana', lab)).id, lab);
+  assert.equal((await store.teamOf('ana', `p-bo`)).id, personal);      // not a member there: falls back to their own
+
+  const api = async (method, pathname, { team, body } = {}) => {
+    let out;
+    const req = { method, headers: team ? { 'x-senju-team': team } : {} };
+    await handleApi({ req, url: new URL(`http://x${pathname}`), user: await store.verifyToken(tok), store, hub: null, json: (code, b) => { out = { code, body: b }; return true; }, readBody: async () => body ?? {} });
+    return out;
+  };
+  assert.equal((await api('GET', '/api/teams')).body.teams.length, 2);
+  await api('POST', '/api/memory', { body: { note: 'Ana prefers tables.' } });
+  await api('POST', '/api/memory', { team: lab, body: { note: 'Lab uses metric units.', scope: 'team' } });
+  assert.deepEqual((await api('GET', '/api/memory')).body.notes.map((n) => n.note), ['Ana prefers tables.']);
+  assert.deepEqual((await api('GET', '/api/memory', { team: lab })).body.notes.map((n) => n.note).sort(), ['Lab uses metric units.']);
+  assert.equal((await api('GET', '/api/team')).body.team.personal, true);
+  assert.equal((await api('GET', '/api/team')).body.team.inviteCode, null);
+  assert.equal((await api('POST', '/api/team/leave')).code, 400);      // a personal org cannot be left
+  const created = (await api('POST', '/api/teams', { body: { name: 'Robotics' } })).body.id;
+  assert.equal((await api('GET', '/api/team', { team: created })).body.team.name, 'Robotics');
+
+  // The hub puts a connection in the org it asked for.
+  const server = http.createServer();
+  new Hub({ store, makeLlm: () => null, config: { model: 'fake' } }).listen(server);
+  await new Promise((r) => server.listen(0, r));
+  const hello = async (teamId) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${server.address().port}`);
+    const got = [];
+    ws.on('message', (d) => got.push(JSON.parse(d)));
+    await new Promise((r) => ws.on('open', r));
+    ws.send(JSON.stringify({ t: 'hello', token: tok, role: 'web', ...(teamId ? { teamId } : {}) }));
+    const w = await until(() => got.find((m) => m.t === 'welcome'), 'welcome');
+    ws.close();
+    return w.team;
+  };
+  assert.deepEqual(await hello(null), { id: personal, name: "Ana's org", personal: true });
+  assert.equal((await hello(lab)).name, 'Lab');
+  server.close();
+}
+
 console.log('sessions test passed');
 process.exit(0);

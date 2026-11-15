@@ -8,10 +8,27 @@ const MAX_BODY = 64_000;
 // Handles /api/sessions, /api/skills, /api/memory and /api/team. Returns false for any other path.
 export async function handleApi({ req, url, user, store, hub, json, readBody }) {
   const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);   // ['api', 'sessions', id]
-  if (parts[0] !== 'api' || !['sessions', 'skills', 'memory', 'team'].includes(parts[1])) return false;
+  if (parts[0] !== 'api' || !['sessions', 'skills', 'memory', 'team', 'teams'].includes(parts[1])) return false;
   if (!user) return json(401, { error: 'Sign in again.' });
-  const team = await store.teamOf(user.id);
-  if (!team) return json(403, { error: 'Create or join a team first.' });
+
+  // ---- Orgs: everyone has a personal one and can be in any number of teams ----
+  if (parts[1] === 'teams') {
+    if (!parts[2] && req.method === 'GET') return json(200, { teams: await store.teamsOf(user.id) });
+    if (!parts[2] && req.method === 'POST') {
+      const name = String((await readBody(req, MAX_BODY)).name ?? '').trim();
+      if (!name) return json(400, { error: 'Give the team a name.' });
+      return json(200, { id: await store.createTeam(user.id, name) });
+    }
+    if (parts[2] === 'join' && req.method === 'POST') {
+      const id = await store.joinTeam(user.id, String((await readBody(req, MAX_BODY)).code ?? ''));
+      return id ? json(200, { id }) : json(404, { error: 'No team has that invite code.' });
+    }
+    return json(405, { error: 'Use GET or POST.' });
+  }
+
+  // Everything else is about one org: the one named in the X-Senju-Team header (or ?team=), else the personal org.
+  const team = await store.teamOf(user.id, req.headers['x-senju-team'] || url.searchParams.get('team') || null);
+  if (!team) return json(403, { error: 'You are not in that org.' });
   const body = () => readBody(req, MAX_BODY);
   const method = req.method;
   const [, area, id, sub, subId] = parts;
@@ -89,6 +106,7 @@ export async function handleApi({ req, url, user, store, hub, json, readBody }) 
     const details = await store.teamDetails(team.id);
     const isOwner = details.ownerId === user.id;
     if (!id && method === 'GET') return json(200, { team: { ...details, me: user.id, isOwner } });
+    if (details.personal && id !== undefined && method !== 'GET') return json(400, { error: 'Your personal org is just you: it has no invite code or members to manage.' });
     if (!id && method === 'PATCH') {
       if (!isOwner) return json(403, { error: 'Only the team owner can rename the team.' });
       const name = String((await body()).name ?? '').trim();
@@ -107,6 +125,7 @@ export async function handleApi({ req, url, user, store, hub, json, readBody }) 
       return json(200, { ok: true });
     }
     if (id === 'leave' && method === 'POST') {
+      if (details.personal) return json(400, { error: 'You cannot leave your personal org.' });
       if (isOwner && details.members.length > 1) return json(400, { error: 'You own this team. Remove the others or hand it over before leaving.' });
       await store.removeMember(team.id, user.id);
       return json(200, { ok: true });

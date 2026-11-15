@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld('senju', {
   signIn: (email, password) => call('sign-in', email, password),
   signOut: () => call('sign-out'),
   openWeb: () => call('open-web'),
+  orgs: () => call('orgs'),
+  switchOrg: (teamId) => call('switch-org', teamId),
 
   sessions: () => call('sessions'),
   session: (id) => call('session', id),

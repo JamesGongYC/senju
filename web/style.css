@@ -100,3 +100,14 @@ form.inline { display: flex; gap: 10px; align-items: center; }
   .nav { grid-column: 1 / -1; order: 3; overflow-x: auto; }
   .list-card { position: static; max-height: 360px; }
 }
+
+/* Orgs: the switcher in the bar, and the list on the Org page */
+.org-select { appearance: none; font: 600 13px var(--body); color: var(--ink); background: var(--punk) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23141414' stroke-width='2'/%3E%3C/svg%3E") no-repeat right 10px center; border: 0; border-radius: 999px; padding: 4px 28px 4px 12px; max-width: 240px; cursor: pointer; }
+.orgs-card { display: flex; flex-direction: column; gap: 10px; }
+.orgs-card .kicker { margin-top: 8px; }
+.org-list { display: flex; flex-direction: column; gap: 4px; }
+.org-row { display: flex; justify-content: space-between; align-items: center; text-align: left; background: transparent; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; cursor: pointer; font-size: 14px; }
+.org-row:hover { border-color: var(--ink); }
+.org-row.on { border: 2px solid var(--ink); box-shadow: 3px 3px 0 var(--orange); }
+.team { grid-template-columns: 1fr 1.3fr; }
+.team > .orgs-card { grid-column: 1; }

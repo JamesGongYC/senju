@@ -82,11 +82,13 @@ export class Hub {
   async hello(client, msg) {
     const user = await this.store.verifyToken(msg.token);
     if (!user) { this.send(client, { t: 'error', code: 'auth', message: 'Sign in again: the session has expired.' }); client.ws.close(4003, 'auth'); return; }
-    const teamInfo = await this.store.teamOf(user.id);
+    // One org per connection: the one the app or page picked, or the person's personal org.
+    const teamInfo = await this.store.teamOf(user.id, msg.teamId ? String(msg.teamId) : null);
     if (!teamInfo) { this.send(client, { t: 'error', code: 'no_team', message: 'Create or join a team in the web app first.' }); client.ws.close(4004, 'no team'); return; }
     let team = this.teams.get(teamInfo.id);
     if (!team) { team = { id: teamInfo.id, name: teamInfo.name, clients: new Set(), session: null }; this.teams.set(team.id, team); }
     team.name = teamInfo.name;
+    team.personal = Boolean(teamInfo.personal);
     team.members = teamInfo.members;
     client.user = user;
     client.team = team;
@@ -107,7 +109,7 @@ export class Hub {
     this.send(client, {
       t: 'welcome',
       user: { id: user.id, name: user.name },
-      team: { id: team.id, name: team.name },
+      team: { id: team.id, name: team.name, personal: team.personal },
       device: client.device ? { id: client.device.id, name: client.device.name } : null,
       session: s ? this.sessionFor(s, client) : null,
     });

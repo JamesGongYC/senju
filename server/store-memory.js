@@ -23,9 +23,31 @@ export class MemoryStore {
   join(userId, teamId) { const t = this.teams.get(teamId); t.members.add(userId); t.owner ??= userId; }
 
   async verifyToken(token) { const m = /^user:(.+)$/.exec(String(token ?? '')); return m ? this.users.get(m[1]) ?? null : null; }
-  async teamOf(userId) {
-    const t = [...this.teams.values()].find((x) => x.members.has(userId));
-    return t ? { id: t.id, name: t.name, members: [...t.members].map((id) => ({ id, name: this.users.get(id).name })) } : null;
+  async teamsOf(userId) {
+    return [...this.teams.values()].filter((t) => t.members.has(userId))
+      .map((t) => ({ id: t.id, name: t.name, personal: Boolean(t.personal), role: t.owner === userId ? 'owner' : 'member' }))
+      .sort((a, b) => Number(b.personal) - Number(a.personal));
+  }
+  // The org asked for if they belong to it; otherwise their personal org (or first team).
+  async teamOf(userId, teamId = null) {
+    const mine = await this.teamsOf(userId);
+    const pick = (teamId && mine.find((t) => t.id === teamId)) || mine[0];
+    const t = pick && this.teams.get(pick.id);
+    return t ? { id: t.id, name: t.name, personal: Boolean(t.personal), members: [...t.members].map((id) => ({ id, name: this.users.get(id).name })) } : null;
+  }
+  async ensurePersonalOrg(userId) {
+    const own = [...this.teams.values()].find((t) => t.personal && t.owner === userId);
+    if (own) return own.id;
+    const id = `p-${userId}`;
+    this.teams.set(id, { id, name: `${this.users.get(userId)?.name ?? 'My'}'s org`, members: new Set([userId]), owner: userId, invite: null, personal: true });
+    return id;
+  }
+  async createTeam(userId, name) { const id = `t-${this.teams.size + 1}`; this.addTeam(id, String(name).trim()); this.join(userId, id); return id; }
+  async joinTeam(userId, code) {
+    const t = [...this.teams.values()].find((x) => !x.personal && x.invite === String(code).trim().toLowerCase());
+    if (!t) return null;
+    this.join(userId, t.id);
+    return t.id;
   }
   async upsertDevice(d) { this.devices.set(d.id, d); }
   async getKey(userId) { return this.keys.get(userId) ?? null; }
@@ -96,7 +118,7 @@ export class MemoryStore {
   // ---- Team management --------------------------------------------------------------------------
   async teamDetails(teamId) {
     const t = this.teams.get(teamId);
-    return t ? { id: t.id, name: t.name, inviteCode: t.invite, ownerId: t.owner, members: [...t.members].map((id) => ({ id, name: this.users.get(id).name, role: id === t.owner ? 'owner' : 'member' })) } : null;
+    return t ? { id: t.id, name: t.name, personal: Boolean(t.personal), inviteCode: t.personal ? null : t.invite, ownerId: t.owner, members: [...t.members].map((id) => ({ id, name: this.users.get(id).name, role: id === t.owner ? 'owner' : 'member' })) } : null;
   }
   async renameTeam(teamId, name) { this.teams.get(teamId).name = String(name).slice(0, 80); }
   async regenerateInvite(teamId) { const t = this.teams.get(teamId); t.invite = `inv-${Math.random().toString(16).slice(2, 10)}`; return t.invite; }

@@ -67,7 +67,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' });
+      res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type, x-senju-team', 'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' });
       return res.end();
     }
     if (url.pathname === '/health') return json(res, 200, { ok: true });

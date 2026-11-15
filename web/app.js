@@ -8,7 +8,9 @@ import { renderLibrary } from './shared/library-view.js';
 const app = document.getElementById('app');
 const state = {
   sb: null, user: null, token: null, name: '',
-  team: null,            // from /api/team
+  team: null,            // the org on screen, from /api/team
+  orgs: [],              // every org this person is in: their personal org first, then teams
+  teamId: null,          // which of them is selected (remembered in this browser)
   hasKey: false, billing: null,
   ws: null, people: [], liveSession: null,   // presence from the hub
   page: 'sessions', sessions: [], selected: null, detail: null, tv: null, watching: false,
@@ -21,7 +23,7 @@ function toast(message) {
 }
 
 async function api(method, path, body) {
-  const res = await fetch(path, { method, headers: { authorization: `Bearer ${state.token}`, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  const res = await fetch(path, { method, headers: { authorization: `Bearer ${state.token}`, ...(state.teamId ? { 'x-senju-team': state.teamId } : {}), ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
   const out = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(out.error ?? `The server answered ${res.status}.`);
   return out;
@@ -50,6 +52,11 @@ async function onSession(session) {
 async function loadAccount() {
   const { data: profile } = await state.sb.from('profiles').select('name').eq('id', state.user.id).maybeSingle();
   state.name = profile?.name ?? state.user.email;
+  try { state.orgs = (await api('GET', '/api/teams')).teams; } catch { state.orgs = []; }
+  if (!state.orgs.length) return viewOnboarding();
+  let saved = null;
+  try { saved = localStorage.getItem('senju.org'); } catch { /* private window */ }
+  state.teamId = (state.orgs.find((o) => o.id === saved) ?? state.orgs[0]).id;
   try { state.team = (await api('GET', '/api/team')).team; } catch { state.team = null; }
   if (!state.team) return viewOnboarding();
   state.hasKey = Boolean((await state.sb.rpc('has_api_key')).data);
@@ -110,6 +117,7 @@ function viewAuth(mode = 'in') {
 
 function viewOnboarding() {
   const err = h('p', { class: 'error-text' });
+  // Only for accounts made before personal orgs existed, until the database has been updated.
   const run = (fn, arg) => async (ev) => {
     ev.preventDefault();
     const { error } = await state.sb.rpc(fn, { [arg]: new FormData(ev.target).get('v') });
@@ -131,7 +139,7 @@ function viewOnboarding() {
 function connect() {
   const ws = new WebSocket(location.origin.replace(/^http/, 'ws'));
   state.ws = ws;
-  ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', token: state.token, role: 'web' }));
+  ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', token: state.token, role: 'web', teamId: state.teamId }));
   ws.onmessage = (m) => onHub(JSON.parse(m.data));
   ws.onclose = () => { if (state.ws === ws && state.user) setTimeout(async () => { state.token = (await state.sb.auth.getSession()).data.session?.access_token ?? state.token; if (state.user) connect(); }, 2500); };
 }
@@ -156,14 +164,44 @@ function onHub(msg) {
   } else if (msg.t === 'error' && msg.code !== 'view_only') toast(msg.message);
 }
 
+// ---- Orgs: your personal org and your teams ---------------------------------------------------
+
+async function switchOrg(id) {
+  if (!id || id === state.teamId) return;
+  state.teamId = id;
+  try { localStorage.setItem('senju.org', id); } catch { /* not remembered */ }
+  state.team = (await api('GET', '/api/team')).team;
+  state.sessions = []; state.selected = null; state.detail = null; state.tv = null; state.watching = false; state.liveSession = null; state.people = [];
+  const old = state.ws; state.ws = null; old?.close();
+  connect();
+  render();
+}
+
+async function createOrJoin(kind, value) {
+  const out = kind === 'create' ? await api('POST', '/api/teams', { name: value }) : await api('POST', '/api/teams/join', { code: value });
+  state.orgs = (await api('GET', '/api/teams')).teams;
+  await switchOrg(out.id);
+}
+
 // ---- The shell ----------------------------------------------------------------------------
 
-const PAGES = [['sessions', 'Sessions'], ['team', 'Team'], ['library', 'Skills & memory'], ['billing', 'Billing']];
+const PAGES = [['sessions', 'Sessions'], ['team', 'Org'], ['library', 'Skills & memory'], ['billing', 'Billing']];
+
+function orgSelect() {
+  const select = h('select', { class: 'org-select', title: 'Switch org' },
+    state.orgs.map((o) => h('option', { value: o.id, selected: o.id === state.teamId }, `${o.personal ? 'Personal · ' : ''}${o.name}`)),
+    h('option', { value: '__new' }, '+ Create or join a team…'));
+  select.addEventListener('change', () => {
+    if (select.value === '__new') { select.value = state.teamId; state.page = 'team'; render(); document.querySelector('.orgs-card input')?.focus(); return; }
+    switchOrg(select.value).catch((err) => toast(err.message));
+  });
+  return select;
+}
 
 function render() {
   const nav = h('nav', { class: 'nav' }, PAGES.map(([id, label]) => h('button', { class: `nav-pill${state.page === id ? ' on' : ''}`, onclick: () => { state.page = id; render(); } }, label)));
   const top = h('header', { class: 'stage bar' },
-    h('div', { class: 'bar-left' }, h('span', { class: 'logo display' }, 'Senju'), h('span', { class: 'team-tag' }, state.team.name)),
+    h('div', { class: 'bar-left' }, h('span', { class: 'logo display' }, 'Senju'), orgSelect()),
     nav,
     h('div', { class: 'bar-right' }, h('span', { class: 'me' }, state.name), h('button', { class: 'btn btn-outline-white btn-sm', onclick: () => state.sb.auth.signOut() }, 'Sign out')));
   const page = state.page === 'team' ? teamPage() : state.page === 'library' ? libraryPage() : state.page === 'billing' ? billingPage() : sessionsPage();
@@ -247,6 +285,15 @@ function teamPage() {
   const online = new Map(state.people.map((p) => [p.id, p]));
   const err = h('p', { class: 'error-text' });
   const act = (fn) => async () => { err.textContent = ''; try { await fn(); state.team = (await api('GET', '/api/team')).team; render(); } catch (x) { err.textContent = x.message; } };
+  const orgs = orgsCard();
+  if (t.personal) {
+    return h('div', { class: 'team' },
+      h('section', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', { class: 'display' }, t.name), h('span', { class: 'pill' }, 'personal')),
+        h('p', {}, 'Your personal org is just you. Its sessions, skills and memory are yours alone, in the cloud, and you can read them here and continue them from any Mac you sign in on.'),
+        h('p', { class: 'dim small' }, 'To work with other people, create a team or join one with an invite code.')),
+      orgs);
+  }
   return h('div', { class: 'team' },
     h('section', { class: 'card' },
       h('div', { class: 'card-head' }, h('h2', { class: 'display' }, t.name), t.isOwner ? h('button', { class: 'btn btn-ghost btn-sm', onclick: act(async () => { const name = prompt('Team name', t.name); if (name) await api('PATCH', '/api/team', { name }); }) }, 'Rename') : null),
@@ -268,8 +315,26 @@ function teamPage() {
       err,
       h('div', { class: 'row' }, h('button', { class: 'btn btn-danger btn-sm', onclick: async () => {
         if (!confirm(`Leave ${t.name}?`)) return;
-        try { await api('POST', '/api/team/leave'); loadAccount(); } catch (x) { err.textContent = x.message; }
-      } }, 'Leave team'))));
+        try { await api('POST', '/api/team/leave'); state.orgs = (await api('GET', '/api/teams')).teams; state.teamId = null; await switchOrg(state.orgs[0]?.id); } catch (x) { err.textContent = x.message; }
+      } }, 'Leave team'))),
+    orgs);
+}
+
+// Every org you are in, and making or joining another.
+function orgsCard() {
+  const err = h('p', { class: 'error-text' });
+  const form = (kind, placeholder, label) => {
+    const input = h('input', { class: 'field', placeholder, required: true });
+    return h('form', { class: 'inline', onsubmit: async (ev) => { ev.preventDefault(); err.textContent = ''; try { await createOrJoin(kind, input.value); } catch (x) { err.textContent = x.message; } } },
+      input, h('button', { class: `btn ${kind === 'create' ? 'btn-punk' : 'btn-ink'}` }, label));
+  };
+  return h('section', { class: 'card orgs-card' },
+    h('div', { class: 'card-head' }, h('h2', { class: 'display' }, 'Your orgs')),
+    h('div', { class: 'org-list' }, state.orgs.map((o) => h('button', { class: `org-row${o.id === state.teamId ? ' on' : ''}`, onclick: () => switchOrg(o.id).catch((x) => toast(x.message)) },
+      h('b', {}, o.name), h('span', { class: 'pill' }, o.personal ? 'personal' : o.role)))),
+    h('div', { class: 'kicker' }, 'New team'), form('create', 'Team name', 'Create'),
+    h('div', { class: 'kicker' }, 'Join a team'), form('join', 'Invite code', 'Join'),
+    err);
 }
 
 // ---- Skills & memory --------------------------------------------------------------------------

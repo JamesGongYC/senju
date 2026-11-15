@@ -54,8 +54,10 @@ function saveKey(key) {
   return null;
 }
 const isMac = process.platform === 'darwin';
-// Two ways to work, chosen each time the app opens: on this Mac only, or signed in to a team.
-// TEAM is true once team mode is chosen; `mode` stays null until the choice is made.
+// Two ways to work, chosen each time the app opens: Local (this Mac only, nothing leaves it) or
+// Cloud (signed in, working in one org at a time: your personal org or one of your teams).
+// TEAM is true in Cloud mode; `mode` ('local' | 'cloud') stays null until the choice is made.
+const normalMode = (m) => (m === 'cloud' || m === 'team' ? 'cloud' : m === 'local' ? 'local' : null);   // 'team' is the old name
 let TEAM = false;
 let mode = null;
 
@@ -185,7 +187,7 @@ const LIVE_SKIP = new Set(['point', 'cursor', 'targets', 'summon', 'mode', 'need
 
 // Keep a personal session's events, and pass every session event to the launcher as it happens.
 function record(event) {
-  if (event.type === 'account') { lastAccount = event; return launcher?.send({ kind: 'account', account: event }); }
+  if (event.type === 'account') { lastAccount = event; buildTray(); return launcher?.send({ kind: 'account', account: event }); }
   if (LIVE_SKIP.has(event.type)) return;
   let at = null;
   if (TEAM) {
@@ -266,11 +268,12 @@ function ago(iso) {
 }
 
 const localLibrary = new LocalLibrary({ sessions, memory, skillsDir });
-const library = () => (TEAM ? new TeamLibrary({ url: HUB, token: async () => (cloud ? cloud.auth.token() : null) }) : localLibrary);
+const library = () => (TEAM ? new TeamLibrary({ url: HUB, teamId: lastAccount?.team?.id ?? savedOrg(), token: async () => (cloud ? cloud.auth.token() : null) }) : localLibrary);
 
 function launcherState() {
   return {
-    mode, team: TEAM, demo: DEMO, lastMode: lastMode(), fixedMode: DEMO ? 'local' : ['local', 'team'].includes(config.mode) ? config.mode : null,
+    mode, team: TEAM, demo: DEMO, lastMode: lastMode(), fixedMode: DEMO ? 'local' : normalMode(config.mode),
+    org: TEAM ? lastAccount?.team ?? null : null,
     hasKey: DEMO || Boolean(process.env.ANTHROPIC_API_KEY), account: lastAccount, running: isRunning(),
     current: TEAM ? teamLive?.id ?? null : current?.id ?? null, hotkey: pretty(hotkey), webUrl: HUB,
   };
@@ -286,6 +289,8 @@ const launcherHandlers = {
     return launcherState();
   },
   'sign-out': async () => { await cloud?.signOut(); return launcherState(); },
+  orgs: async () => (TEAM ? (await library().api('GET', '/api/teams')).teams : []),
+  'switch-org': async (teamId) => { await switchOrg(teamId); return launcherState(); },
   'open-web': () => shell.openExternal(HUB),
   sessions: () => library().sessions(),
   session: (id) => library().session(id),
@@ -352,7 +357,23 @@ function deviceIdentity() {
   return { id, name, platform: process.platform };
 }
 
-const HUB = String(config.cloud?.url || DEFAULT_HUB).replace(/\/+$/, '');
+const HUB = String(process.env.SENJU_CLOUD_URL || config.cloud?.url || DEFAULT_HUB).replace(/\/+$/, '');
+
+// Cloud mode works in one org at a time. The last one picked is remembered; none means the personal org.
+const orgFile = () => path.join(app.getPath('userData'), 'org.json');
+function savedOrg() { try { return JSON.parse(fs.readFileSync(orgFile(), 'utf8')).teamId ?? null; } catch { return null; } }
+
+async function switchOrg(teamId) {
+  if (!TEAM) throw new Error('Switch to Cloud first.');
+  if (isRunning()) throw new Error('A job is running. Stop it before switching orgs.');
+  try { fs.writeFileSync(orgFile(), JSON.stringify({ teamId: teamId || null })); } catch { /* not remembered */ }
+  clearTimeout(teamRetry);
+  const oldCloud = cloud;
+  cloud = null; host = null; lastAccount = null; teamLive = null;
+  try { await oldCloud?.shutdown(); } catch { /* already gone */ }
+  await startTeamMode();
+  launcher?.send({ kind: 'mode', state: launcherState() });
+}
 let teamRetry = null;
 async function startTeamMode() {
   if (!TEAM) return;
@@ -362,7 +383,7 @@ async function startTeamMode() {
     const auth = await supabaseAuth(HUB, path.join(app.getPath('userData'), 'session.json'));
     if (!TEAM || host !== mine) return;   // switched away while connecting
     cloud = new CloudClient({
-      url: HUB, auth, host, device: deviceIdentity(), send,
+      url: HUB, auth, host, device: deviceIdentity(), send, teamId: savedOrg(),
       onSessionOver: () => {
         restoreWindows();
         if (teamLive) teamLive.running = false;
@@ -379,12 +400,12 @@ async function startTeamMode() {
 }
 
 // The last choice is remembered only to put it first next time; the question is asked on every launch
-// unless "mode" in swarm.config.json is "local" or "team".
+// unless "mode" in swarm.config.json is "local" or "cloud".
 const modeFile = () => path.join(app.getPath('userData'), 'mode.json');
-function lastMode() { try { return JSON.parse(fs.readFileSync(modeFile(), 'utf8')).mode === 'team' ? 'team' : 'local'; } catch { return 'local'; } }
+function lastMode() { try { return normalMode(JSON.parse(fs.readFileSync(modeFile(), 'utf8')).mode) ?? 'local'; } catch { return 'local'; } }
 
 async function setMode(next) {
-  next = next === 'team' ? 'team' : 'local';
+  next = normalMode(next) ?? 'local';
   if (DEMO) next = 'local';
   if (next === mode) return send({ type: 'mode', mode, team: TEAM });
   if (isRunning()) return send({ type: 'notice', message: 'A job is running. Stop it before switching.' });
@@ -392,7 +413,7 @@ async function setMode(next) {
   clearTimeout(teamRetry);
   const oldCloud = cloud, oldHost = host;
   cloud = null; host = null;
-  TEAM = next === 'team';
+  TEAM = next === 'cloud';
   mode = next;
   try { await (oldCloud ? oldCloud.shutdown() : oldHost?.shutdown()); } catch { /* already gone */ }
   if (!TEAM && swarm) { try { await swarm.shutdown(); } catch { /* nothing to close */ } swarm = null; }
@@ -413,8 +434,8 @@ function buildTray() {
     { label: `Show prompt bar${hotkey ? `   ${pretty(hotkey)}` : ''}`, click: summon },
     { label: 'Hide', click: dismiss },
     { type: 'separator' },
-    { label: 'Personal (this Mac)', type: 'radio', checked: mode === 'local', click: () => { setMode('local'); launcher?.show(); } },
-    { label: 'Team', type: 'radio', checked: mode === 'team', enabled: !DEMO, click: () => { setMode('team'); launcher?.show(); } },
+    { label: 'Local (this Mac only)', type: 'radio', checked: mode === 'local', click: () => { setMode('local'); launcher?.show(); } },
+    { label: lastAccount?.team ? `Cloud: ${lastAccount.team.name}` : 'Cloud', type: 'radio', checked: mode === 'cloud', enabled: !DEMO, click: () => { setMode('cloud'); launcher?.show(); } },
     { type: 'separator' },
     { label: 'Open settings folder', click: () => shell.openPath(dataDir()) },
     { label: 'Stop current job', click: () => (TEAM ? cloud?.cancel() : swarm?.cancel()) },
@@ -620,7 +641,7 @@ app.whenReady().then(() => {
   });
 
   // Demo and a fixed "mode" in the settings skip the question; otherwise the bar asks on every launch.
-  const fixed = DEMO ? 'local' : ['local', 'team'].includes(config.mode) ? config.mode : null;
+  const fixed = DEMO ? 'local' : normalMode(config.mode);
   if (fixed) win.webContents.once('did-finish-load', () => setMode(fixed));
 });
 

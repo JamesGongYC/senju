@@ -23,12 +23,32 @@ export class SupabaseStore {
     return { id: data.user.id, email: data.user.email, name: profile?.name ?? data.user.email?.split('@')[0] ?? 'Someone' };
   }
 
-  async teamOf(userId) {
-    const mine = ok(await this.db.from('team_members').select('team_id, teams(id, name)').eq('user_id', userId).order('joined_at').limit(1));
-    const team = mine?.[0]?.teams;
+  // The orgs someone belongs to: their personal org first, then teams by when they joined.
+  async teamsOf(userId) {
+    const rows = ok(await this.db.from('team_members').select('role, joined_at, teams(id, name, personal)').eq('user_id', userId).order('joined_at'));
+    if (!rows.some((r) => r.teams?.personal)) { await this.ensurePersonalOrg(userId); return this.teamsOf(userId); }
+    return rows.filter((r) => r.teams).map((r) => ({ id: r.teams.id, name: r.teams.name, personal: Boolean(r.teams.personal), role: r.role }))
+      .sort((a, b) => Number(b.personal) - Number(a.personal));
+  }
+  // One org with its members: the one asked for if they belong to it, otherwise their personal org.
+  async teamOf(userId, teamId = null) {
+    const mine = await this.teamsOf(userId);
+    const team = (teamId && mine.find((t) => t.id === teamId)) || mine[0];
     if (!team) return null;
     const members = ok(await this.db.from('team_members').select('user_id, profiles(name)').eq('team_id', team.id));
-    return { id: team.id, name: team.name, members: members.map((m) => ({ id: m.user_id, name: m.profiles?.name ?? 'Someone' })) };
+    return { id: team.id, name: team.name, personal: team.personal, members: members.map((m) => ({ id: m.user_id, name: m.profiles?.name ?? 'Someone' })) };
+  }
+  async ensurePersonalOrg(userId) { return ok(await this.db.rpc('ensure_personal_org', { p_user: userId })); }
+  async createTeam(userId, name) {
+    const team = ok(await this.db.from('teams').insert({ name: String(name).trim().slice(0, 80), created_by: userId }).select('id').single());
+    ok(await this.db.from('team_members').insert({ team_id: team.id, user_id: userId, role: 'owner' }));
+    return team.id;
+  }
+  async joinTeam(userId, code) {
+    const team = ok(await this.db.from('teams').select('id').eq('invite_code', String(code).trim().toLowerCase()).eq('personal', false).maybeSingle());
+    if (!team) return null;
+    ok(await this.db.from('team_members').upsert({ team_id: team.id, user_id: userId }, { onConflict: 'team_id,user_id', ignoreDuplicates: true }));
+    return team.id;
   }
 
   async upsertDevice({ id, userId, teamId, name, platform }) {
@@ -188,11 +208,11 @@ export class SupabaseStore {
 
   // ---- Team management --------------------------------------------------------------------------
   async teamDetails(teamId) {
-    const team = ok(await this.db.from('teams').select('id, name, invite_code').eq('id', teamId).maybeSingle());
+    const team = ok(await this.db.from('teams').select('id, name, invite_code, personal').eq('id', teamId).maybeSingle());
     if (!team) return null;
     const members = ok(await this.db.from('team_members').select('user_id, role, joined_at, profiles(name)').eq('team_id', teamId).order('joined_at'));
     return {
-      id: team.id, name: team.name, inviteCode: team.invite_code,
+      id: team.id, name: team.name, personal: Boolean(team.personal), inviteCode: team.personal ? null : team.invite_code,
       ownerId: members.find((m) => m.role === 'owner')?.user_id ?? null,
       members: members.map((m) => ({ id: m.user_id, name: m.profiles?.name ?? 'Someone', role: m.role })),
     };

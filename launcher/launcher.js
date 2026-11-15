@@ -70,8 +70,8 @@ function chooseScreen() {
       h('h1', { class: 'display hero-title' }, h('span', { class: 'hash' }, '#'), 'Swarm', h('br'), 'your', h('br'), 'screen'),
       sticker(), scribbleArrow()),
     h('section', { class: 'choices' },
-      card('local', 'Personal', 'On this Mac', ['Your own API key', 'Your sessions stay on this Mac', 'Agents use your apps and browser'], 'Start personal'),
-      card('team', 'Team', 'With your team', ['Sign in to your team', 'Share sessions, skills and memory', 'Agents can work across teammates’ Macs'], app.s.demo ? 'Not in demo' : 'Sign in to team')),
+      card('local', 'Local', 'This Mac only', ['Your own API key', 'Nothing leaves this Mac', 'Agents use your apps and browser'], 'Start local'),
+      card('cloud', 'Cloud', 'Your orgs', ['Your personal org, and every team you are in', 'Sessions, skills and memory kept per org', 'Agents can work across teammates’ Macs'], app.s.demo ? 'Not in demo' : 'Sign in')),
     app.error ? h('p', { class: 'stage-error' }, app.error) : null,
     h('p', { class: 'stage-foot' }, 'You can switch any time from the ◎ menu bar icon.'));
 }
@@ -86,9 +86,9 @@ function keyScreen() {
   return h('main', { class: 'stage centered' },
     h('header', { class: 'top drag' }, h('span', { class: 'logo display' }, 'Senju')),
     h('div', { class: 'panel-card' },
-      h('div', { class: 'choice-kicker' }, 'Personal'),
+      h('div', { class: 'choice-kicker' }, 'Local'),
       h('h2', { class: 'display card-title' }, 'Your API key'),
-      h('p', { class: 'dim' }, 'Personal sessions run on your own Anthropic key. It is stored encrypted in this Mac’s keychain and never leaves it.'),
+      h('p', { class: 'dim' }, 'Local sessions run on your own Anthropic key. It is stored encrypted in this Mac’s keychain and never leaves it.'),
       input, err,
       h('div', { class: 'row' }, h('button', { class: 'btn btn-ghost', onclick: () => back() }, '← Back'), h('button', { class: 'btn btn-punk', onclick: save }, 'Save key'))));
 }
@@ -105,17 +105,17 @@ function signinScreen() {
   pass.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
   let body;
   if (acct?.state === 'no_team') {
-    body = [h('h2', { class: 'display card-title' }, 'No team yet'), h('p', { class: 'dim' }, 'You are signed in but not in a team. Create one or join with an invite code on the team web page, then come back.'),
+    body = [h('h2', { class: 'display card-title' }, 'No org yet'), h('p', { class: 'dim' }, 'Your account has no org yet. Open the web page once to set it up, then come back.'),
       h('div', { class: 'row' }, h('button', { class: 'btn btn-ghost', onclick: () => call('signOut') }, 'Sign out'), h('button', { class: 'btn btn-punk', onclick: () => call('openWeb') }, 'Open the web page ↗'))];
   } else if (!acct || acct.state === 'offline') {
     body = [h('h2', { class: 'display card-title' }, 'Connecting'), h('p', { class: 'dim' }, acct?.error ?? 'Reaching your team server…')];
   } else {
-    body = [h('h2', { class: 'display card-title' }, 'Sign in'), h('p', { class: 'dim' }, 'Use the account you made on the team web page.'), email, pass, err,
+    body = [h('h2', { class: 'display card-title' }, 'Sign in'), h('p', { class: 'dim' }, 'One account for your personal org and every team you are in.'), email, pass, err,
       h('div', { class: 'row' }, h('button', { class: 'btn btn-ghost', onclick: () => call('openWeb') }, 'Create an account ↗'), h('button', { class: 'btn btn-punk', onclick: go }, 'Sign in'))];
   }
   return h('main', { class: 'stage centered' },
     h('header', { class: 'top drag' }, h('span', { class: 'logo display' }, 'Senju')),
-    h('div', { class: 'panel-card' }, h('div', { class: 'choice-kicker' }, 'Team'), ...body, h('button', { class: 'link', onclick: back }, '← Work on this Mac instead')));
+    h('div', { class: 'panel-card' }, h('div', { class: 'choice-kicker' }, 'Cloud'), ...body, h('button', { class: 'link', onclick: back }, '← Work locally instead')));
 }
 
 // Back to the first screen. Nothing changes until another way of working is picked there.
@@ -160,18 +160,18 @@ function sessionList() {
 
 function homeScreen() {
   const s = app.s;
-  const who = s.team ? (s.account?.team?.name ?? 'Team') : 'Personal';
   const side = h('aside', { class: 'side stage' },
     h('div', { class: 'side-top drag' }),
-    h('div', { class: 'side-brand' }, h('span', { class: 'logo display' }, 'Senju'), h('span', { class: 'side-mode' }, who)),
+    h('div', { class: 'side-brand' }, h('span', { class: 'logo display' }, 'Senju'), s.team ? null : h('span', { class: 'side-mode' }, 'Local')),
+    s.team ? orgSwitcher() : null,
     h('button', { class: 'btn btn-punk side-new', onclick: () => { app.panel = 'new'; app.selected = null; render(); } }, '+ New session'),
     sessionList(),
     h('div', { class: 'side-bottom' },
       h('button', { class: `side-link${app.panel === 'library' ? ' on' : ''}`, onclick: () => { app.panel = 'library'; render(); } }, 'Skills & memory'),
-      s.team ? h('button', { class: 'side-link', onclick: () => call('openWeb') }, 'Team web page ↗') : null,
+      s.team ? h('button', { class: 'side-link', onclick: () => call('openWeb') }, 'Manage orgs on the web ↗') : null,
       h('div', { class: 'side-account' },
-        h('span', {}, s.team ? (s.account?.user?.name ?? '') : 'On this Mac'),
-        h('button', { class: 'link light', onclick: () => switchMode() }, s.team ? 'Switch to personal' : 'Switch to team'),
+        h('span', {}, s.team ? (s.account?.user?.name ?? '') : 'On this Mac only'),
+        h('button', { class: 'link light', onclick: () => switchMode() }, s.team ? 'Switch to Local' : 'Switch to Cloud'),
         s.team ? h('button', { class: 'link light', onclick: async () => { await call('signOut'); } }, 'Sign out') : null)));
   let main;
   if (app.panel === 'library') main = libraryPanel();
@@ -181,7 +181,27 @@ function homeScreen() {
 }
 
 async function switchMode() {
-  try { app.s = await call('chooseMode', app.s.team ? 'local' : 'team'); app.panel = 'new'; app.selected = null; route(); } catch (err) { alert(err.message); }
+  try { app.s = await call('chooseMode', app.s.team ? 'local' : 'cloud'); app.panel = 'new'; app.selected = null; route(); } catch (err) { alert(err.message); }
+}
+
+// Cloud: which org this Mac is working in. Sessions, skills and memory below all belong to it.
+function orgSwitcher() {
+  const current = app.s.account?.team;
+  const select = h('select', { class: 'org-select', title: 'Switch org' },
+    h('option', { value: current?.id ?? '' }, current ? `${current.personal ? 'Personal · ' : ''}${current.name}` : 'Connecting…'));
+  call('orgs').then((orgs) => {
+    if (!orgs.length) return;
+    select.replaceChildren(...orgs.map((o) => h('option', { value: o.id, selected: o.id === current?.id }, `${o.personal ? 'Personal · ' : ''}${o.name}`)),
+      h('option', { value: '__web' }, '+ Create or join a team…'));
+    select.value = current?.id ?? orgs[0].id;
+  }).catch(() => {});
+  select.addEventListener('change', async () => {
+    const id = select.value;
+    if (id === '__web') { select.value = current?.id ?? ''; return call('openWeb'); }
+    if (id === current?.id) return;
+    try { app.s = await call('switchOrg', id); app.selected = null; app.panel = 'new'; app.sessions = []; render(); } catch (err) { alert(err.message); select.value = current?.id ?? ''; }
+  });
+  return h('div', { class: 'org' }, h('span', { class: 'org-label' }, 'Org'), select);
 }
 
 function composer({ sessionId = null, placeholder }) {
@@ -283,7 +303,7 @@ function libraryPanel() {
     notes: () => call('notes'),
     addNote: (note, scope) => call('addNote', note, scope),
     deleteNote: (id) => call('deleteNote', id),
-  }, { team: app.s.team, tab: app.libTab });
+  }, { team: app.s.team && !app.s.account?.team?.personal, local: !app.s.team, tab: app.libTab });
   return panel;
 }
 

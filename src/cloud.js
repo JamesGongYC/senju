@@ -12,8 +12,10 @@ export class CloudClient {
    * @param {object} o.device         { id, name, platform }
    * @param {(event: object) => void} o.send   to the overlay
    * @param {() => void} [o.onSessionOver]
+   * @param {string} [o.teamId]       the org to connect to; without it, the person's personal org
    */
-  constructor({ url, auth, host, device, send, onSessionOver = () => {} }) {
+  constructor({ url, auth, host, device, send, onSessionOver = () => {}, teamId = null }) {
+    this.teamId = teamId;
     this.url = String(url).replace(/\/+$/, '');
     this.auth = auth;
     this.host = host;
@@ -59,7 +61,7 @@ export class CloudClient {
     const servers = await this.host.catalog();
     const ws = new WebSocket(this.wsUrl, { maxPayload: 48 * 1024 * 1024 });
     this.ws = ws;
-    ws.on('open', () => { this.retry = 0; this.say({ t: 'hello', token, role: 'device', device: this.device, servers }); });
+    ws.on('open', () => { this.retry = 0; this.say({ t: 'hello', token, role: 'device', device: this.device, servers, ...(this.teamId ? { teamId: this.teamId } : {}) }); });
     ws.on('message', (raw) => { let m; try { m = JSON.parse(raw.toString()); } catch { return; } this.onMessage(m).catch((err) => this.send({ type: 'notice', message: String(err?.message ?? err) })); });
     ws.on('error', () => {});
     ws.on('close', (code) => {

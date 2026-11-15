@@ -95,3 +95,8 @@ button { font: inherit; }
 .tv-scroll { flex: 1; overflow-y: auto; min-height: 0; }
 .tv-wrap { max-width: 860px; margin: 0 auto; padding: 0 40px; }
 
+
+/* Cloud: the org switcher */
+.org { display: flex; flex-direction: column; gap: 4px; margin: -4px 0 14px; padding: 0 2px; }
+.org-label { font: 400 11px var(--display); text-transform: uppercase; letter-spacing: 0.08em; color: rgba(253, 253, 255, 0.7); padding-left: 6px; }
+.org-select { appearance: none; width: 100%; font: 600 14px var(--body); color: var(--ink); background: var(--white) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%23141414' stroke-width='2'/%3E%3C/svg%3E") no-repeat right 12px center; border: 2px solid var(--ink); border-radius: 12px; padding: 9px 34px 9px 12px; cursor: pointer; }

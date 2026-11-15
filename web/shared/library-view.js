@@ -5,7 +5,7 @@
 //   Every api function returns a promise and throws an Error with a readable message.
 import { h } from './brand.js';
 
-export function renderLibrary(root, api, { team = false, tab = 'skills' } = {}) {
+export function renderLibrary(root, api, { team = false, local = false, tab = 'skills' } = {}) {
   const state = { tab, editing: null };
   const body = h('div', { class: 'lib-body' });
   const tabs = h('div', { class: 'lib-tabs' });
@@ -17,8 +17,8 @@ export function renderLibrary(root, api, { team = false, tab = 'skills' } = {}) 
   function show() {
     tabs.replaceChildren(...['skills', 'notes'].map((t) => h('button', { class: `tv-filter${state.tab === t ? ' on' : ''}`, onclick: () => { state.tab = t; state.editing = null; show(); } }, t === 'skills' ? 'Skills' : 'Memory')));
     intro.textContent = state.tab === 'skills'
-      ? `How-tos the lead writes after a job and reads before the next. ${team ? 'Shared with your team; every save is kept as a revision.' : 'Stored as files on this Mac.'}`
-      : `What the lead should always know. ${team ? 'Notes about you are yours alone; team notes everyone in the team sees.' : 'Stays on this Mac.'}`;
+      ? `How-tos the lead writes after a job and reads before the next. ${local ? 'Stored as files on this Mac.' : team ? 'Shared with this team; every save is kept as a revision.' : 'Kept in your personal org; every save is kept as a revision.'}`
+      : `What the lead should always know. ${local ? 'Stays on this Mac.' : team ? 'Notes about you are yours alone; team notes everyone in the team sees.' : 'Kept in your personal org, for your sessions only.'}`;
     body.replaceChildren(h('p', { class: 'dim' }, 'Loading…'));
     (state.tab === 'skills' ? skills() : notes()).catch(fail);
   }

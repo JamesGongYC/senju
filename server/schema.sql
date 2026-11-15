@@ -308,3 +308,50 @@ alter table session_events enable row level security;
 alter table session_contexts enable row level security;
 grant all on session_events, session_contexts to service_role;
 revoke all on session_events, session_contexts from anon, authenticated;
+
+-- ---- Orgs: several per person, and everyone has a personal one -----------------------------------
+-- A person can belong to many orgs (the teams table). Each account also has its own personal org,
+-- "<name>'s org", made at sign-up: a team of one, with its own cloud sessions, skills and memory.
+-- Sessions, skills and memory always belong to one org. Safe to re-run.
+
+alter table teams add column if not exists personal boolean not null default false;
+create unique index if not exists one_personal_org on teams (created_by) where personal;
+
+create or replace function ensure_personal_org(p_user uuid) returns uuid language plpgsql security definer set search_path = public as $$
+declare t uuid; who text;
+begin
+  select id into t from teams where created_by = p_user and personal;
+  if t is not null then return t; end if;
+  select name into who from profiles where id = p_user;
+  insert into teams (name, created_by, personal) values (coalesce(who, 'My') || '''s org', p_user, true) returning id into t;
+  insert into team_members (team_id, user_id, role) values (t, p_user, 'owner') on conflict do nothing;
+  return t;
+end $$;
+revoke execute on function ensure_personal_org(uuid) from public, anon, authenticated;
+grant execute on function ensure_personal_org(uuid) to service_role;
+
+-- New accounts: a profile, then a personal org.
+create or replace function handle_new_user() returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into profiles (id, name)
+  values (new.id, coalesce(nullif(trim(new.raw_user_meta_data->>'name'), ''), split_part(new.email, '@', 1)))
+  on conflict (id) do nothing;
+  perform ensure_personal_org(new.id);
+  return new;
+end $$;
+
+-- Accounts made before personal orgs existed get one now.
+do $$ declare p record; begin
+  for p in select id from profiles loop perform ensure_personal_org(p.id); end loop;
+end $$;
+
+-- Invite codes join teams, never someone's personal org.
+create or replace function join_team(code text) returns uuid language plpgsql security definer set search_path = public as $$
+declare t uuid;
+begin
+  if auth.uid() is null then raise exception 'Sign in first'; end if;
+  select id into t from teams where invite_code = lower(trim(code)) and not personal;
+  if t is null then raise exception 'No team has that invite code'; end if;
+  insert into team_members (team_id, user_id) values (t, auth.uid()) on conflict do nothing;
+  return t;
+end $$;

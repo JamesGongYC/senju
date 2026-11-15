@@ -34,8 +34,9 @@ export class LocalLibrary {
 }
 
 export class TeamLibrary {
-  constructor({ url, token }) {
+  constructor({ url, token, teamId = null }) {
     this.url = String(url).replace(/\/+$/, '');
+    this.teamId = teamId;   // the org everything is about; null means the personal org
     this.token = token;   // async () => access token or null
   }
 
@@ -44,7 +45,7 @@ export class TeamLibrary {
     if (!token) throw new Error('Sign in to your team first.');
     const res = await fetch(`${this.url}${path}`, {
       method,
-      headers: { authorization: `Bearer ${token}`, ...(body ? { 'content-type': 'application/json' } : {}) },
+      headers: { authorization: `Bearer ${token}`, ...(this.teamId ? { 'x-senju-team': this.teamId } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
     const data = await res.json().catch(() => ({}));
