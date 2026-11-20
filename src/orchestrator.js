@@ -8,7 +8,7 @@ import { pointBefore, scrollWithCursor, readPage, foundRef, SCROLL_TOOL } from '
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds, onYouTube } from './adskip.js';
-import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS } from './deskpoint.js';
+import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS, readWindow } from './deskpoint.js';
 import { READ_ONLY, noteTarget, userActive, collides, inBackground, WAIT_LABEL } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
 import { listSkills, readSkill, saveSkill } from './skills.js';
@@ -1260,8 +1260,8 @@ export class Swarm {
               else if (scriptScroll) { out = say(`Not run: browser_evaluate is for reading the page only, and a script that scrolls moves the page with no cursor to watch. Scroll with ${toolName(hit.conn.name, 'browser_scroll')} (a direction, or a target ref to bring into view), then read the page again.`, true); }
               const pointEmit = (point) => this.emit({ type: 'point', agentId: agent.id, point });
               const run = scripted || skipped || scriptScroll ? null : async () => {
-                // The cursor may still be reading this page (and scrolling it back): act once it is done.
-                if (hit.conn.reading) await Promise.race([hit.conn.reading, new Promise((r) => setTimeout(r, 3000))]);
+                // The cursor may still be reading this window: stop it (a chat is put back at its bottom) and act.
+                if (hit.conn.reading) { hit.conn.stopReading?.(); await Promise.race([hit.conn.reading, new Promise((r) => setTimeout(r, 3000))]); }
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 // Background input to another app never looks like the user typing, so only the rest is noted.
@@ -1302,6 +1302,14 @@ export class Swarm {
                 }
                 if (spec.kind === 'desktop') {
                   rememberFrames(agent, hit.tool, res);
+                  // It read an app window with text out of view: scroll it under the cursor while the model thinks
+                  // (src/deskpoint.js). On this Mac only, and never while the person is typing or clicking.
+                  if (hit.tool === 'get_window_state' && canShow && !calls.slice(callIndex + 1).some((c) => lookup.get(c.name)?.conn === hit.conn) && !res.isError && this.config.pointing !== false && this.config.showReading !== false && !this.userActive()) {
+                    const reading = readWindow(hit.conn, res.structured, pointEmit, { turn: (fn) => this.inTurn(hit.conn, fn), busy: () => this.userActive() || signal.aborted });
+                    agent.deskReading = reading.done;
+                    agent.stopDeskReading = reading.stop;
+                    reading.done.finally(() => { if (agent.deskReading === reading.done) { agent.deskReading = null; agent.stopDeskReading = null; } });
+                  }
                   // A launched app should be seen opening: show its window and let the cursor and slot follow it.
                   if (canShow && hit.tool === 'launch_app' && !res.isError) {
                     const shown = await showLaunched(hit.conn, res);
@@ -1347,6 +1355,9 @@ export class Swarm {
                 }
                 return res;
               };
+              // Still reading this agent's app window: stop it (a chat goes back to its bottom) before acting. Outside
+              // the serial queue, since the reading's own steps wait in that queue.
+              if (run && agent.deskReading && spec.kind === 'desktop') { agent.stopDeskReading?.(); await Promise.race([agent.deskReading, new Promise((r) => setTimeout(r, 4000))]); }
               if (run) out = spec.serial ? await this.inTurn(hit.conn, run) : await run();
             }
           }

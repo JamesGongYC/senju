@@ -13,7 +13,9 @@ const page = `<!doctype html><body style="margin:0;font:16px sans-serif">
 <button id="far" onclick="this.textContent='clicked'">Far button</button><div style="height:500px"></div></body>`;
 const inner = `<body style="margin:0"><div style="height:1200px"></div><button style="margin-left:30px" onclick="this.textContent='hit'">Inner button</button></body>`;
 const framed = (port) => `<body style="margin:0"><div style="height:200px">top</div><iframe src="http://localhost:${port}/inner" style="display:block;margin-left:300px;width:400px;height:300px;border:0"></iframe></body>`;
-const srv = http.createServer((q, r) => { r.setHeader('content-type', 'text/html'); r.end(q.url === '/inner' ? inner : q.url === '/framed' ? framed(srv.address().port) : page); }).listen(0);
+// A chat app: the page does not scroll, its message list does, and it sits at the newest message.
+const chat = `<body style="margin:0;overflow:hidden;height:100vh"><div id="log" style="height:100vh;overflow-y:auto">${'<p style="height:60px">message</p>'.repeat(80)}</div><script>log.scrollTop = log.scrollHeight</script></body>`;
+const srv = http.createServer((q, r) => { r.setHeader('content-type', 'text/html'); r.end(q.url === '/inner' ? inner : q.url === '/framed' ? framed(srv.address().port) : q.url === '/chat' ? chat : page); }).listen(0);
 const url = `http://127.0.0.1:${srv.address().port}/`;
 const conn = await connectServer('browser', { command: process.execPath, args: [path.join(root, 'node_modules/@playwright/mcp/cli.js'), '--headless', '--isolated'] });
 const { tools } = buildToolset([conn], () => [SCROLL_TOOL]);
@@ -62,6 +64,25 @@ assert.deepEqual(points.slice(before).map((p) => p.verb), ['scroll', 'click'], '
 assert.equal(points.at(-1).inView, true);
 assert.ok(!(await callTool(conn, 'browser_click', { target: far, element: 'Far button' })).isError);
 assert.ok(points.filter((p) => p.verb === 'scroll').every((p) => Number.isFinite(p.screenX) && p.dir), 'scroll points carry a spot and a direction');
+
+// A chat at its newest message: it scrolls up its message list to read, then back down to the bottom.
+await callTool(conn, 'browser_navigate', { url: `http://127.0.0.1:${srv.address().port}/chat` });
+const logPos = async () => evalResult((await callTool(conn, 'browser_evaluate', { function: '() => [log.scrollTop, log.scrollHeight - log.clientHeight]' })).content[0].text);
+const [startTop, maxTop] = await logPos();
+assert.ok(startTop >= maxTop - 2, 'starts at the bottom');
+let mark0 = points.length;
+await readPage(conn, emit);
+const dirs = points.slice(mark0).filter((p) => p.verb === 'scroll').map((p) => p.dir);
+assert.ok(dirs.includes('up') && dirs.at(-1) === 'down', `up to read, then down: ${dirs}`);
+assert.ok((await logPos())[0] >= maxTop - 2, 'back at the newest message');
+// Stopped while reading (the worker acts): it is back at the bottom before the action.
+await callTool(conn, 'browser_evaluate', { function: '() => { log.insertAdjacentHTML("beforeend", "<p style=height:60px>new</p>".repeat(30)); log.scrollTop = log.scrollHeight; }' });
+const again = readPage(conn, emit);
+await new Promise((r) => setTimeout(r, 500));
+conn.stopReading();
+await again;
+const [t2, m2] = await logPos();
+assert.ok(t2 >= m2 - 2, `stopped reading leaves the chat at its bottom (${t2} of ${m2})`);
 
 // Inside a cross-origin iframe: the cursor goes where the button is on the page, not where it is in its frame.
 await callTool(conn, 'browser_navigate', { url: `http://127.0.0.1:${srv.address().port}/framed` });

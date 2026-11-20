@@ -276,45 +276,73 @@ export async function scrollWithCursor(conn, args, emit, signal, known = null) {
 }
 
 // ---- Reading, shown --------------------------------------------------------------------------------------------
-// When a worker reads a page and there is more of it below the window, the page scrolls down under the cursor the
-// way a person reads on: a screen at a time with a pause to read, a few screens at most, and it stays where the
-// reading ended (the next action scrolls back with the cursor if it needs to). When it reads one thing (a match
-// it searched for, an element it read) that is out of view, the cursor scrolls to it. The cursor does not trace the
-// text. It runs while the model thinks about what it read, and the worker's next action on that window waits for
-// it (conn.reading). A page is read through this way once.
+// When a worker reads a page and part of it is out of view, it scrolls under the resting cursor the way a person
+// reads: a screen at a time with a pause to read, a few screens at most. Below the window: it reads on down and
+// stays there. Only above (a chat sitting at its newest message, like claude.ai): it scrolls up to where the new
+// part starts and reads back down to the bottom, where the input is. Pages that scroll inside a panel are read in
+// that panel. When it reads one thing out of view (a match it searched for), the cursor scrolls to it. The cursor
+// does not trace the text. It plays while the model thinks; the worker's next action on that window stops it
+// (conn.stopReading) instead of waiting, and a chat is put back at its bottom first. A page is read again when it
+// has grown (a new reply), not on every look.
 
 const READ_PLAN = `() => {
   const root = document.scrollingElement || document.documentElement;
-  const scrolls = getComputedStyle(document.body).overflowY !== 'hidden' && getComputedStyle(root).overflowY !== 'hidden';
-  return { url: location.href, room: scrolls ? Math.max(0, root.scrollHeight - innerHeight - root.scrollTop) : 0, ih: innerHeight };
+  const roomIn = (n) => n.scrollHeight - n.clientHeight;
+  const pageScrolls = roomIn(root) > 2 && getComputedStyle(document.body).overflowY !== 'hidden' && getComputedStyle(root).overflowY !== 'hidden';
+  let box = null;
+  if (!pageScrolls) {
+    let best = 0;
+    for (const n of document.querySelectorAll('*')) {
+      if (roomIn(n) < 2 || !/auto|scroll|overlay/.test(getComputedStyle(n).overflowY)) continue;
+      const r = n.getBoundingClientRect(); const a = r.width * r.height;
+      if (a > best) { best = a; box = n; }
+    }
+  }
+  const n = box || root, view = box ? box.clientHeight : innerHeight;
+  return { key: location.href + '|' + Math.round(n.scrollHeight / Math.max(1, view / 2)), above: n.scrollTop, below: n.scrollHeight - view - n.scrollTop, view };
 }`;
-export const READ_SCREENS = 2;    // how far reading scrolls down a long page, in screens
+export const READ_SCREENS = 2;    // how far reading goes, in screens
 export const READ_PAUSE_MS = 450; // the pause to read each screen
 
 /**
- * Show the worker reading. With target (a ref it read), scroll that into view; otherwise read down the page.
- * Returns a promise for when it is done; never rejects.
+ * Show the worker reading. With target (a ref it read), scroll that into view; otherwise read the page.
+ * conn.reading is a promise for when it is done (never rejects); conn.stopReading() ends it early.
  */
 export function readPage(conn, emit, { target = null, element = 'what it read' } = {}) {
+  let stop = false, wake = null;
+  const pause = (ms) => new Promise((r) => { wake = r; setTimeout(r, ms); });
   const run = (async () => {
     if (target) { await scrollWithCursor(conn, { target, element }, emit); return; }
     const planned = await within(callTool(conn, 'browser_evaluate', { function: READ_PLAN }), MEASURE_MAX_MS);
     const plan = planned && !planned.isError ? evalResult(text(planned)) : null;
-    if (!plan || plan.room < plan.ih * 0.4) return;
+    if (!plan || stop) return;
     const seen = (conn.readPages ??= new Set());
-    if (seen.has(plan.url)) return;
-    seen.add(plan.url);
-    let left = Math.min(plan.room, plan.ih * READ_SCREENS);
-    while (left > plan.ih * 0.2) {
-      await sleep(READ_PAUSE_MS);
-      const pages = Math.min(1, left / (plan.ih * 0.85));
-      const r = await scrollWithCursor(conn, { direction: 'down', pages }, emit);
-      if (!r?.moved) break;
-      left -= pages * plan.ih * 0.85;
+    if (seen.has(plan.key)) return;
+    const step = plan.view * 0.85;
+    // mustFinish: keep going when stopped, only without the pauses (a chat must end back at its bottom).
+    const go = async (direction, px, rest, mustFinish = false) => {
+      let left = px, moved = 0;
+      while (left > plan.view * 0.2 && (mustFinish || !stop)) {
+        if (!stop) await pause(rest);
+        if (stop && !mustFinish) break;
+        const pages = Math.min(1, left / step);
+        const r = await scrollWithCursor(conn, { direction, pages }, emit);
+        if (!r?.moved) break;
+        left -= pages * step; moved += pages * step;
+      }
+      return moved;
+    };
+    if (plan.below > plan.view * 0.4) { seen.add(plan.key); await go('down', Math.min(plan.below, plan.view * READ_SCREENS), READ_PAUSE_MS); }
+    else if (plan.above > plan.view * 0.4) {
+      // A chat at its newest message: up to where the new part begins, then read back down to the bottom.
+      seen.add(plan.key);
+      const up = await go('up', Math.min(plan.above, plan.view * READ_SCREENS), 120);
+      if (up > 0) await go('down', up + plan.view, READ_PAUSE_MS, true);
     }
   })().catch(() => {});
   conn.reading = run;
-  run.finally(() => { if (conn.reading === run) conn.reading = null; });
+  conn.stopReading = () => { stop = true; wake?.(); };
+  run.finally(() => { if (conn.reading === run) { conn.reading = null; conn.stopReading = null; } });
   return run;
 }
 
