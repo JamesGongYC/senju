@@ -3,8 +3,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { connectServer, buildToolset, callTool, resolveSpec } from './mcp.js';
-import { pointBefore } from './point.js';
+import { connectServer, buildToolset, callTool, resolveSpec, toolName } from './mcp.js';
+import { pointBefore, scrollWithCursor, SCROLL_TOOL } from './point.js';
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds, onYouTube } from './adskip.js';
@@ -170,7 +170,8 @@ Shared workspace folder for files: ${workspace}
 - When a game or tool shows its own on-screen keyboard or keypad (Wordle, a calculator), click its keys with browser_click, one key per call, and click its Enter key to submit each row, rather than typing on the keyboard.
 - When your subtask is to find a website, page, profile or link, finish by opening it the way a person would: click the matching search result's link with browser_click (not browser_navigate to the address), check the page that opens is the right one, and leave it open on screen. Do not stop at reading or reporting the address.
 - Clear anything that covers the page yourself, without asking the user: a cookie banner (accept or reject it), a newsletter or sign-up pop-up, an ad overlay or a chat bubble in the way. Click its close, "No thanks" or accept button with browser_click so the person sees the cursor do it, then carry on. Never close a box that asks the user to approve, pay or sign in for your task.
-- The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate, but never use a script to click, type or play for you, and never do many actions in one call.
+- The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option, browser_scroll), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate, but never use a script to click, type, scroll or play for you, and never do many actions in one call.
+- Waiting for a page (a reply being written, a build, an upload): wait for what shows it is done, with browser_wait_for and text (words that appear when it is ready) or textGone (a "Stop", "Loading" or "Generating" label that goes away), not a fixed time. A fixed wait only for a few seconds at a time, when nothing on the page tells you.
 - The swarm shares a board. Use board_post to share a finding or partial result another agent could use now, without waiting until you finish. Posts by others reach you automatically on your next step, marked "New on the shared board"; use them if relevant and ignore them otherwise. board_read shows the whole board.
 - Before each tool call, say in at most eight words what you are doing.
 - Long content goes in pieces. When you have to enter a lot of text (a write-up, a long document), put it in through several tool calls of at most about 800 words each, not one giant call. A single oversized call gets cut off and nothing is saved.
@@ -202,6 +203,7 @@ Some steps need the user's own hands, and not in your window: typing or pasting 
 - It waits for as long as the user needs. Do not nag, and do not carry on with steps that depend on it.
 - Afterwards, if you can check the result yourself (read the other window, list the ports, look for the file), do so. If it cannot be checked from here, take the user's Done as the answer.
 - Never ask the user to do something you can do with your own tools.
+- Files: never ask the user to copy, move, replace or delete files or folders outside the shared workspace folder, and never tell them something there "does not need to be kept": you cannot see what is in it, and a replaced folder is gone for good. If a tool cannot reach a file, put the file in the workspace folder with your own tools and use it from there.
 
 # Asking versus proceeding
 The user is busy with other work, so each question costs them attention. Ask only when a wrong guess would be expensive or hard to undo, or when you cannot proceed at all.
@@ -1013,18 +1015,25 @@ export class Swarm {
     try {
       update({ status: 'starting', label: 'connecting tools' });
       const conns = [];
-      for (const name of agent.servers) {
-        if (this.shared.has(name)) { conns.push(this.shared.get(name)); continue; }
+      // Start this worker's own servers together (a browser takes a second or two to open), keeping their order.
+      const opened = await Promise.all(agent.servers.map(async (name) => {
+        if (this.shared.has(name)) return { conn: this.shared.get(name), shared: true };
         try {
-          const conn = await this.connect(name, this.serverSpec(name, agent), agent);
-          own.push(conn);
-          conns.push(conn);
-          if (conn.pid) agent.pids.push(conn.pid);
+          return { conn: await this.connect(name, this.serverSpec(name, agent), agent) };
         } catch (err) {
           this.emit({ type: 'notice', message: `${agent.name}: could not start "${name}": ${err?.message ?? err}` });
+          return null;
         }
+      }));
+      for (const o of opened) {
+        if (!o) continue;
+        conns.push(o.conn);
+        if (o.shared) continue;
+        own.push(o.conn);
+        if (o.conn.pid) agent.pids.push(o.conn.pid);
       }
-      const { tools, lookup } = buildToolset(conns);
+      // Browser windows also get browser_scroll, which the ghost cursor plays (src/point.js).
+      const { tools, lookup } = buildToolset(conns, (c) => (this.config.servers[c.name]?.tile === 'playwright' && c.tools.some((t) => t.name === 'browser_evaluate') ? [SCROLL_TOOL] : []));
       const others = this.agents.filter((a) => a.id !== agent.id && a.live);
       const skillNotes = (this.skills ? await Promise.all(agent.skills.map((n) => this.skills.read(n))) : []).filter(Boolean).map((k) => `## ${k.name}\n${k.body}`).join('\n\n');
       const desktop = agent.servers.some((sv) => this.config.servers[sv]?.kind === 'desktop');
@@ -1206,10 +1215,14 @@ export class Swarm {
               const skipped = batchStopped === hit.conn && desktopAct;
               if (spec.kind === 'desktop' && !skipped) this.noteTarget(agent, call.input);
               // The person watches each cursor: a script that clicks, types or changes the page would act unseen.
-              const scripted = hit.tool === 'browser_evaluate' && /\.click\(|dispatchEvent|\.value\s*=|\.submit\(|\.focus\(|innerHTML\s*=|textContent\s*=/.test(String(call.input?.function ?? ''));
+              const fn = hit.tool === 'browser_evaluate' ? String(call.input?.function ?? '') : '';
+              const scripted = /\.click\(|dispatchEvent|\.value\s*=|\.submit\(|\.focus\(|innerHTML\s*=|textContent\s*=/.test(fn);
+              // Scrolling by script moves the page with no cursor to watch; browser_scroll does it with the cursor.
+              const scriptScroll = spec.tile === 'playwright' && /scrollIntoView|scroll(To|By)\s*\(|\.scroll\s*\(|scroll(Top|Left)\s*[-+]?=(?!=)/.test(fn);
               if (skipped) out = say('Not run: an earlier action in this reply failed, so the rest of the batch was stopped. Look at the window state returned with that failure and decide again.', true);
               else if (scripted) { out = say('Not run: browser_evaluate is for reading the page only. Do each click with browser_click, each entry with browser_type and each key with browser_press_key, one action per call, so the person can watch your cursor do it.', true); }
-              const run = scripted || skipped ? null : async () => {
+              else if (scriptScroll) { out = say(`Not run: browser_evaluate is for reading the page only, and a script that scrolls moves the page with no cursor to watch. Scroll with ${toolName(hit.conn.name, 'browser_scroll')} (a direction, or a target ref to bring into view), then read the page again.`, true); }
+              const run = scripted || skipped || scriptScroll ? null : async () => {
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 // Background input to another app never looks like the user typing, so only the rest is noted.
@@ -1219,6 +1232,12 @@ export class Swarm {
                 if (spec.tile === 'playwright' && hit.tool === 'browser_press_key' && this.config.pointing !== false) {
                   const tapped = await clickOnScreenKey(hit.conn, call.input?.key, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
                   if (tapped) return { ...tapped, content: [{ type: 'text', text: `Clicked the on-screen "${call.input?.key}" key.` }, ...tapped.content] };
+                }
+                // Scrolling is the cursor's too: it moves onto the area, then the page scrolls under it.
+                if (hit.own && hit.tool === 'browser_scroll') {
+                  const emit = this.config.pointing === false ? () => {} : (point) => this.emit({ type: 'point', agentId: agent.id, point });
+                  const { moved, ...res } = await scrollWithCursor(hit.conn, call.input, emit, signal);
+                  return res;
                 }
                 // A browser window of its own: send the ghost cursor to where this action lands first.
                 if (spec.tile === 'playwright' && this.config.pointing !== false) await pointBefore(hit.conn, hit.tool, call.input, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);

@@ -15,6 +15,7 @@ export async function connectServer(name, spec) {
     command: spec.command,
     args: spec.args ?? [],
     env: { ...getDefaultEnvironment(), ...(spec.env ?? {}) },
+    ...(spec.cwd ? { cwd: spec.cwd } : {}),
     stderr: 'ignore',
   });
   const client = new Client({ name: 'senju', version: '0.1.0' });
@@ -69,10 +70,18 @@ export function toolName(server, tool) {
 // Tools agents never get: a script that drives the page does many things at once, with no cursor to watch.
 const HIDDEN_TOOLS = new Set(['browser_run_code_unsafe', 'browser_run_code']);
 
-export function buildToolset(connections) {
+// extra(conn) -> tools of the app's own to offer on that connection ([{ name, description, input_schema }]).
+// The caller runs them: their lookup entries carry own: true. browser_scroll on a browser window is one.
+export function buildToolset(connections, extra = null) {
   const tools = [];
   const lookup = new Map();
   for (const conn of connections) {
+    for (const t of extra?.(conn) ?? []) {
+      if (conn.tools.some((x) => x.name === t.name)) continue;   // the server has its own; use that
+      const name = toolName(conn.name, t.name);
+      lookup.set(name, { conn, tool: t.name, own: true });
+      tools.push({ ...t, name, description: `[${conn.name}] ${t.description}` });
+    }
     for (const t of conn.tools) {
       if (HIDDEN_TOOLS.has(t.name)) continue;
       const name = toolName(conn.name, t.name);
@@ -134,6 +143,11 @@ export function resolveSpec(spec, workspace, agent = null) {
     args[0] = path.join(APP_ROOT, args[0]);
     env = { ...env, ELECTRON_RUN_AS_NODE: '1' };
   }
+  // A browser server reads and writes files (uploads, screenshots, .playwright-mcp logs) only inside the folder it
+  // runs in, so run it in the shared workspace: then a worker can upload what the files tool wrote there, and no
+  // one is asked to copy files into the folder the app itself was started from.
+  let cwd = spec.cwd;
+  if (spec.tile === 'playwright' && !cwd && workspace) { try { fs.mkdirSync(workspace, { recursive: true }); cwd = workspace; } catch { /* keep the default */ } }
   if (spec.tile === 'playwright' && agent?.slot) {
     const { x, y, w, h } = agent.slot;
     const file = path.join(os.tmpdir(), `senju-${process.pid}-${agent.id}.json`);
@@ -145,5 +159,5 @@ export function resolveSpec(spec, workspace, agent = null) {
     }));
     args.push('--config', file);
   }
-  return { ...spec, command, env, args };
+  return { ...spec, command, env, args, ...(cwd ? { cwd } : {}) };
 }

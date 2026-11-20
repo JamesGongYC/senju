@@ -35,13 +35,13 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 #state-dot[data-state="running"] { color: #FF4A1F; animation: pulse 1.4s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.35; transform: scale(0.8); } }
 
-/* Agents listed under the field like Spotlight results: one row each, the selected one highlighted */
-#chips { display: flex; flex-direction: column; gap: 2px; padding: 6px; border-top: 1px solid rgba(255, 255, 255, 0.1); max-height: 38vh; overflow-y: auto; }
+/* Agents as small pills in a row under the field, wrapping onto a second line only when there are many */
+#chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; padding: 8px 10px; border-top: 1px solid rgba(255, 255, 255, 0.1); max-height: 22vh; overflow-y: auto; }
 #chips:empty, #panel[data-state="idle"] #chips:has(> .chip:only-child) { display: none; }
-.chip { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 7px 12px; font-size: 14px; border-radius: 10px; }
-.chip i { width: 9px; height: 9px; border-radius: 50%; flex: none; }
-.chip b { font-weight: 500; flex: none; }
-.chip span { margin-left: auto; min-width: 0; color: var(--dim); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chip { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 240px; padding: 4px 10px; font-size: 12px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--line); border-radius: 999px; }
+.chip i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.chip b { font-weight: 600; flex: none; }
+.chip span { min-width: 0; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chip[data-status="done"] span { color: #39d98a; }
 .chip[data-status="error"] span { color: #ff8d8d; }
 
@@ -67,6 +67,15 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 .cursor.typing svg.arrow { display: none; }
 .cursor.typing .ibeam { display: block; }
 .cursor.typing .tag { margin-left: -6px; }
+/* Scrolling: a wheel badge next to the arrow, its chevrons running the way the content moves. */
+.cursor .wheel { display: none; width: 16px; height: 16px; margin: 14px 0 0 -8px; }
+.cursor.scrolling .wheel { display: block; }
+.cursor.scrolling[data-dir="down"] .wheel { animation: wheel-down 0.45s ease-in-out infinite; }
+.cursor.scrolling[data-dir="up"] .wheel { animation: wheel-up 0.45s ease-in-out infinite; }
+.cursor.scrolling[data-dir="left"] .wheel { transform: rotate(90deg); animation: none; }
+.cursor.scrolling[data-dir="right"] .wheel { transform: rotate(-90deg); animation: none; }
+@keyframes wheel-down { 0%, 100% { transform: translateY(-2px); } 50% { transform: translateY(3px); } }
+@keyframes wheel-up { 0%, 100% { transform: translateY(2px); } 50% { transform: translateY(-3px); } }
 @keyframes press { 50% { transform: translate(1px, 1px) scale(0.78); } }
 .type-bubble { position: absolute; left: 0; top: 0; min-width: 40px; max-width: 520px; padding: 4px 10px; border-radius: 13px; background: #fff; color: #1f1f1f; font: 13px/18px -apple-system, system-ui, sans-serif; white-space: nowrap; overflow: hidden; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25); pointer-events: none; }
 .cursor .body { display: flex; align-items: flex-start; animation: drift 5s ease-in-out infinite; }
@@ -114,11 +123,10 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 .cursor[data-status="blocked"] svg { opacity: 0.55; }
 
 /* Chips are the chat targets: click one to talk to that agent */
-.chip { cursor: pointer; transition: background 0.12s; position: relative; }
-.chip:hover { background: rgba(255, 255, 255, 0.07); }
-.chip.selected { background: color-mix(in srgb, var(--agent, #f2f3f5) 24%, transparent); }
-.chip.unread { padding-right: 28px; }
-.chip.unread::after { content: ""; position: absolute; top: 50%; right: 12px; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; background: #D3FD50; }
+.chip { cursor: pointer; transition: border-color 0.15s, background 0.15s; position: relative; }
+.chip:hover { background: rgba(255, 255, 255, 0.1); }
+.chip.selected { border-color: var(--agent, #f2f3f5); box-shadow: 0 0 0 1px var(--agent, #f2f3f5); background: color-mix(in srgb, var(--agent, #f2f3f5) 16%, transparent); }
+.chip.unread::after { content: ""; position: absolute; top: -2px; right: -2px; width: 9px; height: 9px; border-radius: 50%; background: #D3FD50; border: 2px solid #16171c; }
 .chip[data-status="cancelled"] span { color: var(--dim); }
 
 #thread { width: 100%; max-height: 28vh; overflow: auto; padding: 10px 14px; background: var(--glass); border: 1px solid var(--line); border-radius: 16px; backdrop-filter: blur(24px); font-size: 13px; line-height: 1.45; user-select: text; display: flex; flex-direction: column; gap: 6px; }

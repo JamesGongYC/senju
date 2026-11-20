@@ -65,6 +65,8 @@ const add = (parent, tag, cls, text) => {
 
 function cursorSvg(color) {
   return `<svg class="arrow" viewBox="0 0 24 24"><path d="M4 2.5l15.5 8.2-6.6 1.9-2.6 6.6z" fill="${color}" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>` +
+    `<svg class="wheel" viewBox="0 0 24 24"><path d="M7 9l5-5 5 5M7 15l5 5 5-5" fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>` +
+    `<path d="M7 9l5-5 5 5M7 15l5 5 5-5" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
     `<svg class="ibeam" viewBox="0 0 24 24"><path d="M8 3.5h8M12 3.5v17M8 20.5h8" fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/>` +
     `<path d="M8 3.5h8M12 3.5v17M8 20.5h8" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round"/></svg>`;
 }
@@ -88,7 +90,19 @@ function playCursor(agent, e) {
   agent.target = { ...(agent.target ?? {}), x: e.x, y: e.y };
   agent.el.classList.add('pinned');
   clearTimeout(agent.playTimer);
-  agent.el.classList.remove('typing', 'tapping');
+  agent.el.classList.remove('typing', 'tapping', 'scrolling');
+  if (e.kind === 'scroll') {
+    // Glide onto the area, then the wheel turns (chevrons run the way the page moves) while it scrolls.
+    const glide = moveCursor(agent, e);
+    const ms = Math.max(200, e.ms || 450);
+    agent.busyUntil = Date.now() + glide + ms;
+    agent.playTimer = setTimeout(() => {
+      agent.el.dataset.dir = e.dir || 'down';
+      agent.el.classList.add('scrolling');
+      agent.playTimer = setTimeout(() => { agent.el.classList.remove('scrolling'); agent.busyUntil = 0; }, ms);
+    }, glide);
+    return;
+  }
   if (e.kind === 'type' && e.from) {
     const glide = moveCursor(agent, e.from);
     const ms = Math.max(80, e.ms || 0);

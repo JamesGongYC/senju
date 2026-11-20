@@ -110,7 +110,7 @@ function notify(title, body) {
 
 // Ghost cursors on what an agent is doing.
 // The orchestrator emits (src/point.js) { type: 'point', agentId, point } just before an action: an element's centre for click, type and
-// select, or just the verb for open (address bar), back (back button) and key (stay put). The cursor glides there
+// select, the middle of the area that scrolls for scroll, or just the verb for open (address bar), back (back button) and key (stay put). The cursor glides there
 // and STAYS, relative to that agent's window, until the next point: it never snaps back to a parking spot.
 const pointing = new Map();   // agentId -> { dx, dy } from its window's top-left, or { x, y } when there is no window
 const chromeTops = new Map(); // agentId -> height of the tab and address bars in that window, from measured points
@@ -153,6 +153,8 @@ function cursorMove(agentId, point) {
     const end = Math.min(spot.x + half - 8 * scale, from.x + (point.chars ?? 0) * 7 * scale);
     return { x: clampX(Math.max(from.x, end)), y: spot.y, from, kind: 'type', ms: Number(point.typeMs) || 0 };
   }
+  // Scroll: rest on the area that scrolls and play the wheel while the page moves under the cursor.
+  if (verb === 'scroll') return { ...spot, kind: 'scroll', dir: ['up', 'down', 'left', 'right'].includes(point.dir) ? point.dir : 'down', ms: Number(point.ms) || 450 };
   return { ...spot, kind: 'click', ms: 0 };
 }
 
@@ -524,7 +526,14 @@ function startTracking() {
   stopTracking();
   pointing.clear();   // a new job: cursors start from their windows again
   chromeTops.clear();
+  // One look at a time: listing windows can take a while when the Mac is busy, and looks must not pile up.
+  let ticking = false;
   const tick = async () => {
+    if (ticking) return;
+    ticking = true;
+    try { await look(); } finally { ticking = false; }
+  };
+  const look = async () => {
     if (!isRunning() || !win?.isVisible()) return;
     const [windows, parents] = await Promise.all([listWindows({ all: true }), processParents()]);
     const targets = {};

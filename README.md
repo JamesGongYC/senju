@@ -65,6 +65,7 @@ Several people can share one session across their computers: an agent can work o
 
 - **Tasks for you, anywhere.** An agent can ask you to do something outside its own window with `user_task`: type something into another app, pick a file, plug in a device, anything physical. The card says what to do, where, and what to type back (for example a port name). It waits as long as you need, then checks the result itself when it can.
 - **Take over a window.** Click a worker's chip, then **Pause**. The worker stops before its next action and its window is yours. **Resume** hands it back, and the worker re-reads the window before acting. **Stop** ends just that worker and tells the lead not to restart it.
+- **Scrolling is shown too.** Browser workers scroll with `browser_scroll`: the ghost cursor moves onto the page or panel and the content scrolls smoothly under it. An element out of view is scrolled to the same way before it is clicked, and scripts that scroll the page unseen are refused.
 - **Agents wait while you type, if they would get in your way.** A desktop action that aims at the app you are in, has to run in the foreground, or affects the whole Mac (the real pointer, the clipboard, which app is in front) is held while you are typing or clicking. Background actions on other apps go ahead. A held action goes ahead about two seconds after you stop (`"typingPause"` seconds in `swarm.config.json`; it gives up waiting after `"typingWaitMax"`, default 120). Reading the screen never waits.
 
 **Agents with each other**

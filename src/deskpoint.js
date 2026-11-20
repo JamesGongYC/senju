@@ -29,13 +29,16 @@ export function rememberFrames(agent, tool, res) {
 // Before an action: the screen point it lands on, or null.
 export function deskPoint(agent, tool, input) {
   if (!ACTIONS.test(tool) || !input) return null;
-  const verb = /type|set_value/.test(tool) ? 'type' : tool === 'press_key' || tool === 'hotkey' ? 'key' : 'click';
+  const verb = /type|set_value/.test(tool) ? 'type' : tool === 'press_key' || tool === 'hotkey' ? 'key' : tool === 'scroll' ? 'scroll' : 'click';
+  const extra = verb === 'scroll' ? { dir: input.direction ?? 'down', ms: 450 } : {};
   const f = input.element_token ? agent.deskFrames?.get(input.element_token) : null;
-  if (f) return { verb, screenX: Math.round(f.x + f.w / 2), screenY: Math.round(f.y + f.h / 2), w: f.w, chars: String(input.text ?? input.value ?? '').length };
+  if (f) return { verb, screenX: Math.round(f.x + f.w / 2), screenY: Math.round(f.y + f.h / 2), w: f.w, chars: String(input.text ?? input.value ?? '').length, ...extra };
   if (Number.isFinite(input.x) && Number.isFinite(input.y) && input.window_id != null) {
     const win = agent.deskWindows?.get(input.window_id);
-    if (win) return { verb, screenX: Math.round(win.bounds.x + input.x / win.scale), screenY: Math.round(win.bounds.y + input.y / win.scale) };
+    if (win) return { verb, screenX: Math.round(win.bounds.x + input.x / win.scale), screenY: Math.round(win.bounds.y + input.y / win.scale), ...extra };
   }
+  // A keystroke scroll (no target) scrolls the window the agent is in: play it where the cursor already is.
+  if (verb === 'scroll') return { verb: 'key' };
   return verb === 'key' ? { verb: 'key' } : null;
 }
 
