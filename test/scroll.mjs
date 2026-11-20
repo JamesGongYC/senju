@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectServer, callTool, buildToolset } from '../src/mcp.js';
-import { scrollWithCursor, pointBefore, readPage, SCROLL_TOOL, evalResult, READ_MS, SKIM_MS } from '../src/point.js';
+import { scrollWithCursor, pointBefore, readPage, foundRef, SCROLL_TOOL, evalResult } from '../src/point.js';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const page = `<!doctype html><body style="margin:0;font:16px sans-serif">
 <div style="height:3000px;background:linear-gradient(#fff,#ccd)"><h1>Top</h1></div>
@@ -22,20 +22,29 @@ await callTool(conn, 'browser_navigate', { url });
 const points = []; const emit = (p) => points.push(p);
 const scrollY = async () => Number((await callTool(conn, 'browser_evaluate', { function: '() => document.scrollingElement.scrollTop' })).content[0].text.match(/### Result\s*\n(\d+)/)[1]);
 
-// Reading a long page: the cursor skims it while the page scrolls down and back; it ends where it started.
-let maxSeen = 0;
+// Reading a long page: it scrolls down under the cursor a screen at a time and stays where reading ended.
 const reading = readPage(conn, emit);
 assert.ok(conn.reading, 'actions on this window wait for the reading');
-const watch = setInterval(async () => { maxSeen = Math.max(maxSeen, await scrollY().catch(() => 0)); }, 120);
 await reading;
-clearInterval(watch);
-const read = points.find((p) => p.verb === 'read');
-assert.ok(read && read.rect.w > 0 && read.rect.h > 0 && read.ms === READ_MS, `a reading skim over the page: ${JSON.stringify(read)}`);
-assert.ok(maxSeen > 100, `the page scrolled as it was read (${maxSeen})`);
-assert.equal(await scrollY(), 0, 'and is back where it was');
 assert.equal(conn.reading, null);
+const readScrolls = points.filter((p) => p.verb === 'scroll');
+assert.ok(readScrolls.length >= 2 && readScrolls.every((p) => p.dir === 'down'), `read on, a screen at a time: ${readScrolls.length}`);
+assert.ok(!points.some((p) => p.verb === 'read'), 'no skimming over the text');
+const afterRead = await scrollY();
+assert.ok(afterRead > 600, `the page stays where reading ended (${afterRead})`);
+const n = points.length;
 await readPage(conn, emit);
-assert.equal(points.filter((p) => p.verb === 'read').at(-1).ms, SKIM_MS, 'a page already read is only skimmed');
+assert.equal(points.length, n, 'a page already read is not read through again');
+// Reading one thing that is out of view (a browser_find match): the cursor scrolls to it.
+await callTool(conn, 'browser_evaluate', { function: '() => window.scrollTo(0, 0)' });
+const found = await callTool(conn, 'browser_find', { text: 'Far button' }).catch(() => null);
+const fref = found && !found.isError ? foundRef(found.content.map((c) => c.text).join('\n')) : null;
+if (fref) {
+  await readPage(conn, emit, { target: fref, element: 'Far button' });
+  assert.equal(points.at(-1).verb, 'scroll');
+  assert.ok((await scrollY()) > 1500, 'scrolled to what it found');
+} else console.log('(browser_find not available here; skipped the found-text case)');
+await callTool(conn, 'browser_evaluate', { function: '() => window.scrollTo(0, 0)' });
 points.length = 0;
 const check = (r, moved, re) => { assert.equal(r.moved, moved, r.content[0].text); assert.match(r.content[0].text, re); };
 check(await scrollWithCursor(conn, { direction: 'down' }, emit), true, /^Scrolled down\. The page is now \d+% of the way/);

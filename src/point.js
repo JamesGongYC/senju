@@ -96,7 +96,7 @@ export function evalResult(text) {
   try { return m ? JSON.parse(m[1]) : null; } catch { return null; }
 }
 
-export const POINT_LEAD_MS = 200;   // head start for the cursor's glide (the overlay's glides take 100-190 ms)
+export const POINT_LEAD_MS = 230;   // head start for the cursor's glide (the overlay's glides take 120-220 ms)
 const MEASURE_MAX_MS = 2000;
 export const pointLeadMs = (point) => (point?.verb === 'key' ? 0 : POINT_LEAD_MS + (point?.verb === 'open' ? Number(point.typeMs) || 0 : 0));
 
@@ -276,49 +276,50 @@ export async function scrollWithCursor(conn, args, emit, signal, known = null) {
 }
 
 // ---- Reading, shown --------------------------------------------------------------------------------------------
-// When a worker reads a page (opening it, a snapshot), the cursor skims the text, and on a page longer than the
-// window the page scrolls down under it as it reads, then back to where it was. It runs while the model thinks
-// about what it read, so it costs no time; the worker's next action on that window waits for it to finish
-// (conn.reading), and the page is left exactly as it was found. Each page is read this way once.
+// When a worker reads a page and there is more of it below the window, the page scrolls down under the cursor the
+// way a person reads on: a screen at a time with a pause to read, a few screens at most, and it stays where the
+// reading ended (the next action scrolls back with the cursor if it needs to). When it reads one thing (a match
+// it searched for, an element it read) that is out of view, the cursor scrolls to it. The cursor does not trace the
+// text. It runs while the model thinks about what it read, and the worker's next action on that window waits for
+// it (conn.reading). A page is read through this way once.
 
 const READ_PLAN = `() => {
   const root = document.scrollingElement || document.documentElement;
-  const room = root.scrollHeight - innerHeight;
-  const bodyScrolls = getComputedStyle(document.body).overflowY !== 'hidden' && getComputedStyle(root).overflowY !== 'hidden';
-  return { url: location.href, y0: root.scrollTop, room: bodyScrolls ? Math.max(0, room - root.scrollTop) : 0, ih: innerHeight, iw: innerWidth, m: (${METRICS})() };
+  const scrolls = getComputedStyle(document.body).overflowY !== 'hidden' && getComputedStyle(root).overflowY !== 'hidden';
+  return { url: location.href, room: scrolls ? Math.max(0, root.scrollHeight - innerHeight - root.scrollTop) : 0, ih: innerHeight };
 }`;
-const READ_RUN = (down, y0) => `async () => {
-  const root = document.scrollingElement || document.documentElement;
-  const rest = (ms) => new Promise((resolve) => { let done = false; const end = () => { if (!done) { done = true; resolve(); } }; document.addEventListener('scrollend', end, { once: true }); setTimeout(end, ms); });
-  root.scrollBy({ top: ${Math.round(down)}, behavior: 'smooth' });
-  await rest(900);
-  await new Promise((r) => setTimeout(r, 220));
-  root.scrollTo({ top: ${Math.round(y0)}, behavior: 'smooth' });
-  await rest(900);
-  if (Math.abs(root.scrollTop - ${Math.round(y0)}) > 2) root.scrollTo({ top: ${Math.round(y0)} });
-  return root.scrollTop;
-}`;
-export const READ_MS = 1300;      // a skim with scrolling; a skim alone takes SKIM_MS
-export const SKIM_MS = 650;
+export const READ_SCREENS = 2;    // how far reading scrolls down a long page, in screens
+export const READ_PAUSE_MS = 450; // the pause to read each screen
 
 /**
- * Show the worker reading its page. scroll: false only skims (after a screenshot or a script that reads).
- * Returns a promise for when the page is back as it was; never rejects.
+ * Show the worker reading. With target (a ref it read), scroll that into view; otherwise read down the page.
+ * Returns a promise for when it is done; never rejects.
  */
-export function readPage(conn, emit, { scroll = true } = {}) {
+export function readPage(conn, emit, { target = null, element = 'what it read' } = {}) {
   const run = (async () => {
+    if (target) { await scrollWithCursor(conn, { target, element }, emit); return; }
     const planned = await within(callTool(conn, 'browser_evaluate', { function: READ_PLAN }), MEASURE_MAX_MS);
     const plan = planned && !planned.isError ? evalResult(text(planned)) : null;
-    if (!plan?.m) return;
-    const tl = toScreen(plan.m, 0, 0), br = toScreen(plan.m, plan.iw, plan.ih);
-    const rect = { screenX: tl.screenX, screenY: tl.screenY, w: br.screenX - tl.screenX, h: br.screenY - tl.screenY };
+    if (!plan || plan.room < plan.ih * 0.4) return;
     const seen = (conn.readPages ??= new Set());
-    const scrolls = scroll && plan.room > plan.ih * 0.4 && !seen.has(plan.url);
+    if (seen.has(plan.url)) return;
     seen.add(plan.url);
-    emit({ verb: 'read', rect, ms: scrolls ? READ_MS : SKIM_MS });
-    if (scrolls) await within(callTool(conn, 'browser_evaluate', { function: READ_RUN(Math.min(plan.room, plan.ih * 1.5), plan.y0) }), 3000);
+    let left = Math.min(plan.room, plan.ih * READ_SCREENS);
+    while (left > plan.ih * 0.2) {
+      await sleep(READ_PAUSE_MS);
+      const pages = Math.min(1, left / (plan.ih * 0.85));
+      const r = await scrollWithCursor(conn, { direction: 'down', pages }, emit);
+      if (!r?.moved) break;
+      left -= pages * plan.ih * 0.85;
+    }
   })().catch(() => {});
   conn.reading = run;
   run.finally(() => { if (conn.reading === run) conn.reading = null; });
   return run;
+}
+
+// The element a browser_find result points at: the deepest ref of its first match.
+export function foundRef(resultText) {
+  const first = String(resultText ?? '').split(/\n(?=- |\d+\. )/).find((b) => /\[ref=/.test(b)) ?? '';
+  return [...first.matchAll(/\[ref=([\w-]+)\]/g)].at(-1)?.[1] ?? null;
 }

@@ -60,7 +60,6 @@ button:hover { background: rgba(255, 255, 255, 0.14); }
 /* Ghost cursors */
 #cursors { position: fixed; inset: 0; pointer-events: none; }
 .cursor { position: absolute; left: 0; top: 0; transition: opacity 0.4s; will-change: transform; }   /* moves are animated in renderer.js */
-.cursor.reading svg.arrow { opacity: 0.85; }
 /* On an element: hold still (no drift or tap loop), tap once per click, show an I-beam while typing. */
 .cursor.pinned .body, .cursor.pinned[data-status] .body { animation: none; }
 .cursor.tapping svg.arrow { animation: press 0.2s ease-out; }

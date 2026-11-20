@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { connectServer, buildToolset, callTool, resolveSpec, toolName } from './mcp.js';
-import { pointBefore, scrollWithCursor, readPage, SCROLL_TOOL } from './point.js';
+import { pointBefore, scrollWithCursor, readPage, foundRef, SCROLL_TOOL } from './point.js';
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds, onYouTube } from './adskip.js';
@@ -1302,12 +1302,6 @@ export class Swarm {
                 }
                 if (spec.kind === 'desktop') {
                   rememberFrames(agent, hit.tool, res);
-                  // Reading an app window: the cursor skims it while the model thinks.
-                  if (hit.tool === 'get_window_state' && !res.isError && this.config.pointing !== false && this.config.showReading !== false) {
-                    const w = agent.deskWindows?.get(res.structured?.window_id)?.bounds;
-                    const ww = w?.width ?? w?.w, wh = w?.height ?? w?.h;
-                    if (w && ww > 80 && wh > 80) pointEmit({ verb: 'read', rect: { screenX: w.x, screenY: w.y + 28, w: ww, h: wh - 28 }, ms: 650 });
-                  }
                   // A launched app should be seen opening: show its window and let the cursor and slot follow it.
                   if (canShow && hit.tool === 'launch_app' && !res.isError) {
                     const shown = await showLaunched(hit.conn, res);
@@ -1342,10 +1336,14 @@ export class Swarm {
                     res = { ...cleared.result, content: [{ type: 'text', text: `Opened ${call.input?.url ?? 'the page'}. It opened under a ${cleared.closed.join(' and then a ')}, so that was closed for you. The page now:` }, ...cleared.result.content] };
                   }
                 }
-                // It read the page: the cursor skims it, scrolling down through a long page and back (src/point.js).
-                // Not awaited, so it plays while the model thinks; only after the last call on this window in the reply.
-                if (spec.tile === 'playwright' && this.config.pointing !== false && this.config.showReading !== false && !res.isError && lastHere && /^browser_(navigate|navigate_back|snapshot|take_screenshot|find|evaluate)$/.test(hit.tool)) {
-                  readPage(hit.conn, pointEmit, { scroll: /^browser_(navigate|snapshot)$/.test(hit.tool) });
+                // It read the page: scroll on through a long page, or to the one thing it read if that is out of view
+                // (src/point.js). Not awaited, so it plays while the model thinks; only after the last call on this
+                // window in the reply.
+                if (spec.tile === 'playwright' && this.config.pointing !== false && this.config.showReading !== false && !res.isError && lastHere) {
+                  const resText = res.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+                  const target = hit.tool === 'browser_find' ? foundRef(resText) : hit.tool === 'browser_evaluate' ? (call.input?.target ?? call.input?.ref ?? null) : null;
+                  if (target) readPage(hit.conn, pointEmit, { target, element: String(call.input?.element ?? 'what it read') });
+                  else if (/^browser_(navigate|snapshot)$/.test(hit.tool)) readPage(hit.conn, pointEmit);
                 }
                 return res;
               };

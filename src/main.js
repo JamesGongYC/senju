@@ -133,11 +133,6 @@ function cursorMove(agentId, point) {
   const scale = t?.rect && point?.windowW ? t.rect.w / point.windowW : 1;
   if (Number.isFinite(point?.chromeTop)) chromeTops.set(agentId, point.chromeTop);
   const verb = point?.verb;
-  // Reading: skim the lines of the page (or app window) it reads; rect is in screen points.
-  if (verb === 'read' && point.rect && Number.isFinite(point.rect.screenX)) {
-    const r = point.rect;
-    return { kind: 'read', ms: Number(point.ms) || 650, rect: { x: r.screenX - area.x, y: r.screenY - area.y, w: r.w, h: r.h } };
-  }
   if (verb === 'open' || verb === 'back') {
     if (!t?.rect) return null;
     // Chrome's address bar sits about 25 px above the page; the back button is at its left end.
@@ -174,8 +169,6 @@ const send = (event) => {
     if (Number.isFinite(pt?.screenX) && Number.isFinite(pt?.x) && pt.windowW) frames.set(event.agentId, { x: pt.screenX - pt.x, y: pt.screenY - pt.y, w: pt.windowW, h: pt.windowH });
     const move = cursorMove(event.agentId, event.point);
     if (!move) return;
-    // A skim ends where it began, so where the cursor rests does not change.
-    if (move.kind === 'read') return win.webContents.send('swarm:event', { type: 'cursor', agentId: event.agentId, ...move });
     const f = Number.isFinite(pt?.screenX) ? frames.get(event.agentId) : null;
     const rect = f ? { x: f.x - area.x, y: f.y - area.y, w: f.w, h: f.h } : lastTargets[event.agentId]?.rect;
     pointing.set(event.agentId, rect ? { dx: move.x - rect.x, dy: move.y - rect.y } : { x: move.x, y: move.y });
@@ -474,7 +467,9 @@ function createWindow() {
     resizable: false, movable: false, minimizable: false, maximizable: false, fullscreenable: false,
     skipTaskbar: true, alwaysOnTop: true, show: false,
     ...(isMac ? { type: 'panel' } : {}),   // panel: takes keys without activating our app
-    webPreferences: { preload: path.join(ROOT, 'src', 'preload.cjs'), contextIsolation: true },
+    // The overlay is never the focused window; without this Chromium may slow its timers and animations,
+    // and the cursors lag behind what the agents do.
+    webPreferences: { preload: path.join(ROOT, 'src', 'preload.cjs'), contextIsolation: true, backgroundThrottling: false },
   });
   win.setAlwaysOnTop(true, 'screen-saver');
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
