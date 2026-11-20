@@ -11,21 +11,39 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'senju-term-test-'));
 const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'senju-term-bin-'));
-// A stand-in for the claude CLI: it writes a file and streams JSON events, as claude --output-format stream-json does.
-fs.writeFileSync(path.join(bin, 'claude'), `#!/bin/sh
-echo "claude args: $*" >&2
-echo built > index.html
-echo '{"type":"system","subtype":"init","model":"fake-model"}'
-echo '{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text"}}}'
-echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Building the "}}}'
-echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"site now."}}}'
-echo '{"type":"stream_event","event":{"type":"content_block_stop"}}'
-echo '{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Write"}}}'
-echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\\"file_path\\": \\"index.html\\", \\"content\\": \\"<h1>"}}}'
-echo '{"type":"stream_event","event":{"type":"content_block_stop"}}'
-echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Building the site now."}]}}'
-echo '{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"lint failed"}]}}'
-echo '{"type":"result","subtype":"success","is_error":false,"duration_ms":65000,"num_turns":3,"total_cost_usd":0.12,"result":"Built index.html."}'
+// A stand-in for the claude CLI: it notes its arguments, writes a file and streams JSON events, as
+// claude --output-format stream-json --include-partial-messages does.
+const events = [
+  { type: 'system', subtype: 'init', model: 'fake-model' },
+  { type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'text' } } },
+  { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Building the ' } } },
+  { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'site now.' } } },
+  { type: 'stream_event', event: { type: 'content_block_stop' } },
+  // A command with a newline in it, split across deltas.
+  { type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'tool_use', id: 'b1', name: 'Bash' } } },
+  { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: JSON.stringify({ command: 'python3 -c "\nimport json"' }).slice(0, -1) } } },
+  { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '}' } } },
+  { type: 'stream_event', event: { type: 'content_block_stop' } },
+  { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'b1', content: 'line one\nline two' }] } },
+  // A file written in pieces, with escapes cut in half between deltas.
+  ...(() => {
+    const json = JSON.stringify({ file_path: 'index.html', content: '<h1>Hi</h1>\n<p class="x">café</p>' }).replace('é', '\\u00e9');
+    const cuts = [json.indexOf('\\n') + 1, json.indexOf('\\u00e9') + 4];
+    return [
+      { type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'tool_use', id: 'w1', name: 'Write' } } },
+      ...[json.slice(0, cuts[0]), json.slice(cuts[0], cuts[1]), json.slice(cuts[1])].map((partial_json) => ({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json } } })),
+      { type: 'stream_event', event: { type: 'content_block_stop' } },
+    ];
+  })(),
+  { type: 'assistant', message: { content: [{ type: 'text', text: 'Building the site now.' }] } },
+  { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'w1', is_error: true, content: 'lint failed' }] } },
+  { type: 'result', subtype: 'success', is_error: false, duration_ms: 65000, num_turns: 3, total_cost_usd: 0.12, result: 'Built index.html.' },
+];
+fs.writeFileSync(path.join(bin, 'claude'), `#!/usr/bin/env node
+const fs = require('fs');
+fs.writeFileSync('args.json', JSON.stringify(process.argv.slice(2)));
+fs.writeFileSync('index.html', 'built');
+for (const e of ${JSON.stringify(events)}) console.log(JSON.stringify(e));
 `);
 fs.chmodSync(path.join(bin, 'claude'), 0o755);
 
@@ -70,12 +88,20 @@ assert.match(r.text, /Exited with code/);
 
 // Claude Code: the prompt arrives intact, edits are accepted, commands only when allowed.
 r = await call('claude_code', { prompt: 'Build "the site" & test it', cwd: 'site' });
-assert.match(r.text, /claude args: -p Build "the site" & test it --output-format stream-json --verbose --include-partial-messages --permission-mode acceptEdits/);
-assert.doesNotMatch(r.text, /allowedTools/);
-// What it does shows as it works, readably, then its final answer; it is printed once, not twice.
+const argsOf = () => JSON.parse(fs.readFileSync(path.join(ws, 'site', 'args.json'), 'utf8'));
+let args = argsOf();
+assert.deepEqual(args.slice(0, 6), ['-p', 'Build "the site" & test it', '--output-format', 'stream-json', '--verbose', '--include-partial-messages']);
+assert.equal(args[args.indexOf('--add-dir') + 1], ws, 'it may read the whole workspace');
+assert.ok(args.includes('acceptEdits'));
+assert.ok(!args.includes('--allowedTools'));
+// The agent reads a short account: what Claude Code said and did, failures, the summary and its answer, once
+// each, without the code it typed or what its commands printed.
 assert.match(r.text, /Claude Code started \(fake-model\)/);
 assert.equal(r.text.match(/Building the site now\./g)?.length, 1);
-assert.match(r.text, /→ Write index\.html/);
+assert.match(r.text, /→ Bash python3 -c " import json"/, 'escapes decoded in the command shown');
+assert.match(r.text, /→ Write index\.html\n {3}\(2 lines, 33 characters\)/);
+assert.doesNotMatch(r.text, /<h1>Hi/, 'no code for the agent');
+assert.doesNotMatch(r.text, /line two/, 'no command output for the agent');
 assert.match(r.text, /✗ lint failed/);
 assert.match(r.text, /Done in 1m 5s · 3 turns · \$0\.12/);
 assert.match(r.text, /Final answer:\nBuilt index\.html\./);
@@ -83,7 +109,19 @@ assert.match(r.text, /Exited with code 0/);
 assert.doesNotMatch(r.text, /"type":/, 'no raw JSON');
 assert.ok(fs.existsSync(path.join(ws, 'site', 'index.html')));
 r = await call('claude_code', { prompt: 'again', cwd: 'site', allow_commands: true, continue_session: true });
-assert.match(r.text, /--allowedTools Bash --continue/);
+args = argsOf();
+assert.ok(args.includes('--allowedTools') && args.includes('Bash') && args.includes('--continue'));
+
+// The window shows the code as it is typed, decoded, and the last lines a command printed.
+{
+  const { execFileSync } = await import('node:child_process');
+  const pf = path.join(ws, 'p.txt');
+  fs.writeFileSync(pf, 'x');
+  const shown = execFileSync(process.execPath, [path.join(here, '../src/claude-stream.js'), pf, '--claude', path.join(bin, 'claude')], { cwd: ws, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  assert.match(shown, /│ <h1>Hi<\/h1>\n {2}│ <p class="x">café<\/p>/, 'the file as it is written');
+  assert.match(shown, /│ line two/, 'what the command printed');
+  assert.match(shown, /└ 2 lines/);
+}
 
 await client.close();
 console.log('terminal test passed');
