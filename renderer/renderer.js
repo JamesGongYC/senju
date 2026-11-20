@@ -170,9 +170,9 @@ function typeBubble(at, text, ms) {
 
 function restSpot(index, count) {
   // Parked in a row just under the prompt bar and its cards.
-  const gap = 120, w = window.innerWidth;
-  const below = $('dock').getBoundingClientRect().bottom + 12;
-  return { x: w / 2 - ((count - 1) * gap) / 2 + index * gap - 30, y: below };
+  const gap = 120, box = $('dock').getBoundingClientRect();
+  const mid = box.left + box.width / 2, below = box.bottom + 12;
+  return { x: mid - ((count - 1) * gap) / 2 + index * gap - 30, y: below };
 }
 
 function laneSpot(index) {
@@ -737,5 +737,63 @@ $('dismiss').addEventListener('click', () => window.swarm.dismiss());
 $('open-app').addEventListener('click', () => window.swarm.openApp());
 $('card-close').addEventListener('click', () => { card.hidden = true; recheckHit(); refreshBar(); });
 window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') window.swarm.dismiss(); });
-window.addEventListener('resize', placeAll);
+window.addEventListener('resize', () => { placeDock(); placeAll(); });
 new ResizeObserver(placeAll).observe($('dock'));
+
+// Drag the bar by its empty parts (the dot on the left, its edges, between the chips) to move it.
+// It stays where you put it, across launches. Double-click those same parts to put it back on top.
+const dock = $('dock'), panel = $('panel');
+const DOCK_KEY = 'senju.dock';
+let dockAt = null;   // { left, top } in px once moved; null = centered at the top
+try { dockAt = JSON.parse(localStorage.getItem(DOCK_KEY)) || null; } catch { dockAt = null; }
+function placeDock() {
+  if (!dockAt) { dock.style.left = dock.style.top = dock.style.transform = ''; return; }
+  // Keep the whole bar on screen, also after the screen gets smaller.
+  const left = Math.max(4, Math.min(window.innerWidth - dock.offsetWidth - 4, dockAt.left));
+  const top = Math.max(4, Math.min(window.innerHeight - panel.offsetHeight - 4, dockAt.top));
+  dock.style.left = `${Math.round(left)}px`;
+  dock.style.top = `${Math.round(top)}px`;
+  dock.style.transform = 'none';
+}
+function saveDock() {
+  try { if (dockAt) localStorage.setItem(DOCK_KEY, JSON.stringify(dockAt)); else localStorage.removeItem(DOCK_KEY); } catch {}
+}
+const grabbable = (t) => !t.closest('input, textarea, select, button, a, .chip');
+panel.addEventListener('mousedown', (ev) => {
+  if (ev.button !== 0 || !grabbable(ev.target)) return;
+  const box = dock.getBoundingClientRect();
+  const dx = ev.clientX - box.left, dy = ev.clientY - box.top;
+  dragging = true;
+  document.body.classList.add('moving-bar');
+  let queued = false;
+  const move = (m) => {
+    dockAt = { left: m.clientX - dx, top: m.clientY - dy };
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => { queued = false; placeDock(); placeAll(); });
+  };
+  const up = () => {
+    dragging = false;
+    document.body.classList.remove('moving-bar');
+    window.removeEventListener('mousemove', move);
+    window.removeEventListener('mouseup', up);
+    if (dockAt) {
+      // Save where it actually ended up (after keeping it on screen).
+      const b = dock.getBoundingClientRect();
+      dockAt = { left: b.left, top: b.top };
+    }
+    saveDock();
+    recheckHit();
+  };
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', up);
+  ev.preventDefault();   // no text selection, and the prompt keeps its focus
+});
+panel.addEventListener('dblclick', (ev) => {
+  if (!grabbable(ev.target)) return;
+  dockAt = null;
+  saveDock();
+  placeDock();
+  placeAll();
+});
+placeDock();
