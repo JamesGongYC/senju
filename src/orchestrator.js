@@ -8,6 +8,7 @@ import { pointBefore, scrollWithCursor, readPage, foundRef, SCROLL_TOOL } from '
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds } from './adskip.js';
+import { VISION_TOOLS, MOVES_VIEW, look, clickAt, canSee } from './vision.js';
 import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS, readWindow } from './deskpoint.js';
 import { READ_ONLY, noteTarget, userActive, collides, inBackground, WAIT_LABEL } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
@@ -187,6 +188,7 @@ Shared workspace folder for files: ${workspace}
 - When your subtask is to find a website, page, profile or link, finish by opening it the way a person would: click the matching search result's link with browser_click (not browser_navigate to the address), check the page that opens is the right one, and leave it open on screen. Do not stop at reading or reporting the address.
 - Clear anything that covers the page yourself, without asking the user: a cookie banner (accept or reject it), a newsletter or sign-up pop-up, an ad overlay or a chat bubble in the way. Click its close, "No thanks" or accept button with browser_click so the person sees the cursor do it, then carry on. Never close a box that asks the user to approve, pay or sign in for your task.
 - The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option, browser_scroll), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate; when checking a page, gather every value you need in one browser_evaluate that returns an object, not one call per check, since each call costs a round trip of a few seconds. But never use a script to click, type, scroll or play for you, and never do many actions in one call.
+- What is drawn rather than built from page elements (a canvas game or board, a map, a chart, a drawing, a video frame) has no refs and no text to read. See it with browser_look and act on it with browser_click_at, giving positions in the picture's pixels: aim at the centre of the thing. browser_click_at shows your cursor at each position, takes several positions in one call (a piece and then where it goes), waits for the page to react, and returns the new picture with rings where your clicks landed. So make one call per move, read the result from the picture it returns, and do not take a separate picture after it. When something answers after a pause (the other side's move, a result loading), raise settle on that call so the picture includes the answer. When small things matter (which piece, a small label, a thin line), look closer first with browser_look and a region; a miss shows as a ring beside the thing or as "nothing changed", so correct your aim from the rings instead of repeating the same position. Use these only where there are no elements: a real button, link or field is clicked with browser_click and its ref, which is exact.
 - Waiting for a page (a reply being written, a build, an upload): wait for what shows it is done, with browser_wait_for and text (words that appear when it is ready) or textGone (a "Stop", "Loading" or "Generating" label that goes away), not a fixed time. A fixed wait only for a few seconds at a time, when nothing on the page tells you.
 - The swarm shares a board. Use board_post to share a finding or partial result another agent could use now, without waiting until you finish. Posts by others reach you automatically on your next step, marked "New on the shared board"; use them if relevant and ignore them otherwise. board_read shows the whole board.
 - Before each tool call, say in at most eight words what you are doing, as a short plain sentence ("Opening the Claude app."). When the user has written to you, answer them first in full, natural sentences instead.
@@ -1068,8 +1070,10 @@ export class Swarm {
         own.push(o.conn);
         if (o.conn.pid) agent.pids.push(o.conn.pid);
       }
-      // Browser windows also get browser_scroll, which the ghost cursor plays (src/point.js).
-      const { tools, lookup } = buildToolset(conns, (c) => (this.config.servers[c.name]?.tile === 'playwright' && c.tools.some((t) => t.name === 'browser_evaluate') ? [SCROLL_TOOL] : []));
+      // Browser windows also get browser_scroll, which the ghost cursor plays (src/point.js), and the tools to see
+      // the page as a picture and click by position in it (src/vision.js).
+      const { tools, lookup } = buildToolset(conns, (c) => (this.config.servers[c.name]?.tile === 'playwright' && c.tools.some((t) => t.name === 'browser_evaluate')
+        ? [SCROLL_TOOL, ...(this.config.vision !== false && canSee(c) ? VISION_TOOLS : [])] : []));
       const others = this.agents.filter((a) => a.id !== agent.id && a.live);
       const skillNotes = (this.skills ? await Promise.all(agent.skills.map((n) => this.skills.read(n))) : []).filter(Boolean).map((k) => `## ${k.name}\n${k.body}`).join('\n\n');
       const desktop = agent.servers.some((sv) => this.config.servers[sv]?.kind === 'desktop');
@@ -1298,8 +1302,14 @@ export class Swarm {
                 if (hit.own && hit.tool === 'browser_scroll') {
                   const emit = this.config.pointing === false ? () => {} : (point) => this.emit({ type: 'point', agentId: agent.id, point });
                   const { moved, ...res } = await scrollWithCursor(hit.conn, call.input, emit, signal);
+                  hit.conn.viewStale = true;
                   return res;
                 }
+                // Seeing the page as a picture, and clicking by position in it with the cursor (src/vision.js).
+                if (hit.own && hit.tool === 'browser_look') return look(hit.conn, call.input, signal);
+                if (hit.own && hit.tool === 'browser_click_at') return clickAt(hit.conn, call.input, this.config.pointing === false ? null : pointEmit, signal);
+                // The page is about to move on: positions from the last picture will not hold.
+                if (spec.tile === 'playwright' && MOVES_VIEW.test(hit.tool)) hit.conn.viewStale = true;
                 // A browser window of its own: send the ghost cursor to where this action lands first.
                 if (spec.tile === 'playwright' && this.config.pointing !== false) await pointBefore(hit.conn, hit.tool, call.input, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
                 const deskEmit = (point) => this.emit({ type: 'point', agentId: agent.id, point });
@@ -1315,7 +1325,9 @@ export class Swarm {
                   if (shown?.windowId) this.noteTarget(agent, { pid: firstPid, window_id: shown.windowId });
                 }
                 if (spec.kind === 'desktop' && this.config.pointing !== false) await pointDesk(agent, hit.tool, call.input, deskEmit);
-                const input = spec.kind === 'desktop' ? widenWindowState(hit.tool, call.input) : call.input;
+                // A screenshot with no format asked for goes up as a JPEG: the same picture, a fraction of the bytes.
+                const jpeg = spec.tile === 'playwright' && hit.tool === 'browser_take_screenshot' && !call.input?.type && !call.input?.filename;
+                const input = spec.kind === 'desktop' ? widenWindowState(hit.tool, call.input) : jpeg ? { ...call.input, type: 'jpeg' } : call.input;
                 // The terminal types into its own windows: the cursor follows it there (on this Mac only).
                 const onPoint = hit.conn.name === 'terminal' && !this.team && this.config.pointing !== false ? pointEmit : null;
                 let res = await callTool(hit.conn, hit.tool, input, signal, onPoint);
