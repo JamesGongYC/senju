@@ -119,7 +119,8 @@ const TERMINAL_RULES = (AUTO) => `
 You have a terminal: run_command runs a shell command in a Terminal window of its own and returns its exact output and exit code; claude_code gives a coding task to Claude Code in a project folder.
 - Check the exit code and read the output before you go on. A non-zero code means it failed: read why, fix it, and try again, or report it.
 - A long-running command (a dev server, a watcher) keeps running when run_command returns. Note its command id, read it with read_output, and stop it with stop_command when you are done with it.
-- claude_code: write the task the way you would brief a developer (what to build, where the spec is, how to check it). Set allow_commands only when it needs to run things (installs, tests, builds). For follow-ups in the same folder, set continue_session. Read the files it says it wrote before you report them done.
+- claude_code: write the task the way you would brief a developer (what to build, where the spec is, how to check it). Set allow_commands only when it needs to run things (installs, tests, builds). For follow-ups in the same folder, set continue_session: it is typed into the same Claude Code window. Read the files it says it wrote before you report them done.
+- Claude Code runs in its own interface in a Terminal window: Senju opens it and types your task into its prompt box, and the user can watch and step in. Never open Claude Code or type into it with the desktop tools; use claude_code, then read_output, send_input (to answer a permission question it asks) and stop_command (to interrupt it).
 - Ask the user (ask_user) before a command that publishes or deploys, pushes to a remote, deletes or overwrites anything outside the workspace, installs software system-wide${AUTO}, changes system settings, signs in, or spends money, and say exactly what it will run. Read-only and workspace-local commands need no question.
 - Never put passwords, tokens or keys in a command line. If one is needed, hand off to the user.
 `;
@@ -1309,7 +1310,9 @@ export class Swarm {
                 }
                 if (spec.kind === 'desktop' && this.config.pointing !== false) await pointDesk(agent, hit.tool, call.input, deskEmit);
                 const input = spec.kind === 'desktop' ? widenWindowState(hit.tool, call.input) : call.input;
-                let res = await callTool(hit.conn, hit.tool, input, signal);
+                // The terminal types into its own windows: the cursor follows it there (on this Mac only).
+                const onPoint = hit.conn.name === 'terminal' && !this.team && this.config.pointing !== false ? pointEmit : null;
+                let res = await callTool(hit.conn, hit.tool, input, signal, onPoint);
                 if (ownInput) this.lastDesktopAction = Date.now();
                 // On YouTube: from now on, skip each video ad with the cursor as soon as its Skip button shows.
                 if (spec.tile === 'playwright' && !res.isError && !hit.conn.adWatch && this.config.skipAds !== false && onYouTube(res, call.input)) {

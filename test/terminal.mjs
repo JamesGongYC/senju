@@ -180,4 +180,26 @@ const pidIn = async (dir) => { const f = path.join(dir, 'claude.pid'); for (let 
 }
 
 await client.close();
+
+// Claude Code in its own window: what is typed into its prompt box, and the agent's account from its transcript.
+{
+  const { promptKeys, typedChars, account, writeHooks } = await import('../src/claude-window.js');
+  const short = promptKeys('Build the site\tnow\x07\r\nthen test it');
+  assert.equal(short.length, 1);
+  assert.equal(short[0][1], 'Build the site  now\nthen test it ', 'tabs and control keys go, line breaks stay');
+  assert.ok(short[0][0] >= 3 && short[0][0] <= 28);
+  assert.equal(promptKeys('/clear everything')[0][1].slice(0, 2), ' /', 'a leading slash is not a command');
+  const long = promptKeys('x'.repeat(5000));
+  assert.equal(typedChars(long), 300, 'a long task is typed in part and the rest pasted');
+  assert.ok(long[1][1].startsWith('\x1b[200~') && long[1][1].endsWith('\x1b[201~'));
+  const lines = account([
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Writing it.' }, { type: 'tool_use', id: 't1', name: 'Write', input: { file_path: '/p/site/index.html', content: '<h1>' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', is_error: true, content: 'disk full' }] } },
+  ], '/p/site');
+  assert.deepEqual(lines, ['Writing it.', '→ Write index.html', '   ✗ Write: disk full'], 'paths are shown inside the project, no code');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'senju-hooks-'));
+  const hooks = JSON.parse(fs.readFileSync(writeHooks(dir), 'utf8')).hooks;
+  assert.deepEqual(Object.keys(hooks).sort(), ['Notification', 'SessionEnd', 'SessionStart', 'Stop', 'UserPromptSubmit']);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
 console.log('terminal test passed');

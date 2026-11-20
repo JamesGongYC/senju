@@ -17,12 +17,14 @@ import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ClaudeWindow, writeFeeder } from './claude-window.js';
 
 const WORKSPACE = path.resolve(process.argv[2] || path.join(os.homedir(), 'Senju'));
 const HIDDEN = process.env.SENJU_TERMINAL === 'hidden' || process.platform !== 'darwin';
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'senju-term-'));
 const OUTPUT_LIMIT = 12_000;   // characters of output handed back per call; the full log stays on disk
 
+const FEEDER = HIDDEN ? null : writeFeeder(ROOT);
 const runs = new Map();   // id -> { id, dir, command, cwd, windowId, child, started, readFrom }
 let seq = 0;
 
@@ -108,6 +110,14 @@ function closeFinished(kind) {
 }
 
 function status(run) {
+  if (run.cc) {
+    // A Claude Code window: its task is over when it finishes (or is interrupted), or Claude Code quits.
+    run.cc.poll();
+    const code = run.cc.exitCode();
+    if (code !== null) return code;
+    if (run.cc.turn?.stopped) return 130;
+    return run.cc.turn?.done ? 0 : null;
+  }
   const file = path.join(run.dir, 'exit');
   if (!fs.existsSync(file)) return null;
   const code = Number(fs.readFileSync(file, 'utf8').trim());
@@ -119,7 +129,8 @@ function status(run) {
 // no one waiting for it (a Claude Code run kept building, and spending, after its job was stopped).
 async function wait(run, seconds, signal) {
   const until = Date.now() + Math.max(0, seconds) * 1000;
-  while (status(run) === null && Date.now() < until && !signal?.aborted) await sleep(250);
+  // A Claude Code window asking for permission is waiting on someone: hand it to the agent now.
+  while (status(run) === null && Date.now() < until && !signal?.aborted && !run.cc?.turn?.notice) await sleep(250);
   if (signal?.aborted && status(run) === null) { kill(run); return null; }
   if (status(run) !== null) await sleep(100);   // let the last of the output reach the log
   return status(run);
@@ -139,10 +150,26 @@ function newOutput(run) {
 function report(run, code) {
   const secs = Math.round((Date.now() - run.started) / 1000);
   const out = newOutput(run).trimEnd();
+  if (run.cc) return liveReport(run, code, secs, out);
   const head = code === null
     ? `Still running after ${secs}s (command id ${run.id}). Call read_output to wait for more, send_input to answer a prompt, or stop_command to stop it.`
     : `Exited with code ${code} after ${secs}s (command id ${run.id}).`;
   return [head, run.note, run.windowId ? `It runs in its own Terminal window (window id ${run.windowId}), where the user can watch.` : null, out ? `Output:\n${out}` : 'No output.'].filter(Boolean).join('\n');
+}
+
+function liveReport(run, code, secs, out) {
+  const cc = run.cc;
+  const notice = cc.turn?.notice;
+  if (notice) cc.turn.noticeShown = notice;
+  if (notice) cc.turn.notice = null;   // told once; read_output waits again after this
+  const head = code === null
+    ? notice
+      ? `Claude Code is waiting for an answer in its window (command id ${run.id}): "${notice}". Answer with send_input: "1" for Yes, "3" for No (or ask the user to choose in the window). Then read_output.`
+      : `Claude Code is still working after ${secs}s (command id ${run.id}). Call read_output to wait for more, or stop_command to interrupt it.`
+    : code === 130 ? `Claude Code was interrupted after ${secs}s (command id ${run.id}). It is still open: claude_code with continue_session gives it a new instruction.`
+      : code === 0 && cc.alive ? `Claude Code finished the task in ${secs}s (command id ${run.id}). Its window stays open; claude_code with continue_session types a follow-up into it.`
+        : `Claude Code quit with code ${code} after ${secs}s (command id ${run.id}).`;
+  return [head, run.note, `It runs in its own Terminal window (window id ${cc.windowId}), where the user can watch and step in.`, out ? `What it did:\n${out}` : 'Nothing to report from it yet.'].filter(Boolean).join('\n');
 }
 
 function find(id) {
@@ -153,6 +180,7 @@ function find(id) {
 
 // Kill the command and everything it started.
 function kill(run) {
+  if (run.cc) { run.cc.interrupt().finally(() => run.cc.quit()); return; }
   let pid = null;
   try { pid = Number(fs.readFileSync(path.join(run.dir, 'pid'), 'utf8').trim()) || null; } catch { /* not started yet */ }
   if (run.child) { try { process.kill(-run.child.pid, 'SIGTERM'); } catch { /* gone */ } return; }
@@ -198,7 +226,7 @@ const TOOLS = [
   },
   {
     name: 'claude_code',
-    description: 'Give a coding task to Claude Code (the claude CLI) in a project folder and get back its final answer. It reads and edits files there itself. Runs in its own Terminal window. By default it may edit files but not run shell commands; set allow_commands to let it run them (installs, tests, builds). Set continue_session to follow up on the last Claude Code conversation in that folder. Takes minutes: it waits up to timeout_seconds (default 900); if still running, keep waiting with read_output.',
+    description: 'Give a coding task to Claude Code (the claude CLI) in a project folder and get back what it did and its final answer. It reads and edits files there itself. It opens Claude Code in a Terminal window of its own and types the task into its prompt box, where the user can watch; the window stays open afterwards. If it asks a permission question, the result says so: answer with send_input. By default it may edit files but not run shell commands; set allow_commands to let it run them (installs, tests, builds). Set continue_session to follow up in the same conversation (typed into the same window when it is still open). Takes minutes: it waits up to timeout_seconds (default 900); if still running, keep waiting with read_output.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -232,7 +260,51 @@ const TOOLS = [
 const text = (t, isError = false) => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) });
 const clampSecs = (v, dflt) => Math.min(1800, Math.max(1, Number(v) || dflt));
 
-async function call(name, args = {}, signal = null) {
+// Is the person at the keyboard right now (typed or clicked in the last two seconds)? Then a new window does not
+// come to the front: that would take their keystrokes.
+function userIdleSeconds() {
+  return new Promise((resolve) => execFile('/usr/sbin/ioreg', ['-c', 'IOHIDSystem', '-d', '4'], { timeout: 3000 }, (err, out) => {
+    const m = !err && String(out).match(/"HIDIdleTime"\s*=\s*(\d+)/);
+    resolve(m ? Number(m[1]) / 1e9 : 99);
+  }));
+}
+
+// Claude Code in its own interface: a Terminal window where Senju types `claude`, then the task into its prompt
+// box, with the agent's cursor there. A follow-up (continue_session) is typed into the same window when it is
+// still open in that folder. Returns [text, isError].
+async function claudeWindow(args, prompt, cwd, signal, emit) {
+  const open = [...runs.values()].filter((r) => r.cc?.alive);
+  let run = args.continue_session ? open.find((r) => r.cwd === cwd && r.cc.idle) : null;
+  // A finished Claude Code window closes when a new one opens, so they do not pile up. One still working stays.
+  for (const r of open) if (r !== run && r.cc.idle) r.cc.close();
+  if (run) {
+    run.cc.emit = emit;
+    run.started = Date.now();
+    run.readFrom = fs.readFileSync(run.cc.summaryFile, 'utf8').length;
+  } else {
+    const id = String(++seq);
+    const dir = path.join(ROOT, id);
+    fs.mkdirSync(dir);
+    const cc = new ClaudeWindow({ dir, cwd, feeder: FEEDER, osascript, emit, claudeBin: process.env.SENJU_CLAUDE });
+    run = { id, dir, command: 'claude', cwd, title: 'Claude Code', cc, started: Date.now(), readFrom: 0, logFile: cc.summaryFile, kind: 'claude-window' };
+    runs.set(id, run);
+    // It may read and edit the whole workspace (the spec and data other agents wrote), and edit files without
+    // asking. Shell commands only when allowed; otherwise they are refused instead of waiting on a question.
+    const flags = [`--permission-mode acceptEdits --add-dir ${q(WORKSPACE)}`, args.allow_commands ? '--allowedTools Bash' : '--disallowedTools Bash'].join(' ');
+    try { await cc.open(flags, (await userIdleSeconds()) >= 2); } catch (err) { runs.delete(id); return [`Could not open a Terminal window for Claude Code: ${err.message}`, true]; }
+    const extra = `${args.continue_session ? ' --continue' : ''}${args.model ? ` --model ${String(args.model).replace(/[^\w.:-]/g, '')}` : ''}`;
+    const problem = await cc.startClaude(extra);
+    if (problem === 'missing') return [`Claude Code is not installed on this computer (the claude command is missing). Ask the user to install it: npm install -g @anthropic-ai/claude-code`, true];
+    if (problem) return [`${problem}\n\nThe window is open (window id ${cc.windowId}); ask the user to finish this in it, then try again.`, true];
+  }
+  try {
+    if (!(await run.cc.submit(prompt))) return [`The task was typed into Claude Code (window id ${run.cc.windowId}) but it did not start working on it. Look at the window, or ask the user.`, true];
+  } catch (err) { return [String(err.message ?? err), true]; }
+  const code = await wait(run, clampSecs(args.timeout_seconds, 900), signal);
+  return [report(run, code), code !== null && code !== 0];
+}
+
+async function call(name, args = {}, signal = null, emit = () => {}) {
   if (name === 'run_command') {
     const command = String(args.command ?? '').trim();
     if (!command) return text('Give a command.', true);
@@ -244,6 +316,7 @@ async function call(name, args = {}, signal = null) {
     if (!prompt) return text('Give Claude Code a task.', true);
     const cwd = path.resolve(WORKSPACE, String(args.cwd ?? '.').replace(/^~(?=$|\/)/, os.homedir()));
     fs.mkdirSync(cwd, { recursive: true });
+    if (!HIDDEN) return text(...await claudeWindow(args, prompt, cwd, signal, emit));
     const dir = fs.mkdtempSync(path.join(ROOT, 'claude-'));
     const shown = `claude "${prompt.replace(/\s+/g, ' ').slice(0, 90)}${prompt.length > 90 ? '…' : ''}"${args.allow_commands ? ' (may run commands)' : ''}`;
     const run = await start(claudeCommand(dir, { ...args, prompt }), cwd, 'Claude Code · Senju', shown, 'claude');
@@ -260,7 +333,8 @@ async function call(name, args = {}, signal = null) {
   if (name === 'send_input') {
     const run = find(args.id);
     if (status(run) !== null) return text(`Command ${run.id} has already ended.`, true);
-    if (run.child) run.child.stdin.write(`${args.text ?? ''}\n`);
+    if (run.cc) { run.cc.emit = emit; await run.cc.typeAt([[25, String(args.text ?? '')], [0, '\r']]); }
+    else if (run.child) run.child.stdin.write(`${args.text ?? ''}\n`);
     else if (run.windowId) await osascript(`tell application "Terminal" to do script ${asString(String(args.text ?? ''))} in selected tab of window id ${run.windowId}`);
     else return text('That command has no input to type into.', true);
     await sleep(500);
@@ -268,6 +342,7 @@ async function call(name, args = {}, signal = null) {
   }
   if (name === 'stop_command') {
     const run = find(args.id);
+    if (run.cc) { await run.cc.interrupt(); return text(report(run, status(run))); }
     if (status(run) === null) kill(run);
     return text(report(run, await wait(run, 5)));
   }
@@ -277,12 +352,21 @@ async function call(name, args = {}, signal = null) {
 const server = new Server({ name: 'senju-terminal', version: '1.0.0' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
-  try { return await call(req.params.name, req.params.arguments ?? {}, extra?.signal); } catch (err) { return text(String(err?.message ?? err), true); }
+  // Where the agent's cursor should be (the window line being typed into) goes back to the app as progress.
+  const token = req.params._meta?.progressToken;
+  let n = 0;
+  const emit = token == null || !extra?.sendNotification ? () => {} : (point) => {
+    extra.sendNotification({ method: 'notifications/progress', params: { progressToken: token, progress: ++n, message: JSON.stringify({ point }) } }).catch(() => {});
+  };
+  try { return await call(req.params.name, req.params.arguments ?? {}, extra?.signal, emit); } catch (err) { return text(String(err?.message ?? err), true); }
 });
 
 // Leave nothing behind: stop commands still running in the background and remove the logs.
 function cleanup() {
-  for (const run of runs.values()) if (run.child && status(run) === null) kill(run);
+  for (const run of runs.values()) {
+    if (run.cc) { if (run.cc.turn && !run.cc.turn.done) run.cc.quit(); else try { fs.writeFileSync(path.join(run.cc.keysDir, 'quit'), ''); } catch { /* gone */ } }
+    else if (run.child && status(run) === null) kill(run);
+  }
   try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 process.on('exit', cleanup);
