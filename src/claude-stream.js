@@ -29,7 +29,19 @@ const short = (s, n = 140) => { const t = String(s ?? '').replace(/\s+/g, ' ').t
 // Two outputs: the window (everything) and the agent's summary (no code, no command output).
 const summary = summaryFile ? fs.createWriteStream(summaryFile, { flags: 'a' }) : null;
 let midLine = false;   // the window has a line in progress
-const show = (s) => { if (!s) return; process.stdout.write(s); midLine = !s.endsWith('\n'); };
+const show = (s) => { if (!s) return; clearTicker(); quietSince = Date.now(); process.stdout.write(s); midLine = !s.endsWith('\n'); };
+
+// While nothing new shows (Claude thinking over a big codebase, or a request on its way), a single line in the
+// window says so and counts the seconds, rewritten in place, so a long think never looks like a hang. Window only.
+let quietSince = Date.now(), tickerShown = false, thinking = false, frame = 0;
+function clearTicker() { if (tickerShown) { process.stdout.write('\r\x1b[2K'); tickerShown = false; } }
+if (color) setInterval(() => {
+  const secs = Math.round((Date.now() - quietSince) / 1000);
+  if (secs < 3 || midLine) return;
+  const spin = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[frame++ % 10];
+  process.stdout.write(`\r\x1b[2K${dim(`  ${spin} ${thinking ? 'Claude is thinking' : 'Waiting for Claude'}… ${secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`}`)}`);
+  tickerShown = true;
+}, 250).unref();
 const note = (s) => summary?.write(s.replace(/\x1b\[[0-9;]*m/g, ''));
 const both = (s) => { show(s); note(s); };
 const endLine = () => { if (midLine) { process.stdout.write('\n'); midLine = false; } };
@@ -110,7 +122,8 @@ function onStreamEvent(ev) {
     if (cb.type === 'tool_use') { endLine(); block = { kind: 'tool', id: cb.id, name: cb.name, json: '', named: false, code: new CodeStream(), coding: false }; tools.set(cb.id, cb.name); }
     else if (cb.type === 'text') { endLine(); if (lastTool) show('\n'); block = { kind: 'text', text: '' }; }
     else block = { kind: cb.type };
-    lastTool = cb.type === 'tool_use';
+    thinking = /thinking/.test(cb.type ?? '');   // its text is not shown to users, so the ticker stands in for it
+    if (!thinking) lastTool = cb.type === 'tool_use';
   } else if (ev.type === 'content_block_delta') {
     const d = ev.delta ?? {};
     if (d.type === 'text_delta' && d.text) { both(d.text); if (block?.kind === 'text') block.text += d.text; }
@@ -125,6 +138,7 @@ function onStreamEvent(ev) {
       if (text) codeOut(block, text);
     }
   } else if (ev.type === 'content_block_stop') {
+    thinking = false;
     if (block?.kind === 'text') { endLine(); note('\n'); if (block.text.trim()) lastText = block.text.trim(); }
     else if (block?.kind === 'tool') {
       endLine();
@@ -179,7 +193,7 @@ function onLine(line) {
 }
 
 const child = spawn(bin, ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', ...argv], { stdio: ['ignore', 'pipe', 'inherit'] });
-const finish = (code) => { if (summary) summary.end(() => process.exit(code)); else process.exit(code); };
+const finish = (code) => { clearTicker(); if (summary) summary.end(() => process.exit(code)); else process.exit(code); };
 let failed = false;
 child.on('error', (err) => {
   failed = true;

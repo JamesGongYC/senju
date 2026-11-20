@@ -42,6 +42,18 @@ const events = [
 fs.writeFileSync(path.join(bin, 'claude'), `#!/usr/bin/env node
 const fs = require('fs');
 fs.writeFileSync('args.json', JSON.stringify(process.argv.slice(2)));
+if (process.argv.includes('think')) {
+  const say = (e) => console.log(JSON.stringify(e));
+  say({ type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'thinking' } } });
+  setTimeout(() => {
+    say({ type: 'stream_event', event: { type: 'content_block_stop' } });
+    say({ type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'text' } } });
+    say({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Thought it through.' } } });
+    say({ type: 'stream_event', event: { type: 'content_block_stop' } });
+    say({ type: 'result', is_error: false, duration_ms: 4000, num_turns: 1, result: 'Thought it through.' });
+  }, 4200);
+  return;
+}
 if (process.argv.includes('slow')) { fs.writeFileSync('claude.pid', String(process.pid)); console.log(JSON.stringify({ type: 'system', subtype: 'init', model: 'fake-model' })); setInterval(() => {}, 1000); return; }
 fs.writeFileSync('index.html', 'built');
 for (const e of ${JSON.stringify(events)}) console.log(JSON.stringify(e));
@@ -122,6 +134,19 @@ assert.ok(args.includes('--allowedTools') && args.includes('Bash') && args.inclu
   assert.match(shown, /│ <h1>Hi<\/h1>\n {2}│ <p class="x">café<\/p>/, 'the file as it is written');
   assert.match(shown, /│ line two/, 'what the command printed');
   assert.match(shown, /└ 2 lines/);
+}
+
+// A long think shows as a live "thinking" line in the window (never in the agent's summary), which goes away
+// when Claude starts writing.
+{
+  const { execFileSync } = await import('node:child_process');
+  const pf = path.join(ws, 'think.txt');
+  const sf = path.join(ws, 'think-summary.log');
+  fs.writeFileSync(pf, 'think');
+  const shown = execFileSync(process.execPath, [path.join(here, '../src/claude-stream.js'), pf, '--claude', path.join(bin, 'claude'), '--summary', sf], { cwd: ws, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, SENJU_COLOR: '1' } });
+  assert.match(shown, /Claude is thinking… 3s/);
+  assert.match(shown, /\r\x1b\[2K[^\r]*Thought it through\./, 'the line is cleared before Claude writes');
+  assert.doesNotMatch(fs.readFileSync(sf, 'utf8'), /thinking…/);
 }
 
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
