@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectServer, callTool, buildToolset } from '../src/mcp.js';
 import { look, clickAt, canSee, MAX_EDGE, VISION_TOOLS } from '../src/vision.js';
-import { evalResult } from '../src/point.js';
+import { evalResult, SCROLL_TOOL } from '../src/point.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // A canvas that records every click and drag in page coordinates, and repaints a moment after each click.
@@ -117,6 +117,12 @@ assert.equal((await clickAt(conn, { points: [{ x: 300, y: 100 }] }, emit)).isErr
 // Browser workers are offered both tools next to the server's own.
 const { tools } = buildToolset([conn], (c) => (canSee(c) ? VISION_TOOLS : []));
 assert.ok(tools.some((t) => t.name === 'browser__browser_look') && tools.some((t) => t.name === 'browser__browser_click_at'));
+// Every tool is in the shape the API requires; one that is not fails every request of the worker that has it.
+const shape = (list) => { for (const t of list) { assert.deepEqual(Object.keys(t).sort(), ['description', 'input_schema', 'name'], `tool ${t.name}`); assert.equal(t.input_schema.type, 'object', `tool ${t.name}`); assert.ok(typeof t.description === 'string' && t.description.length > 0 && /^[a-zA-Z0-9_-]{1,64}$/.test(t.name), `tool ${t.name}`); } };
+shape(tools);
+shape(buildToolset([conn], () => [SCROLL_TOOL, ...VISION_TOOLS]).tools);
+// A tool of the app's own written with MCP's inputSchema is put right, not passed on broken.
+shape(buildToolset([conn], () => [{ name: 'x_tool', description: 'x', inputSchema: { type: 'object', properties: {} } }]).tools);
 
 // A page that keeps moving by itself (an animation): no waiting for it to come to rest.
 await value('() => { hits.length = 0; const d = document.createElement("div"); d.style.cssText = "position:fixed;right:0;top:0;width:60px;height:60px;background:red"; document.body.append(d); setInterval(() => { d.style.background = "#" + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0"); }, 30); return true; }');

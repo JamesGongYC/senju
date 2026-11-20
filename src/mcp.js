@@ -80,7 +80,10 @@ export function buildToolset(connections, extra = null) {
       if (conn.tools.some((x) => x.name === t.name)) continue;   // the server has its own; use that
       const name = toolName(conn.name, t.name);
       lookup.set(name, { conn, tool: t.name, own: true });
-      tools.push({ ...t, name, description: `[${conn.name}] ${t.description}` });
+      // Exactly what the API takes: name, description, input_schema (a tool written with MCP's inputSchema is
+      // put right here, since one bad definition fails every request that carries it).
+      const { inputSchema, input_schema = inputSchema, ...rest } = t;
+      tools.push({ ...rest, name, description: `[${conn.name}] ${t.description}`, input_schema: input_schema?.type === 'object' ? input_schema : { type: 'object', properties: {} } });
     }
     for (const t of conn.tools) {
       if (HIDDEN_TOOLS.has(t.name)) continue;
