@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { ClaudeWindow, writeFeeder } from './claude-window.js';
+import { ClaudeWindow, writeFeeder, closeIdleWindow } from './claude-window.js';
 
 const WORKSPACE = path.resolve(process.argv[2] || path.join(os.homedir(), 'Senju'));
 const HIDDEN = process.env.SENJU_TERMINAL === 'hidden' || process.platform !== 'darwin';
@@ -60,7 +60,7 @@ async function start(command, cwd, title, display = command, kind = 'command') {
   fs.writeFileSync(path.join(dir, 'out.log'), '');
   const run = { id, dir, command, cwd, title, windowId: null, child: null, started: Date.now(), readFrom: 0, logFile: null, kind };
   runs.set(id, run);
-  const log = path.join(dir, 'out.log'), exit = path.join(dir, 'exit'), pid = path.join(dir, 'pid');
+  const log = path.join(dir, 'out.log'), exit = path.join(dir, 'exit'), pid = path.join(dir, 'pid'), claim = path.join(dir, 'claimed');
 
   let shown = false;
   if (!HIDDEN) {
@@ -69,7 +69,9 @@ async function start(command, cwd, title, display = command, kind = 'command') {
     // and the exit code is written down afterwards: PIPESTATUS for bash, pipestatus for zsh.
     fs.writeFileSync(path.join(dir, 'banner'), `\x1b[2m── ${title ?? 'Senju'} · ${cwd}\x1b[0m\n\x1b[1m$ ${display}\x1b[0m\n`);
     closeFinished(kind);
-    const line = ` clear; cat ${q(path.join(dir, 'banner'))}; ( sh -c 'echo $PPID' > ${q(pid)}; cd ${q(cwd)} && source ${q(path.join(dir, 'cmd.sh'))} ) 2>&1 | tee ${q(log)}; echo "\${PIPESTATUS[0]}\${pipestatus[1]}" > ${q(exit)}`;
+    // mkdir claims the run: if the window only gets the line after its open timed out and the command already
+    // ran hidden, it does nothing instead of running it a second time.
+    const line = ` clear; mkdir ${q(claim)} 2>/dev/null && { cat ${q(path.join(dir, 'banner'))}; ( sh -c 'echo $PPID' > ${q(pid)}; cd ${q(cwd)} && source ${q(path.join(dir, 'cmd.sh'))} ) 2>&1 | tee ${q(log)}; echo "\${PIPESTATUS[0]}\${pipestatus[1]}" > ${q(exit)}; }`;
     try {
       const wid = await osascript(`tell application "Terminal"
   set t to do script ${asString(line)}
@@ -85,6 +87,8 @@ end tell`);
     }
   }
   if (!shown) {
+    // The window may have started it after all (Terminal was slow to answer): then leave it to the window.
+    try { fs.mkdirSync(claim); } catch { run.note = 'Terminal was slow to answer; it runs in its window after all.'; return run; }
     const child = spawn('/bin/zsh', ['-lc', `cd ${q(cwd)} && source ${q(path.join(dir, 'cmd.sh'))}`], { stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     run.child = child;
     fs.writeFileSync(pid, String(child.pid));
@@ -105,7 +109,7 @@ function closeFinished(kind) {
     if (run.kind !== kind || !run.windowId || run.closed || status(run) === null) continue;
     try { if (Date.now() - fs.statSync(path.join(run.dir, 'exit')).mtimeMs < 1000) continue; } catch { continue; }
     run.closed = true;
-    osascript(`tell application "Terminal" to close (every window whose id is ${run.windowId})`).catch(() => {});
+    closeIdleWindow(osascript, run.windowId).catch(() => {});
   }
 }
 
@@ -195,7 +199,8 @@ function kill(run) {
 const STREAM = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-stream.js');
 // It may read and edit the whole workspace (--add-dir), not only the project folder: the spec and data other
 // agents wrote are usually there.
-function claudeCommand(dir, { prompt, allow_commands, continue_session, model }) {
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+function claudeCommand(dir, { prompt, allow_commands, continue_session, model, effort }) {
   const file = path.join(dir, 'prompt.txt');
   fs.writeFileSync(file, String(prompt));
   return [
@@ -207,6 +212,7 @@ function claudeCommand(dir, { prompt, allow_commands, continue_session, model })
     allow_commands ? '--allowedTools Bash' : null,
     continue_session ? '--continue' : null,
     model ? `--model ${q(model)}` : null,
+    EFFORTS.includes(effort) ? `--effort ${effort}` : null,
   ].filter(Boolean).join(' ');
 }
 
@@ -235,6 +241,7 @@ const TOOLS = [
         allow_commands: { type: 'boolean', description: 'Let Claude Code run shell commands (npm install, tests). Default false' },
         continue_session: { type: 'boolean', description: 'Continue the most recent Claude Code conversation in this folder' },
         model: { type: 'string', description: 'Optional Claude model for Claude Code to use' },
+        effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: 'How hard Claude Code thinks (its --effort). Lower is faster. Set it when the user names one; otherwise leave it out for Claude Code\'s own default' },
         timeout_seconds: { type: 'number', description: 'How long to wait before returning (default 900, at most 1800)' },
       },
       required: ['prompt', 'cwd'],
@@ -292,7 +299,7 @@ async function claudeWindow(args, prompt, cwd, signal, emit) {
     // asking. Shell commands only when allowed; otherwise they are refused instead of waiting on a question.
     const flags = [`--permission-mode acceptEdits --add-dir ${q(WORKSPACE)}`, args.allow_commands ? '--allowedTools Bash' : '--disallowedTools Bash'].join(' ');
     try { await cc.open(flags, (await userIdleSeconds()) >= 2); } catch (err) { runs.delete(id); return [`Could not open a Terminal window for Claude Code: ${err.message}`, true]; }
-    const extra = `${args.continue_session ? ' --continue' : ''}${args.model ? ` --model ${String(args.model).replace(/[^\w.:-]/g, '')}` : ''}`;
+    const extra = `${args.continue_session ? ' --continue' : ''}${args.model ? ` --model ${String(args.model).replace(/[^\w.:-]/g, '')}` : ''}${EFFORTS.includes(args.effort) ? ` --effort ${args.effort}` : ''}`;
     const problem = await cc.startClaude(extra);
     if (problem === 'missing') return [`Claude Code is not installed on this computer (the claude command is missing). Ask the user to install it: npm install -g @anthropic-ai/claude-code`, true];
     if (problem) return [`${problem}\n\nThe window is open (window id ${cc.windowId}); ask the user to finish this in it, then try again.`, true];
