@@ -187,6 +187,17 @@ child.on('error', (err) => {
   finish(err.code === 'ENOENT' ? 127 : 1);
 });
 readline.createInterface({ input: child.stdout }).on('line', onLine);
+// Stopped (the job was stopped, stop_command, Ctrl-C, or its window was closed): stop claude too, which is this
+// process's child and would otherwise carry on by itself.
+let stopping = false;
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => {
+  if (stopping) return;
+  stopping = true;
+  try { child.kill('SIGTERM'); } catch { /* already gone */ }
+  endLine();
+  show(red('\n── Stopped.\n')); note('\n── Stopped.\n');
+  setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } finish(143); }, 1500).unref();
+});
 child.on('close', (code) => {
   if (failed) return;   // the error handler reports a failed start
   endLine();

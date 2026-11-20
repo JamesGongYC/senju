@@ -42,6 +42,7 @@ const events = [
 fs.writeFileSync(path.join(bin, 'claude'), `#!/usr/bin/env node
 const fs = require('fs');
 fs.writeFileSync('args.json', JSON.stringify(process.argv.slice(2)));
+if (process.argv.includes('slow')) { fs.writeFileSync('claude.pid', String(process.pid)); console.log(JSON.stringify({ type: 'system', subtype: 'init', model: 'fake-model' })); setInterval(() => {}, 1000); return; }
 fs.writeFileSync('index.html', 'built');
 for (const e of ${JSON.stringify(events)}) console.log(JSON.stringify(e));
 `);
@@ -121,6 +122,36 @@ assert.ok(args.includes('--allowedTools') && args.includes('Bash') && args.inclu
   assert.match(shown, /│ <h1>Hi<\/h1>\n {2}│ <p class="x">café<\/p>/, 'the file as it is written');
   assert.match(shown, /│ line two/, 'what the command printed');
   assert.match(shown, /└ 2 lines/);
+}
+
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+const pidIn = async (dir) => { const f = path.join(dir, 'claude.pid'); for (let i = 0; i < 100 && !fs.existsSync(f); i++) await sleep(50); return Number(fs.readFileSync(f, 'utf8')); };
+
+// Stopping the wrapper stops claude, its child (a window's command is stopped by signalling the wrapper only).
+{
+  const { spawn } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(ws, 'stop-'));
+  fs.writeFileSync(path.join(dir, 'p.txt'), 'slow');
+  const wrapper = spawn(process.execPath, [path.join(here, '../src/claude-stream.js'), path.join(dir, 'p.txt'), '--claude', path.join(bin, 'claude')], { cwd: dir, stdio: 'ignore' });
+  const pid = await pidIn(dir);
+  assert.ok(alive(pid));
+  wrapper.kill('SIGTERM');
+  await new Promise((res) => wrapper.on('exit', res));
+  for (let i = 0; i < 40 && alive(pid); i++) await sleep(50);
+  assert.ok(!alive(pid), 'claude stopped with its wrapper');
+}
+
+// A claude_code call that is cancelled (the job was stopped) stops Claude Code instead of leaving it running.
+{
+  const ctl = new AbortController();
+  const pending = client.callTool({ name: 'claude_code', arguments: { prompt: 'slow', cwd: 'slow' } }, undefined, { signal: ctl.signal, timeout: 60_000 }).catch(() => 'cancelled');
+  const pid = await pidIn(path.join(ws, 'slow'));
+  assert.ok(alive(pid));
+  ctl.abort();
+  assert.equal(await pending, 'cancelled');
+  for (let i = 0; i < 60 && alive(pid); i++) await sleep(50);
+  assert.ok(!alive(pid), 'Claude Code stopped when its call was cancelled');
 }
 
 await client.close();

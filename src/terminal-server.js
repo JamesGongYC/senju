@@ -114,10 +114,13 @@ function status(run) {
   return Number.isFinite(code) ? code : 1;
 }
 
-// Wait until the command ends or the time is up.
-async function wait(run, seconds) {
+// Wait until the command ends or the time is up. If the call is cancelled while it waits (the user stopped the
+// job, or the worker was stopped), the command is stopped too: otherwise it would carry on in its window with
+// no one waiting for it (a Claude Code run kept building, and spending, after its job was stopped).
+async function wait(run, seconds, signal) {
   const until = Date.now() + Math.max(0, seconds) * 1000;
-  while (status(run) === null && Date.now() < until) await sleep(250);
+  while (status(run) === null && Date.now() < until && !signal?.aborted) await sleep(250);
+  if (signal?.aborted && status(run) === null) { kill(run); return null; }
   if (status(run) !== null) await sleep(100);   // let the last of the output reach the log
   return status(run);
 }
@@ -229,12 +232,12 @@ const TOOLS = [
 const text = (t, isError = false) => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) });
 const clampSecs = (v, dflt) => Math.min(1800, Math.max(1, Number(v) || dflt));
 
-async function call(name, args = {}) {
+async function call(name, args = {}, signal = null) {
   if (name === 'run_command') {
     const command = String(args.command ?? '').trim();
     if (!command) return text('Give a command.', true);
     const run = await start(command, folder(args.cwd), 'Senju');
-    return text(report(run, await wait(run, clampSecs(args.timeout_seconds, 120))));
+    return text(report(run, await wait(run, clampSecs(args.timeout_seconds, 120), signal)));
   }
   if (name === 'claude_code') {
     const prompt = String(args.prompt ?? '').trim();
@@ -245,14 +248,14 @@ async function call(name, args = {}) {
     const shown = `claude "${prompt.replace(/\s+/g, ' ').slice(0, 90)}${prompt.length > 90 ? '…' : ''}"${args.allow_commands ? ' (may run commands)' : ''}`;
     const run = await start(claudeCommand(dir, { ...args, prompt }), cwd, 'Claude Code · Senju', shown, 'claude');
     run.logFile = path.join(dir, 'summary.log');
-    const code = await wait(run, clampSecs(args.timeout_seconds, 900));
+    const code = await wait(run, clampSecs(args.timeout_seconds, 900), signal);
     const out = report(run, code);
     if (code === 127 || /command not found: claude|claude: command not found/.test(out)) return text(`${out}\n\nClaude Code is not installed on this computer (the claude command is missing). Ask the user to install it: npm install -g @anthropic-ai/claude-code`, true);
     return text(out, code !== null && code !== 0);
   }
   if (name === 'read_output') {
     const run = find(args.id);
-    return text(report(run, await wait(run, clampSecs(args.wait_seconds, 60))));
+    return text(report(run, await wait(run, clampSecs(args.wait_seconds, 60), signal)));
   }
   if (name === 'send_input') {
     const run = find(args.id);
@@ -273,8 +276,8 @@ async function call(name, args = {}) {
 
 const server = new Server({ name: 'senju-terminal', version: '1.0.0' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  try { return await call(req.params.name, req.params.arguments ?? {}); } catch (err) { return text(String(err?.message ?? err), true); }
+server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
+  try { return await call(req.params.name, req.params.arguments ?? {}, extra?.signal); } catch (err) { return text(String(err?.message ?? err), true); }
 });
 
 // Leave nothing behind: stop commands still running in the background and remove the logs.
