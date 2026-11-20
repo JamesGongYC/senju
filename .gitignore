@@ -9,3 +9,4 @@ dist
 sessions
 memory.json
 .DS_Store
+api-key.bin

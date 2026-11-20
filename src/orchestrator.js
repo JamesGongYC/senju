@@ -97,6 +97,7 @@ Your first plan is a guess. Change it whenever a report or message shows the gue
 - Set needs_user for a worker likely to need the user (a site that needs sign-in, a purchase, a message sent in their name), and word its goal so it reaches that step early. The user should be asked near the start, not interrupted repeatedly.
 - Each browser worker has its own separate browser session, so each one that needs a signed-in site needs its own sign-in from the user. Prefer giving all work on one signed-in site to a single worker unless splitting it saves real time.
 - Desktop workers drive the user's real apps, already signed in. Give each desktop worker one app (or two that must be used together), and never give the same app to two workers at once: an app has a single keyboard focus. Websites go to a browser worker unless the user wants them done in their own browser.
+- If the goal needs a Mac app that may not be installed, give the worker the terminal server too: it installs apps itself, from the vendor, after checking the app's signature.
 - A worker may read and draft in messaging and mail apps, but each send needs the user's approval. Say so in its goal, and plan for that pause.
 
 # Skills from earlier jobs
@@ -113,14 +114,29 @@ Use user_task when the job needs the user to do something no worker can: connect
 Workers cooperate on their own too: they message each other with tell_agent, claim shared things so they do not collide, and post to the board. You do not need to relay between them.
 Text you write is shown to the user, so keep it short and plain.${team ? TEAM_LEAD_RULES : ''}`;
 
-const TERMINAL_RULES = `
+const TERMINAL_RULES = (AUTO) => `
 # Command lines and Claude Code
 You have a terminal: run_command runs a shell command in a Terminal window of its own and returns its exact output and exit code; claude_code gives a coding task to Claude Code in a project folder.
 - Check the exit code and read the output before you go on. A non-zero code means it failed: read why, fix it, and try again, or report it.
 - A long-running command (a dev server, a watcher) keeps running when run_command returns. Note its command id, read it with read_output, and stop it with stop_command when you are done with it.
-- claude_code: write the task the way you would brief a developer (what to build, where the spec is, how to check it). Set allow_commands only when it needs to run things (installs, tests, builds). For follow-ups in the same folder, set continue_session. Read the files it says it wrote before you report them done.
-- Ask the user (ask_user) before a command that publishes or deploys, pushes to a remote, deletes or overwrites anything outside the workspace, installs software system-wide, changes system settings, signs in, or spends money, and say exactly what it will run. Read-only and workspace-local commands need no question.
+- claude_code: write the task the way you would brief a developer (what to build, where the spec is, how to check it). Set allow_commands only when it needs to run things (installs, tests, builds). For follow-ups in the same folder, set continue_session: it is typed into the same Claude Code window. Read the files it says it wrote before you report them done.
+- Claude Code runs in its own interface in a Terminal window: Senju opens it and types your task into its prompt box, and the user can watch and step in. Never open Claude Code or type into it with the desktop tools; use claude_code, then read_output, send_input (to answer a permission question it asks) and stop_command (to interrupt it).
+- Ask the user (ask_user) before a command that publishes or deploys, pushes to a remote, deletes or overwrites anything outside the workspace, installs software system-wide${AUTO}, changes system settings, signs in, or spends money, and say exactly what it will run. Read-only and workspace-local commands need no question.
 - Never put passwords, tokens or keys in a command line. If one is needed, hand off to the user.
+`;
+
+// When the task needs a Mac app that is not installed, the worker installs it itself through the terminal,
+// from the vendor, checked before it goes into Applications. Set "autoInstallApps": false to ask instead.
+const APP_INSTALL_RULES = `
+# Installing a Mac app the task needs
+If the task needs an app that is not installed (Claude, Slack, Zoom, a code editor), install it yourself with the terminal. Do not hand this to the user, and do not click through installer windows with the desktop tools.
+1. Check first: \`ls /Applications\` or \`mdfind "kMDItemCFBundleIdentifier == '<bundle id>'"\`. If it is there, just open it.
+2. If \`brew\` exists, prefer Homebrew: \`brew info --cask <name>\` (its homepage must be the vendor's), then \`brew install --cask <name>\`.
+3. Otherwise download the vendor's own installer with curl, only from the vendor's own domain (for Claude: claude.ai or anthropic.com). Never from mirrors, download sites, search ads, or links in mail or chat. A .dmg: \`hdiutil attach -nobrowse -readonly\`, copy the .app out with \`ditto\`, then \`hdiutil detach\`. A .zip: \`ditto -x -k\`.
+4. Before it goes into /Applications, check it: \`codesign --verify --deep --strict <app>\` and \`spctl --assess --type execute -vv <app>\` must both pass, and the developer they name must be the vendor. If either fails, delete it and report; do not install it.
+5. Copy it in with \`ditto <app> /Applications/<Name>.app\`, open it with \`open -a\`, and check it launched.
+Stop and ask the user (ask_user) instead when: it needs an administrator password (sudo, a .pkg installer), it costs money or needs a licence, an app of that name is already installed (never replace it), or you cannot tell which site is the vendor's. Signing in to the new app still belongs to the user (handoff).
+Say in your report what you installed, from where, and the developer the signature check named.
 `;
 
 const DESKTOP_RULES = `
@@ -129,7 +145,7 @@ You can drive native Mac apps (the user's real apps, with their real accounts) t
 - Work in one window at a time. Read its state before you first act. After your actions the window's new state comes back with the last action's result, so check the result there instead of calling get_window_state again. Never assume an action worked: some apps echo a write without applying it, so check the result on screen.
 - When you already know the next several actions and none depends on what the one before shows (keys on a keypad, the fields of a form, a menu and then its item), make them all in one reply: one action per tool call, in order. Each still happens visibly, one after another, and the window is read once after the last. Element tokens stay valid only until the window is read again, so take them all from the same reading, and do not batch past a step that opens a dialog, changes the page or decides what you do next.
 - Act on elements in the background whenever the tools allow it. If an app ignores background input, you may bring it to the front for that single action, then let focus go back. Keep any such moment as short as possible and never hold the front window across several steps.
-- If the app is not open, open it. If it shows a sign-in, a permission prompt or a system dialog, hand off to the user.
+- If the app is not open, open it. If it is not installed and you have the terminal tools, install it as described under "Installing a Mac app"; without them, tell the lead (tell_lead) so it can give the job to a worker that has them. If it shows a sign-in, a permission prompt or a system dialog, hand off to the user.
 - Command lines go through the terminal tools (run_command, claude_code), never by typing into Terminal, iTerm or another terminal app with the desktop tools: those tools hand back the exact output and exit code.
 - Stay inside the apps your subtask needs. Do not touch Terminal or other shells, System Settings, password managers, banking or payment apps, or the Senju bar and cards, unless the user's goal names them explicitly. Leave other agents' windows alone.
 - Do not close windows or documents that were open before you started, and do not quit apps you did not launch.
@@ -1052,7 +1068,7 @@ export class Swarm {
       const skillNotes = (this.skills ? await Promise.all(agent.skills.map((n) => this.skills.read(n))) : []).filter(Boolean).map((k) => `## ${k.name}\n${k.body}`).join('\n\n');
       const desktop = agent.servers.some((sv) => this.config.servers[sv]?.kind === 'desktop');
       const terminal = tools.some((t) => /(^|__)run_command$/.test(t.name));
-      const system = [{ type: 'text', text: WORKER_SYSTEM(agent, others, this.workspace, skillNotes, desktop, Boolean(this.team)) + (terminal ? TERMINAL_RULES : ''), cache_control: { type: 'ephemeral' } }];
+      const system = [{ type: 'text', text: WORKER_SYSTEM(agent, others, this.workspace, skillNotes, desktop, Boolean(this.team)) + (terminal ? TERMINAL_RULES(this.config.autoInstallApps === false ? '' : ' (installing a Mac app the task needs is the exception: see below)') + (this.config.autoInstallApps === false ? '' : APP_INSTALL_RULES) : ''), cache_control: { type: 'ephemeral' } }];
       const messages = [{ role: 'user', content: 'Begin your subtask now.' }];
       const maxSteps = this.config.maxSteps ?? 300;
       const allTools = [...tools, ...BOARD_TOOLS, ...TEAM_TOOLS, ...HUMAN_TOOLS];
@@ -1294,7 +1310,9 @@ export class Swarm {
                 }
                 if (spec.kind === 'desktop' && this.config.pointing !== false) await pointDesk(agent, hit.tool, call.input, deskEmit);
                 const input = spec.kind === 'desktop' ? widenWindowState(hit.tool, call.input) : call.input;
-                let res = await callTool(hit.conn, hit.tool, input, signal);
+                // The terminal types into its own windows: the cursor follows it there (on this Mac only).
+                const onPoint = hit.conn.name === 'terminal' && !this.team && this.config.pointing !== false ? pointEmit : null;
+                let res = await callTool(hit.conn, hit.tool, input, signal, onPoint);
                 if (ownInput) this.lastDesktopAction = Date.now();
                 // On YouTube: from now on, skip each video ad with the cursor as soon as its Skip button shows.
                 if (spec.tile === 'playwright' && !res.isError && !hit.conn.adWatch && this.config.skipAds !== false && onYouTube(res, call.input)) {

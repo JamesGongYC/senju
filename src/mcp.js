@@ -101,13 +101,19 @@ export function buildToolset(connections, extra = null) {
 }
 
 // Run one MCP call and convert the result into Claude tool_result content.
-export async function callTool(conn, tool, args, signal) {
+// onPoint: a server may send where the agent's cursor should go while a call runs (the terminal, as it types into
+// a window), as progress notifications whose message is {"point": {...}}.
+export async function callTool(conn, tool, args, signal, onPoint = null) {
   // How many calls are running on this connection now (background helpers wait for 0).
   conn.inflight = (conn.inflight ?? 0) + 1;
   if (conn.cursorSession && conn.sessionTools?.has(tool)) args = { ...args, session: conn.cursorSession };
   try {
     // A server can allow longer calls ("callTimeout" seconds): the terminal waits on builds and Claude Code.
-    const res = await conn.client.callTool({ name: tool, arguments: args ?? {} }, undefined, { signal, timeout: (conn.spec?.callTimeout ?? 120) * 1000 });
+    const res = await conn.client.callTool({ name: tool, arguments: args ?? {} }, undefined, {
+      signal,
+      timeout: (conn.spec?.callTimeout ?? 120) * 1000,
+      ...(onPoint ? { onprogress: (p) => { try { const m = JSON.parse(p?.message ?? ''); if (m?.point) onPoint(m.point); } catch { /* not a point */ } } } : {}),
+    });
     const content = [];
     for (const item of res.content ?? []) {
       if (item.type === 'text') {
