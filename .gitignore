@@ -6,3 +6,6 @@ skills
 hw7.json
 .playwright-mcp
 dist
+sessions
+memory.json
+.DS_Store

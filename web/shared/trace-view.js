@@ -1,8 +1,8 @@
 // The session viewer, shared by the desktop launcher and the web control page.
 //
 // A session reads top to bottom like a chat, one block per turn:
-//   your message → a swimlane strip (who worked when) → the lead's story, with each worker's card
-//   placed where the lead started it → the turn's summary.
+//   your message → a timeline with one column per agent (the lead first), time running down and shared
+//   by every column → the turn's summary. A column opens into that agent's trace when its head is clicked.
 // A worker card lists its steps the way Claude Code lists tool calls: "● click  Sign in", with the
 // result underneath when it is available (personal sessions only; team history never stores results).
 //
@@ -13,7 +13,7 @@
 // No dependencies, no innerHTML: every string from a session is set as text.
 
 const LOOK = /(^|_)(snapshot|screenshot|get_window_state|list_windows|get_browser_state|evaluate|read|state|wait_for|wait)$/;
-const LEAD_HIDDEN = new Set(['wait', 'board_read', 'read_skill']);
+const LEAD_HIDDEN = new Set(['wait', 'board_read', 'read_skill', 'ask_user']);
 
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; };
 const add = (parent, tag, cls, text) => parent.appendChild(el(tag, cls, text));
@@ -193,67 +193,202 @@ export function createTraceView(root, { showResults = false } = {}) {
     return box;
   }
 
-  function workerCard(t, a) {
-    const key = `${t.index}:${a.id}`;
-    const live = ['acting', 'thinking', 'starting', 'waiting', 'blocked', 'paused'].includes(a.status) && t.status === 'running';
-    const open = state.open.has(key) || (live && !state.open.has(`${key}:closed`));
-    const card = el('section', `tv-card${live ? ' live' : ''}${open ? ' open' : ''}`);
-    card.id = `tv-${t.index}-${a.id}`;
-    card.style.setProperty('--agent', a.color);
-    const head = add(card, 'header', 'tv-card-head');
-    add(head, 'i', 'tv-swatch');
-    const title = add(head, 'div', 'tv-card-title');
-    add(title, 'b', null, a.name);
-    add(title, 'span', 'tv-card-goal', a.goal);
-    const meta = add(head, 'div', 'tv-card-meta');
-    if (a.deviceName) add(meta, 'span', 'pill', `on ${a.deviceName}`);
-    const status = a.status === 'done' ? 'done' : a.status === 'error' ? 'error' : a.status === 'cancelled' ? 'stopped' : live ? 'live' : a.status;
-    add(meta, 'span', `pill ${status}`, status === 'live' ? (a.status === 'waiting' ? 'needs you' : a.status) : status);
-    const tools = a.steps.filter((s) => s.kind === 'tool').length;
-    add(meta, 'span', 'tv-count', `${tools} step${tools === 1 ? '' : 's'} · ${dur(a.first, a.last)}`);
-    head.addEventListener('click', () => {
-      if (open) { state.open.delete(key); state.open.add(`${key}:closed`); } else { state.open.add(key); state.open.delete(`${key}:closed`); }
-      draw(t.index);
-    });
-    const body = add(card, 'div', 'tv-card-body');
-    const steps = open ? a.steps : a.steps.slice(-3);
-    if (!open && a.steps.length > 3) add(body, 'div', 'tv-more', `${a.steps.length - 3} earlier · click to see all`);
-    body.append(...stepList(steps, a));
-    if (live && a.label) add(body, 'div', 'tv-now', a.label);
-    if (a.report) { const q = add(body, 'blockquote', 'tv-report'); add(q, 'b', null, 'Report'); add(q, 'p', null, a.report); }
-    return card;
+  // ---- The timeline: agents across, time down ----
+  // Every agent is a column. Closed, a column is a lifeline with a dot per step; opened (click its head),
+  // it shows the agent's trace. Rows are shared by all columns, so things that happened at the same time
+  // sit side by side.
+
+  const LIVE = ['acting', 'thinking', 'starting', 'waiting', 'blocked', 'paused'];
+  const isLive = (t, a) => LIVE.includes(a.status) && t.status === 'running';
+  const statusWord = (t, a) => {
+    if (a.status === 'done') return 'done';
+    if (a.status === 'error') return 'error';
+    if (a.status === 'cancelled') return 'stopped';
+    if (!isLive(t, a)) return a.status;
+    if (a.status === 'waiting') return 'needs you';
+    if (a.status === 'paused' && a.label === 'waiting while you type') return 'holding';
+    return a.status;
+  };
+  const isOpen = (t, key, dflt) => state.open.has(`${t.index}:${key}`) || (dflt && !state.open.has(`${t.index}:${key}:closed`));
+  function toggle(t, key, open) {
+    const k = `${t.index}:${key}`;
+    if (open) { state.open.delete(k); state.open.add(`${k}:closed`); } else { state.open.add(k); state.open.delete(`${k}:closed`); }
+    draw(t.index);
   }
 
-  function swimlanes(t) {
-    const agents = [...t.agents.values()];
-    if (!agents.length || !t.first) return null;
-    const start = ms(t.first), end = Math.max(ms(t.last ?? t.first), ...agents.map((a) => ms(a.last)), start + 1000);
-    const span = end - start;
-    const box = el('div', 'tv-lanes');
-    const lane = (name, color, from, to, ticks, id) => {
-      const row = add(box, 'div', 'tv-lane');
-      add(row, 'span', 'tv-lane-name', name);
-      const track = add(row, 'div', 'tv-track');
-      const barEl = add(track, 'i', 'tv-span');
-      barEl.style.left = `${((ms(from) - start) / span) * 100}%`;
-      barEl.style.width = `${Math.max(0.6, ((ms(to) - ms(from)) / span) * 100)}%`;
-      barEl.style.background = color;
-      for (const tk of ticks) {
-        const m = add(track, 'i', `tv-tick${tk.err ? ' err' : ''}${tk.ask ? ' ask' : ''}`);
-        m.style.left = `${((ms(tk.at) - start) / span) * 100}%`;
-      }
-      if (id) row.addEventListener('click', () => { state.open.add(`${t.index}:${id}`); draw(t.index); root.querySelector(`#tv-${t.index}-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }); });
-    };
-    lane('Lead', 'var(--ink)', t.first, t.last ?? t.first, t.leadSteps.map((at) => ({ at })), null);
-    for (const a of agents) {
-      if (state.filter !== 'all' && state.filter !== a.id) continue;
-      lane(a.name, a.color, a.first, a.last, a.steps.filter((s) => s.kind === 'tool' || s.kind === 'ask').map((s) => ({ at: s.at, err: s.isError, ask: s.kind === 'ask' })), a.id);
+  // What a worker's column shows, in time order. Runs of look-only steps fold into one line.
+  function workerItems(t, a) {
+    const items = [{ kind: 'start', at: a.first }];
+    let looks = null;
+    for (const st of a.steps) {
+      const quiet = st.kind === 'tool' && !st.isError && LOOK.test(toolParts(st.tool).verb.replace(/ /g, '_')) && !state.showResults;
+      if (quiet) { if (looks) looks.n++; else items.push(looks = { kind: 'looks', at: st.at, n: 1, s: st }); continue; }
+      looks = null;
+      items.push({ kind: 'step', at: st.at, s: st });
     }
-    const foot = add(box, 'div', 'tv-lanes-foot');
-    add(foot, 'span', null, clock(t.first));
-    add(foot, 'span', null, dur(t.first, end));
-    add(foot, 'span', null, clock(end));
-    return box;
+    if (a.report) items.push({ kind: 'report', at: a.last });
+    else if (isLive(t, a) && a.label) items.push({ kind: 'now', at: a.last });
+    return items;
+  }
+
+  function leadItems(t) {
+    return t.flow
+      .filter((f) => !(f.kind === 'lead' && t.summary && f.text.trim() === String(t.summary).trim()))   // the final reply is the summary below
+      .map((f) => ({ kind: `lead-${f.kind}`, at: f.at, f }));
+  }
+
+  function cell(t, a, it) {
+    switch (it.kind) {
+      case 'start': { const c = el('div', 'tl-item tl-start'); add(c, 'span', 'tl-kicker', 'Started'); add(c, 'p', null, a.goal); c.title = 'Click to read the whole goal'; c.addEventListener('click', () => c.classList.toggle('full')); return c; }
+      case 'looks': {
+        if (it.n === 1) return stepRow(it.s, a);
+        const c = el('div', 'tv-step look folded');
+        const h = add(c, 'div', 'tv-step-head');
+        add(h, 'i', 'tv-dot').style.background = 'var(--line-strong)';
+        add(h, 'span', 'tv-verb', `looked ${it.n}×`);
+        return c;
+      }
+      case 'step': return stepRow(it.s, a);
+      case 'report': { const q = el('blockquote', 'tv-report'); add(q, 'b', null, 'Report'); add(q, 'p', null, a.report); return q; }
+      case 'now': return el('div', 'tv-now', a.label);
+      case 'lead-lead': { const c = el('div', 'tl-item tl-leadsay'); add(c, 'p', null, it.f.text); return c; }
+      case 'lead-leadtool': { const { verb } = toolParts(it.f.tool); const c = el('div', 'tv-leadtool'); add(c, 'span', 'tv-verb', verb); if (it.f.label) add(c, 'span', 'tv-label', it.f.label); return c; }
+      case 'lead-said': {
+        const f = it.f;
+        const c = el('div', 'tv-said');
+        add(c, 'b', null, `${f.name}${f.target && f.target !== 'lead' ? ` → ${t.agents.get(f.target)?.name ?? 'a worker'}` : ''}: `);
+        c.append(f.text);
+        return c;
+      }
+      case 'lead-agent': {
+        const w = t.agents.get(it.f.id);
+        const c = el('button', 'tl-spawn');
+        c.style.setProperty('--agent', w?.color ?? '#888');
+        add(c, 'i', 'tv-dot');
+        c.append(`started ${w?.name ?? 'a worker'}`);
+        c.addEventListener('click', () => w && toggle(t, w.id, isOpen(t, w.id, isLive(t, w))));
+        return c;
+      }
+      case 'lead-board': { const c = el('div', 'tv-board'); add(c, 'b', null, `${it.f.from} on the board: `); c.append(it.f.text); return c; }
+      case 'lead-memo': return el('div', 'tv-memo', it.f.text);
+      case 'lead-ask': return askBox(it.f);
+      case 'lead-error': return el('div', 'tv-error', it.f.text);
+      default: return el('div');
+    }
+  }
+
+  function timeline(t) {
+    const workers = [...t.agents.values()];
+    const cols = [
+      { key: 'lead', name: 'Lead', color: 'var(--ink)', lead: true, open: isOpen(t, 'lead', true), items: leadItems(t), live: t.status === 'running', word: t.status === 'running' ? 'running' : 'done', count: t.leadSteps.length },
+      ...workers.map((a) => ({ key: a.id, a, name: a.name, color: a.color, open: isOpen(t, a.id, isLive(t, a)), items: workerItems(t, a), live: isLive(t, a), word: statusWord(t, a), count: a.steps.filter((x) => x.kind === 'tool').length, device: a.deviceName })),
+    ];
+    if (!workers.length && !cols[0].items.length) return null;
+
+    // Shared rows: everything an open column shows, plus where each closed column starts and ends.
+    // Things from different columns within two seconds of each other share a row.
+    const evs = [];
+    cols.forEach((c, ci) => {
+      // A closed column also marks each half minute it was busy, so its lifeline keeps its length in time.
+      let shown = c.items;
+      if (!c.open && c.items.length > 1) {
+        const seen = new Set();
+        shown = [c.items[0], ...c.items.slice(1, -1).filter((it) => { const b = Math.floor(ms(it.at) / 30000); if (seen.has(b)) return false; seen.add(b); return true; }), c.items.at(-1)];
+      }
+      shown.forEach((it, k) => evs.push({ ci, it, time: ms(it.at) || 0, order: k }));
+    });
+    evs.sort((x, y) => x.time - y.time || x.ci - y.ci || x.order - y.order);
+    const rows = [];
+    for (const ev of evs) {
+      const r = rows.at(-1);
+      if (r && !r.used.has(ev.ci) && ev.time - r.time <= 2000) { r.used.add(ev.ci); r.evs.push(ev); }
+      else rows.push({ time: ev.time, used: new Set([ev.ci]), evs: [ev] });
+    }
+    // The last row at or before a time.
+    const rowAt = (time) => {
+      let lo = 0, hi = rows.length - 1, best = 0;
+      while (lo <= hi) { const mid = (lo + hi) >> 1; if (rows[mid].time <= time) { best = mid; lo = mid + 1; } else hi = mid - 1; }
+      return best;
+    };
+    const t0 = ms(t.started ?? t.first) || rows[0]?.time || 0;
+
+    const wrap = el('div', 'tl-wrap');
+    const grid = add(wrap, 'div', 'tl-grid');
+    grid.style.gridTemplateColumns = `52px ${cols.map((c) => c.open ? (c.lead ? 'minmax(300px, 1.3fr)' : 'minmax(280px, 1fr)') : '132px').join(' ')}`;
+    const place = (node, row, col, rowEnd) => {
+      node.style.gridRow = rowEnd ? `${row} / ${rowEnd}` : String(row);
+      node.style.gridColumn = String(col);
+      grid.append(node);
+      return node;
+    };
+
+    // Zebra bands first, so everything else sits on top.
+    rows.forEach((r, ri) => { if (ri % 2 === 1) { const b = place(el('div', 'tl-band'), ri + 2, 1); b.style.gridColumn = `1 / ${cols.length + 2}`; } });
+
+    // Heads, across the top.
+    place(el('div', 'tl-corner', 'time'), 1, 1);
+    cols.forEach((c, ci) => {
+      const head = el('button', `tl-head${c.open ? ' open' : ''}${c.live ? ' live' : ''}${c.lead ? ' lead' : ''}`);
+      head.style.setProperty('--agent', c.color);
+      head.title = c.open ? 'Fold this trace' : 'Open this trace';
+      const top = add(head, 'span', 'tl-head-top');
+      add(top, 'i', 'tl-orb');
+      add(top, 'b', null, c.name);
+      add(top, 'span', 'tl-chev', c.open ? '▾' : '▸');
+      const meta = add(head, 'span', 'tl-head-meta');
+      add(meta, 'span', `pill ${c.live ? 'live' : c.word}`, c.word);
+      add(meta, 'span', 'tv-count', `${c.count} step${c.count === 1 ? '' : 's'}`);
+      if (c.device) add(head, 'span', 'tl-device', `on ${c.device}`);
+      head.addEventListener('click', () => toggle(t, c.key, c.open));
+      place(head, 1, ci + 2);
+    });
+
+    // Time down the left, from the start of the turn.
+    let lastLabel = '';
+    rows.forEach((r, ri) => {
+      const sec = Math.max(0, Math.round((r.time - t0) / 1000));
+      const label = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+      place(el('div', `tl-time${label === lastLabel ? ' same' : ''}`, label), ri + 2, 1);
+      lastLabel = label;
+    });
+
+    // Each column: its lifeline, then dots (closed) or its trace (open).
+    cols.forEach((c, ci) => {
+      const mine = rows.map((r, ri) => (r.used.has(ci) ? ri : -1)).filter((ri) => ri >= 0);
+      if (!mine.length) return;
+      const life = place(el('div', `tl-life${c.live ? ' live' : ''}${c.open ? ' open' : ''}`), mine[0] + 2, ci + 2, mine.at(-1) + 3);
+      life.style.setProperty('--agent', c.color);
+      if (!c.open) {
+        // A dot in the row where each step happened, bigger when several fall in one row.
+        const per = new Map();
+        for (const st of c.lead ? c.items : c.a.steps) {
+          const ri = rowAt(ms(st.at));
+          const m = per.get(ri) ?? { n: 0, err: false, ask: false };
+          m.n++;
+          m.err ||= Boolean(st.isError ?? st.s?.isError);
+          m.ask ||= st.kind === 'ask' || st.kind === 'lead-ask';
+          per.set(ri, m);
+        }
+        for (const [ri, m] of per) {
+          const dot = place(el('button', 'tl-dotcell'), ri + 2, ci + 2);
+          dot.title = `${m.n} step${m.n === 1 ? '' : 's'}: click to open`;
+          const d = add(dot, 'i', `tl-pip${m.err ? ' err' : ''}${m.ask ? ' ask' : ''}`);
+          d.style.setProperty('--agent', c.color);
+          d.style.setProperty('--size', `${Math.min(18, 7 + Math.sqrt(m.n) * 2.4)}px`);
+          dot.addEventListener('click', () => toggle(t, c.key, false));
+        }
+        return;
+      }
+      rows.forEach((r, ri) => {
+        for (const ev of r.evs) {
+          if (ev.ci !== ci) continue;
+          const box = place(el('div', 'tl-cell'), ri + 2, ci + 2);
+          box.style.setProperty('--agent', c.color);
+          box.append(cell(t, c.a, ev.it));
+        }
+      });
+    });
+    return wrap;
   }
 
   function drawTurn(t) {
@@ -263,23 +398,8 @@ export function createTraceView(root, { showResults = false } = {}) {
     const bubble = add(you, 'div', 'tv-bubble');
     add(bubble, 'p', null, t.goal || '(no message)');
     add(you, 'div', 'tv-you-meta', `${t.by ?? 'You'}${t.started ? ` · ${clock(t.started)}` : ''}${t.index > 0 ? ' · continued' : ''}`);
-    const lanes = swimlanes(t);
-    if (lanes) sec.append(lanes);
-    const flow = add(sec, 'div', 'tv-flow');
-    for (const f of t.flow) {
-      if (state.filter !== 'all' && f.kind !== 'agent' && state.filter !== 'lead') continue;
-      if (f.kind === 'lead') {
-        if (t.summary && f.text.trim() === String(t.summary).trim()) continue;   // the final reply is the summary below
-        const p = add(flow, 'div', 'tv-lead'); add(p, 'span', 'tv-who', 'Lead'); add(p, 'p', null, f.text);
-      }
-      else if (f.kind === 'leadtool') { const { verb } = toolParts(f.tool); const p = add(flow, 'div', 'tv-leadtool'); add(p, 'span', 'tv-verb', verb); if (f.label) add(p, 'span', 'tv-label', f.label); }
-      else if (f.kind === 'said') { const p = add(flow, 'div', 'tv-said'); add(p, 'b', null, `${f.name}${f.target && f.target !== 'lead' ? ` → ${t.agents.get(f.target)?.name ?? 'a worker'}` : ''}: `); p.append(f.text); }
-      else if (f.kind === 'agent') { const a = t.agents.get(f.id); if (a && (state.filter === 'all' || state.filter === a.id)) flow.append(workerCard(t, a)); }
-      else if (f.kind === 'board') { const p = add(flow, 'div', 'tv-board'); add(p, 'b', null, `${f.from} on the board: `); p.append(f.text); }
-      else if (f.kind === 'memo') add(flow, 'div', 'tv-memo', f.text);
-      else if (f.kind === 'ask') flow.append(askBox(f));
-      else if (f.kind === 'error') add(flow, 'div', 'tv-error', f.text);
-    }
+    const tl = timeline(t);
+    if (tl) sec.append(tl);
     if (t.summary || t.status === 'stopped') {
       const done = add(sec, 'div', `tv-summary ${t.status === 'done' ? '' : 'stopped'}`);
       add(done, 'div', 'tv-summary-kicker', t.status === 'done' ? 'Done' : 'Stopped');
@@ -299,18 +419,7 @@ export function createTraceView(root, { showResults = false } = {}) {
 
   function drawBar() {
     bar.replaceChildren();
-    const ids = new Map();
-    for (const t of state.turns) for (const a of t.agents.values()) if (!ids.has(a.id + a.name)) ids.set(a.id + a.name, a);
-    const chips = add(bar, 'div', 'tv-filters');
-    const chip = (id, label, color) => {
-      const b = add(chips, 'button', `tv-filter${state.filter === id ? ' on' : ''}`);
-      if (color) add(b, 'i', 'tv-dot').style.background = color;
-      b.append(label);
-      b.addEventListener('click', () => { state.filter = id; drawAll(); });
-    };
-    chip('all', 'Everyone');
-    chip('lead', 'Lead', 'var(--ink)');
-    for (const a of ids.values()) chip(a.id, a.name, a.color);
+    add(bar, 'div', 'tv-hint', 'Click an agent to open its trace. Rows line up in time across agents.');
     const tools = add(bar, 'div', 'tv-tools');
     if (state.canShowResults) {
       const lab = add(tools, 'label', 'tv-toggle');
@@ -323,7 +432,7 @@ export function createTraceView(root, { showResults = false } = {}) {
     const all = add(tools, 'button', 'tv-filter', state.expandAll ? 'Collapse all' : 'Expand all');
     all.addEventListener('click', () => {
       state.expandAll = !state.expandAll;
-      for (const t of state.turns) for (const a of t.agents.values()) { const k = `${t.index}:${a.id}`; if (state.expandAll) { state.open.add(k); state.open.delete(`${k}:closed`); } else { state.open.delete(k); state.open.add(`${k}:closed`); } }
+      for (const t of state.turns) for (const a of [{ id: 'lead' }, ...t.agents.values()]) { const k = `${t.index}:${a.id}`; if (state.expandAll) { state.open.add(k); state.open.delete(`${k}:closed`); } else { state.open.delete(k); state.open.add(`${k}:closed`); } }
       drawAll();
     });
   }

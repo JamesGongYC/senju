@@ -29,6 +29,16 @@ export function loadConfig() {
   }
   const config = JSON.parse(fs.readFileSync(fs.existsSync(mine) ? mine : shipped, 'utf8'));
   config.servers ??= {};
+  // Tool servers that ship with the app reach settings copied before they existed. Setting one to null
+  // in your own settings turns it off.
+  if (mine !== shipped && fs.existsSync(mine)) {
+    try {
+      for (const [name, spec] of Object.entries(JSON.parse(fs.readFileSync(shipped, 'utf8')).servers ?? {})) {
+        if (spec.builtin && !(name in config.servers)) config.servers[name] = spec;
+      }
+    } catch { /* the shipped default is unreadable: use the user's as is */ }
+  }
+  for (const [name, spec] of Object.entries(config.servers)) if (spec == null) delete config.servers[name];
   return config;
 }
 

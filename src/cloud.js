@@ -98,6 +98,10 @@ export class CloudClient {
       case 'event':
         return this.onEvent(m.event);
       case 'open':
+        // Some tools (the terminal) can do anything on this computer, so only its owner's own sessions get them.
+        if (this.host.config.servers?.[m.server]?.ownerOnly && this.session?.owner?.id !== this.me?.user?.id) {
+          return this.say({ t: 'opened', rid: m.rid, error: `"${m.server}" on ${this.device.name} is only for its owner's own sessions.` });
+        }
         try { this.say({ t: 'opened', rid: m.rid, ...(await this.host.open(m.server, m.agent)) }); }
         catch (err) { this.say({ t: 'opened', rid: m.rid, error: String(err?.message ?? err) }); }
         return;

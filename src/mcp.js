@@ -97,7 +97,8 @@ export async function callTool(conn, tool, args, signal) {
   conn.inflight = (conn.inflight ?? 0) + 1;
   if (conn.cursorSession && conn.sessionTools?.has(tool)) args = { ...args, session: conn.cursorSession };
   try {
-    const res = await conn.client.callTool({ name: tool, arguments: args ?? {} }, undefined, { signal, timeout: 120000 });
+    // A server can allow longer calls ("callTimeout" seconds): the terminal waits on builds and Claude Code.
+    const res = await conn.client.callTool({ name: tool, arguments: args ?? {} }, undefined, { signal, timeout: (conn.spec?.callTimeout ?? 120) * 1000 });
     const content = [];
     for (const item of res.content ?? []) {
       if (item.type === 'text') {

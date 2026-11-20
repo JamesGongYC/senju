@@ -362,8 +362,10 @@ export class Hub {
     s.allowed.add(client.device.id);
     this.join(s, client.user);
     for (const [server, info] of Object.entries(client.servers)) {
+      // A server that can do anything on its computer (the terminal) serves only its owner's own sessions.
+      if (info.ownerOnly && client.user.id !== s.owner.id) continue;
       const full = `${server}@${client.device.slug}`;
-      s.servers.set(full, { client, server });
+      s.servers.set(full, { client, server, callTimeout: Number(info.callTimeout) || null });
       s.swarm.addServer(full, {
         about: `${info.about ?? server}. Runs on "${client.device.name}", ${client.user.name}'s computer`,
         kind: info.kind, app: info.app, shared: false,
@@ -398,7 +400,7 @@ export class Hub {
       pid: null,
       client: {
         callTool: async ({ name, arguments: args }, _schema, opts) => {
-          const res = await this.rpc(at.client, { t: 'call', conn, tool: name, args }, opts?.signal);
+          const res = await this.rpc(at.client, { t: 'call', conn, tool: name, args }, opts?.signal, at.callTimeout ? Math.min(at.callTimeout, 3600) * 1000 + 30000 : CALL_TIMEOUT);
           return { content: res.content ?? [], isError: Boolean(res.isError), structuredContent: res.structured };
         },
       },

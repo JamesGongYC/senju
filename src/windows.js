@@ -36,6 +36,18 @@ export async function listWindows({ all = false } = {}) {
 // Of several windows, one the user can see now if there is one.
 const showing = (wins) => wins.find((w) => w.onScreen !== false) ?? wins[0] ?? null;
 
+const FRONT = `
+ObjC.import('AppKit');
+var a = $.NSWorkspace.sharedWorkspace.frontmostApplication;
+JSON.stringify(a.isNil() ? null : { pid: a.processIdentifier, app: ObjC.unwrap(a.localizedName) });
+`;
+
+// The app the user is in: {pid, app}, or null if unknown.
+export async function frontApp() {
+  if (process.platform !== 'darwin') return null;
+  try { return JSON.parse(await run('osascript', ['-l', 'JavaScript', '-e', FRONT], 2000)) ?? null; } catch { return null; }
+}
+
 // Map of pid -> parent pid for every process.
 export async function processParents() {
   const out = await run('ps', ['-axo', 'pid=,ppid=']);

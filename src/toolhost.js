@@ -3,7 +3,7 @@
 // with the same care as solo mode: tiled windows, one desktop action at a time, and waiting
 // while the user is typing.
 import { connectServer, callTool, resolveSpec } from './mcp.js';
-import { READ_ONLY, noteTarget, userActive } from './desktop.js';
+import { READ_ONLY, noteTarget, userActive, collides, inBackground, WAIT_LABEL } from './desktop.js';
 
 export class ToolHost {
   /**
@@ -12,13 +12,15 @@ export class ToolHost {
    * @param {string} o.workspace
    * @param {(count: number) => object[]} [o.layout]  screen slots for agent windows
    * @param {() => number} [o.idle]  seconds since the user last typed or clicked
+   * @param {() => Promise<{pid: number, app: string}|null>} [o.front]  the app the user is in
    * @param {(event: object) => void} [o.emit]  local-only UI events
    */
-  constructor({ config, workspace, layout = null, idle = null, emit = () => {}, connect = connectServer }) {
+  constructor({ config, workspace, layout = null, idle = null, front = null, emit = () => {}, connect = connectServer }) {
     this.config = config;
     this.workspace = workspace;
     this.layout = layout;
     this.idle = idle;
+    this.front = front;   // async () => {pid, app} the user is in, or null if unknown
     this.emit = emit;
     this.connect = connect;
     this.agents = new Map();   // agent id -> { id, name, color, server, pids, target, slot, live, status, label }
@@ -38,7 +40,7 @@ export class ToolHost {
       await Promise.all(Object.entries(this.config.servers ?? {}).map(async ([name, spec]) => {
         try {
           const conn = await this.connect(name, resolveSpec(spec, this.workspace));
-          out[name] = { about: spec.about ?? name, kind: spec.kind ?? null, app: spec.app ?? null, tile: spec.tile ?? null, tools: conn.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) };
+          out[name] = { about: spec.about ?? name, kind: spec.kind ?? null, app: spec.app ?? null, tile: spec.tile ?? null, ownerOnly: Boolean(spec.ownerOnly), callTimeout: spec.callTimeout ?? null, tools: conn.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) };
           if (spec.shared) this.shared.set(name, conn); else await conn.close();
         } catch (err) {
           this.emit({ type: 'notice', message: spec.setup && /ENOENT|not found/i.test(String(err?.message ?? err))
@@ -85,13 +87,15 @@ export class ToolHost {
     return { conn: id, tools: conn.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) };
   }
 
-  // Hold a desktop action until the user pauses, so it never lands in the middle of their typing.
-  async quiet(agent) {
+  // Hold a desktop action while the person at this computer is typing or clicking, but only if it
+  // would get in their way (see collides() in desktop.js).
+  async quiet(agent, tool = '', input = {}) {
     const active = () => userActive(this.idle?.(), this.lastDesktopAction, this.config.typingPause ?? 2);
-    if (!active()) return;
+    const blocked = async () => active() && collides(tool, input, agent.target, await this.front?.() ?? null);
+    if (!(await blocked())) return;
     const limit = Date.now() + (this.config.typingWaitMax ?? 120) * 1000;
-    this.emit({ type: 'agent', id: agent.id, status: 'paused', label: 'waiting for you to pause', local: true });
-    while (active() && Date.now() < limit) await new Promise((r) => setTimeout(r, 300));
+    this.emit({ type: 'agent', id: agent.id, status: 'paused', label: WAIT_LABEL, local: true });
+    while (Date.now() < limit && await blocked()) await new Promise((r) => setTimeout(r, 300));
   }
 
   async call(connId, tool, args) {
@@ -103,9 +107,11 @@ export class ToolHost {
     const acts = spec.kind === 'desktop' && !READ_ONLY.test(tool);
     if (spec.kind === 'desktop' && agent) noteTarget(agent, args);
     const run = async () => {
-      if (acts && agent) { await this.quiet(agent); this.lastDesktopAction = Date.now(); }
+      // Background input to another app never looks like the person typing, so only the rest is noted.
+      const own = acts && !inBackground(tool, args);
+      if (acts && agent) { await this.quiet(agent, tool, args); if (own) this.lastDesktopAction = Date.now(); }
       const res = await callTool(entry.conn, tool, args);
-      if (acts) this.lastDesktopAction = Date.now();
+      if (own) this.lastDesktopAction = Date.now();
       return res;
     };
     if (!spec.serial) return run();

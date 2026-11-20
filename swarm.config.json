@@ -36,6 +36,19 @@
       "shared": true,
       "about": "Read and write files in the shared workspace folder"
     },
+    "terminal": {
+      "command": "bundled",
+      "args": [
+        "src/terminal-server.js",
+        "${WORKSPACE}"
+      ],
+      "app": "Terminal",
+      "shared": true,
+      "ownerOnly": true,
+      "builtin": true,
+      "about": "Runs shell commands and Claude Code (the claude CLI) in Terminal windows of its own, and returns their exact output and exit code. Use it for every command line, coding task, build, test, install or deploy, instead of typing into Terminal with the desktop tools",
+      "callTimeout": 1900
+    },
     "desktop": {
       "command": "cua-driver",
       "args": [

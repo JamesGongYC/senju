@@ -111,7 +111,7 @@ assert.ok(L.over >= 1 && J.over >= 1);
 const [readAt, typeAt] = [L.calls[0][2], L.calls[1][2]];
 assert.ok(readAt < lindaTypingUntil, 'reading does not wait');
 assert.ok(typeAt >= lindaTypingUntil, 'acting waits for the person at that computer to pause');
-assert.ok(L.ui.some((e) => e.type === 'agent' && e.local && e.label === 'waiting for you to pause'));
+assert.ok(L.ui.some((e) => e.type === 'agent' && e.local && e.label === 'waiting while you type'));
 // Presence told each computer whether it was in the session.
 assert.ok(L.ui.some((e) => e.type === 'presence' && e.people.find((p) => p.name === 'Linda').devices[0].inSession));
 // Shared servers stay open for the next session.

@@ -9,7 +9,7 @@ import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds, onYouTube } from './adskip.js';
 import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS } from './deskpoint.js';
-import { READ_ONLY, noteTarget, userActive } from './desktop.js';
+import { READ_ONLY, noteTarget, userActive, collides, inBackground, WAIT_LABEL } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
 import { listSkills, readSkill, saveSkill } from './skills.js';
 
@@ -51,6 +51,16 @@ export function snapshotMessages(messages) {
       : b);
   }
   return closeOpenCalls(copy);
+}
+
+// A tool result for the API. The API refuses an error result that carries anything but text, and a failed
+// desktop action often comes back with a screenshot of where it failed. Keep the picture, say it failed in
+// words, and drop the flag.
+export function toolResult(id, content, isError) {
+  const blocks = Array.isArray(content) && content.length ? content : [{ type: 'text', text: isError ? 'The tool failed.' : '(no output)' }];
+  if (!isError) return { type: 'tool_result', tool_use_id: id, content: blocks };
+  if (blocks.every((b) => b.type === 'text')) return { type: 'tool_result', tool_use_id: id, content: blocks, is_error: true };
+  return { type: 'tool_result', tool_use_id: id, content: [{ type: 'text', text: 'Error: this tool call failed. What it returned:' }, ...blocks] };
 }
 
 export function closeOpenCalls(messages) {
@@ -103,6 +113,16 @@ Use user_task when the job needs the user to do something no worker can: connect
 Workers cooperate on their own too: they message each other with tell_agent, claim shared things so they do not collide, and post to the board. You do not need to relay between them.
 Text you write is shown to the user, so keep it short and plain.${team ? TEAM_LEAD_RULES : ''}`;
 
+const TERMINAL_RULES = `
+# Command lines and Claude Code
+You have a terminal: run_command runs a shell command in a Terminal window of its own and returns its exact output and exit code; claude_code gives a coding task to Claude Code in a project folder.
+- Check the exit code and read the output before you go on. A non-zero code means it failed: read why, fix it, and try again, or report it.
+- A long-running command (a dev server, a watcher) keeps running when run_command returns. Note its command id, read it with read_output, and stop it with stop_command when you are done with it.
+- claude_code: write the task the way you would brief a developer (what to build, where the spec is, how to check it). Set allow_commands only when it needs to run things (installs, tests, builds). For follow-ups in the same folder, set continue_session. Read the files it says it wrote before you report them done.
+- Ask the user (ask_user) before a command that publishes or deploys, pushes to a remote, deletes or overwrites anything outside the workspace, installs software system-wide, changes system settings, signs in, or spends money, and say exactly what it will run. Read-only and workspace-local commands need no question.
+- Never put passwords, tokens or keys in a command line. If one is needed, hand off to the user.
+`;
+
 const DESKTOP_RULES = `
 # Working in desktop apps
 You can drive native Mac apps (the user's real apps, with their real accounts) through the desktop tools. The user is using this computer at the same time.
@@ -110,6 +130,7 @@ You can drive native Mac apps (the user's real apps, with their real accounts) t
 - When you already know the next several actions and none depends on what the one before shows (keys on a keypad, the fields of a form, a menu and then its item), make them all in one reply: one action per tool call, in order. Each still happens visibly, one after another, and the window is read once after the last. Element tokens stay valid only until the window is read again, so take them all from the same reading, and do not batch past a step that opens a dialog, changes the page or decides what you do next.
 - Act on elements in the background whenever the tools allow it. If an app ignores background input, you may bring it to the front for that single action, then let focus go back. Keep any such moment as short as possible and never hold the front window across several steps.
 - If the app is not open, open it. If it shows a sign-in, a permission prompt or a system dialog, hand off to the user.
+- Command lines go through the terminal tools (run_command, claude_code), never by typing into Terminal, iTerm or another terminal app with the desktop tools: those tools hand back the exact output and exit code.
 - Stay inside the apps your subtask needs. Do not touch Terminal or other shells, System Settings, password managers, banking or payment apps, or the Senju bar and cards, unless the user's goal names them explicitly. Leave other agents' windows alone.
 - Do not close windows or documents that were open before you started, and do not quit apps you did not launch.
 
@@ -434,7 +455,7 @@ export class Swarm {
    * @param {Function} [opts.connect]       override for tests
    * @param {Function} [opts.layout]        (count) => [{x, y, w, h}] screen rects for tiling agent windows
    */
-  constructor({ llm, config, workspace, emit, connect = connectServer, layout = null, traceDir = null, skillsDir = null, idle = null, skills = null, memory = null, team = null }) {
+  constructor({ llm, config, workspace, emit, connect = connectServer, layout = null, traceDir = null, skillsDir = null, idle = null, skills = null, memory = null, team = null, front = null }) {
     this.llm = llm;
     this.config = config;
     this.workspace = workspace;
@@ -469,6 +490,7 @@ export class Swarm {
     this.learnAbort = null;
     this.leadCtx = null;
     this.idle = idle;           // () => seconds since the user last typed or clicked, or null if unknown
+    this.front = front;         // async () => {pid, app} the user is in, or null if unknown
     this.lastDesktopAction = 0; // when an agent last acted on the desktop, to tell its input from the user's
     this.claims = new Map();    // resource -> name of the agent holding it
     this.serverContext = true;  // server-side clearing, compaction and auto-caching; switched off if the API rejects them
@@ -599,13 +621,15 @@ export class Swarm {
   // Is the user typing or clicking right now? Input the agents themselves just produced does not count.
   userActive() { return userActive(this.idle?.(), this.lastDesktopAction, this.config.typingPause ?? 2); }
 
-  // Hold a desktop action until the user pauses, so it never lands in the middle of their typing.
-  async quiet(agent, update, signal) {
-    if (!this.userActive()) return;
+  // Hold a desktop action while the user is typing or clicking, but only if it would get in their way:
+  // it aims at the app they are in, runs in the foreground, or affects the whole Mac (see collides()).
+  async quiet(agent, update, signal, tool = '', input = {}) {
+    const blocked = async () => this.userActive() && collides(tool, input, agent.target, await this.front?.() ?? null);
+    if (!(await blocked())) return;
     const before = { status: agent.status, label: agent.label };
     const limit = Date.now() + (this.config.typingWaitMax ?? 120) * 1000;
-    update({ status: 'paused', label: 'waiting for you to pause' });
-    while (this.userActive() && Date.now() < limit) {
+    update({ status: 'paused', label: WAIT_LABEL });
+    while (Date.now() < limit && await blocked()) {
       if (signal.aborted) throw new Error('cancelled');
       await new Promise((r) => setTimeout(r, 300));
     }
@@ -1004,7 +1028,8 @@ export class Swarm {
       const others = this.agents.filter((a) => a.id !== agent.id && a.live);
       const skillNotes = (this.skills ? await Promise.all(agent.skills.map((n) => this.skills.read(n))) : []).filter(Boolean).map((k) => `## ${k.name}\n${k.body}`).join('\n\n');
       const desktop = agent.servers.some((sv) => this.config.servers[sv]?.kind === 'desktop');
-      const system = [{ type: 'text', text: WORKER_SYSTEM(agent, others, this.workspace, skillNotes, desktop, Boolean(this.team)), cache_control: { type: 'ephemeral' } }];
+      const terminal = tools.some((t) => /(^|__)run_command$/.test(t.name));
+      const system = [{ type: 'text', text: WORKER_SYSTEM(agent, others, this.workspace, skillNotes, desktop, Boolean(this.team)) + (terminal ? TERMINAL_RULES : ''), cache_control: { type: 'ephemeral' } }];
       const messages = [{ role: 'user', content: 'Begin your subtask now.' }];
       const maxSteps = this.config.maxSteps ?? 300;
       const allTools = [...tools, ...BOARD_TOOLS, ...TEAM_TOOLS, ...HUMAN_TOOLS];
@@ -1187,7 +1212,9 @@ export class Swarm {
               const run = scripted || skipped ? null : async () => {
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
-                if (desktopAct) { await this.quiet(agent, update, signal); this.lastDesktopAction = Date.now(); }
+                // Background input to another app never looks like the user typing, so only the rest is noted.
+                const ownInput = desktopAct && !inBackground(hit.tool, call.input);
+                if (desktopAct) { await this.quiet(agent, update, signal, hit.tool, call.input); if (ownInput) this.lastDesktopAction = Date.now(); }
                 // A key the page shows as an on-screen button (a game keyboard, a calculator keypad): tap it with the cursor.
                 if (spec.tile === 'playwright' && hit.tool === 'browser_press_key' && this.config.pointing !== false) {
                   const tapped = await clickOnScreenKey(hit.conn, call.input?.key, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
@@ -1199,9 +1226,10 @@ export class Swarm {
                 // Only on this Mac, through the real desktop driver: never take over a teammate's screen.
                 const canShow = spec.kind === 'desktop' && !this.team && hit.conn.tools?.some((t) => t.name === 'bring_to_front');
                 // The first time a worker reads or acts on an app it did not launch (already open, maybe on another
-                // desktop), take the person's screen there so they can watch.
+                // desktop), take the person's screen there so they can watch. Not while they are typing: that would take
+                // their keyboard, so it waits for a later action.
                 const firstPid = Number.isInteger(call.input?.pid) ? call.input.pid : null;
-                if (canShow && firstPid && hit.tool !== 'launch_app' && this.config.showApps !== false && !(agent.shownPids ??= new Set()).has(firstPid) && /^(get_window_state|click|double_click|right_click|type_text|set_value|press_key|hotkey|scroll)$/.test(hit.tool)) {
+                if (canShow && firstPid && !this.userActive() && hit.tool !== 'launch_app' && this.config.showApps !== false && !(agent.shownPids ??= new Set()).has(firstPid) && /^(get_window_state|click|double_click|right_click|type_text|set_value|press_key|hotkey|scroll)$/.test(hit.tool)) {
                   agent.shownPids.add(firstPid);
                   const shown = await reveal(hit.conn, firstPid, call.input?.window_id ?? null, true).catch(() => null);
                   if (shown?.windowId) this.noteTarget(agent, { pid: firstPid, window_id: shown.windowId });
@@ -1209,7 +1237,7 @@ export class Swarm {
                 if (spec.kind === 'desktop' && this.config.pointing !== false) await pointDesk(agent, hit.tool, call.input, deskEmit);
                 const input = spec.kind === 'desktop' ? widenWindowState(hit.tool, call.input) : call.input;
                 let res = await callTool(hit.conn, hit.tool, input, signal);
-                if (desktopAct) this.lastDesktopAction = Date.now();
+                if (ownInput) this.lastDesktopAction = Date.now();
                 // On YouTube: from now on, skip each video ad with the cursor as soon as its Skip button shows.
                 if (spec.tile === 'playwright' && !res.isError && !hit.conn.adWatch && this.config.skipAds !== false && onYouTube(res, call.input)) {
                   watchAds(hit.conn, (point) => this.emit({ type: 'point', agentId: agent.id, point }), (label) => this.trace(agent.name, 'note', { note: `skipped a video ad ("${label}")` }));
@@ -1257,7 +1285,7 @@ export class Swarm {
           }
           this.trace(agent.name, 'tool', { name: call.name, isError: Boolean(out.isError), result: out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' ').slice(0, 1500) });
           this.emitStep(agent.id, call, out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' '), Boolean(out.isError), t0);
-          results.push({ type: 'tool_result', tool_use_id: call.id, content: out.content, is_error: out.isError });
+          results.push(toolResult(call.id, out.content, out.isError));
         }
         messages.push({ role: 'user', content: results });
       }

@@ -509,7 +509,7 @@ function make(scripts, extra = {}) {
   assert.match(got.claimAfter, /You hold "Word: notes\.docx"/);                                   // released when Asker finished
   assert.equal(got.leadTold, true);
   assert.ok(events.some((e) => e.type === 'agent' && e.status === 'paused' && e.label === 'paused by you'));
-  assert.ok(events.some((e) => e.type === 'agent' && e.status === 'paused' && e.label === 'waiting for you to pause'));
+  assert.ok(events.some((e) => e.type === 'agent' && e.status === 'paused' && e.label === 'waiting while you type'));
   const read = calls.find((c) => c[0] === 'get_window_state')[1], click = calls.find((c) => c[0] === 'click')[1];
   assert.ok(read < typingUntil, 'reading does not wait for the user');
   assert.ok(click >= typingUntil, 'acting waits until the user stops typing');
@@ -518,6 +518,60 @@ function make(scripts, extra = {}) {
   assert.equal(swarm.userActive(), false);
   swarm.lastDesktopAction = Date.now() - 10000;
   assert.equal(swarm.userActive(), true);
+}
+
+// 13b. While the user types in one app, an agent working in the background on another app does not wait;
+// one aimed at the app they are in does.
+{
+  const { collides } = await import('../src/desktop.js');
+  const front = { pid: 5, app: 'Notes' };
+  assert.equal(collides('click', { pid: 9 }, null, front), false, 'another app, in the background');
+  assert.equal(collides('click', { pid: 5 }, null, front), true, 'the app the user is in');
+  assert.equal(collides('click', { app: 'notes' }, null, front), true, 'named by app');
+  assert.equal(collides('click', { window_id: 3 }, { pid: 5 }, front), true, 'the window of the app it already drives');
+  assert.equal(collides('type_text', { pid: 9, delivery_mode: 'foreground' }, null, front), true, 'foreground');
+  assert.equal(collides('press_key', { key: 'a' }, null, front), true, 'no app named: keys go to the front app');
+  assert.equal(collides('move_cursor', { pid: 9, x: 1, y: 1 }, null, front), true, 'the real pointer');
+  assert.equal(collides('click', { pid: 9 }, null, null), true, 'front app unknown');
+  assert.equal(collides('run_steps', { steps: [{ tool: 'click', args: { pid: 9 } }, { tool: 'type_text', args: { pid: 9 } }] }, null, front), false);
+  assert.equal(collides('run_steps', { steps: [{ tool: 'get_window_state', args: { pid: 5 } }, { tool: 'click', args: { pid: 5 } }] }, null, front), true);
+
+  let typingUntil = 0;
+  const calls = [];
+  const desk = async (name) => ({
+    name, pid: null, close: async () => {},
+    tools: ['click'].map((n) => ({ name: n, description: n, inputSchema: { type: 'object', properties: {} } })),
+    client: { callTool: async ({ name: tool, arguments: args }) => { calls.push([tool, args.pid, Date.now()]); return { content: [{ type: 'text', text: 'ok' }] }; } },
+  });
+  const { swarm, events } = make({
+    lead: ({ turn, lastText }) => turn === 1
+      ? [use('spawn_agent', { name: 'Elsewhere', goal: 'click', servers: ['desktop'] }), use('spawn_agent', { name: 'Here', goal: 'click', servers: ['desktop'] })]
+      : /No workers are running/.test(lastText) ? say('clicked') : use('wait'),
+    Elsewhere: ({ turn }) => turn === 1 ? use('desktop__click', { pid: 9 }) : say('done'),
+    Here: ({ turn }) => turn === 1 ? use('desktop__click', { pid: 5 }) : say('done'),
+  }, { opts: {
+    config: { ...baseConfig, typingPause: 2, servers: { desktop: { command: 'x', kind: 'desktop', shared: true } } },
+    connect: (name) => desk(name),
+    idle: () => (Date.now() < typingUntil ? 0 : 30),
+    front: async () => front,
+  }, onEvent: (e) => { if (e.type === 'spawn' && e.agent.name === 'Elsewhere') typingUntil = Date.now() + 700; } });
+  await swarm.run('click while I type');
+  const at = (pid) => calls.find((c) => c[1] === pid)[2];
+  assert.ok(at(9) < typingUntil, 'a background action on another app goes ahead');
+  assert.ok(at(5) >= typingUntil, 'an action on the app the user is typing in waits');
+  assert.ok(events.some((e) => e.type === 'agent' && e.label === 'waiting while you type'));
+}
+
+// 13c. A failed tool call that returns a screenshot still makes a result the API accepts.
+{
+  const { toolResult } = await import('../src/orchestrator.js');
+  const img = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } };
+  const failed = toolResult('t1', [{ type: 'text', text: 'no such element' }, img], true);
+  assert.equal(failed.is_error, undefined, 'no error flag when an image is present');
+  assert.match(failed.content[0].text, /failed/);
+  assert.deepEqual(failed.content.at(-1), img, 'the picture is kept');
+  assert.equal(toolResult('t2', [{ type: 'text', text: 'boom' }], true).is_error, true, 'text-only errors keep the flag');
+  assert.equal(toolResult('t3', [img], false).is_error, undefined);
 }
 
 // 14. A message from the user releases a lead that is blocked on its own question.

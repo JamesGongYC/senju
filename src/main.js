@@ -7,7 +7,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { ROOT, dataDir, loadEnv, loadConfig, ensureWorkspace } from './config.js';
 import { Swarm } from './orchestrator.js';
-import { listWindows, processParents, pickWindow } from './windows.js';
+import { listWindows, processParents, pickWindow, frontApp } from './windows.js';
 import { demoLlm, demoConnect, demoConfigServers } from './demo.js';
 import { placeWindow } from './place.js';
 import { callTool } from './mcp.js';
@@ -84,6 +84,13 @@ let host = null;            // team mode: runs this computer's tools for agents 
 let awake = null;
 let area = { x: 0, y: 0, width: 1280, height: 800 };
 let tracker = null;
+// The app the user is in, asked at most every half second (agents only ask while the user is typing).
+let frontCache = { at: 0, value: null };
+async function front() {
+  if (Date.now() - frontCache.at < 500) return frontCache.value;
+  frontCache = { at: Date.now(), value: await frontApp() };
+  return frontCache.value;
+}
 let retrack = null;   // re-check window positions now (the user switched desktops)
 const moved = new Map();    // pid -> the frame an app's window had before we tiled it
 let tilingDenied = false;
@@ -209,7 +216,7 @@ function ensureSwarm() {
   if (!llm) return null;
   swarm = new Swarm({
     llm, config, workspace, emit: send, layout,
-    idle: () => powerMonitor.getSystemIdleTime(),
+    idle: () => powerMonitor.getSystemIdleTime(), front,
     traceDir: config.trace === false ? null : path.join(dataDir(), 'traces'),
     skillsDir,
     memory: config.memory === false ? null : memory,
@@ -377,7 +384,7 @@ async function switchOrg(teamId) {
 let teamRetry = null;
 async function startTeamMode() {
   if (!TEAM) return;
-  host = new ToolHost({ config, workspace, layout, idle: () => powerMonitor.getSystemIdleTime(), emit: send });
+  host = new ToolHost({ config, workspace, layout, idle: () => powerMonitor.getSystemIdleTime(), front, emit: send });
   const mine = host;
   try {
     const auth = await supabaseAuth(HUB, path.join(app.getPath('userData'), 'session.json'));

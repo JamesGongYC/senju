@@ -20,17 +20,6 @@
 .tv-bubble p { margin: 0; white-space: pre-wrap; }
 .tv-you-meta { font-size: 12px; color: var(--ink-dim); }
 
-/* Who worked when. */
-.tv-lanes { background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px 8px; display: flex; flex-direction: column; gap: 5px; }
-.tv-lane { display: grid; grid-template-columns: 96px 1fr; align-items: center; gap: 10px; cursor: pointer; }
-.tv-lane-name { font: 600 12px var(--body); color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tv-track { position: relative; height: 12px; }
-.tv-span { position: absolute; top: 4px; height: 4px; border-radius: 4px; opacity: 0.85; }
-.tv-tick { position: absolute; top: 1px; width: 2px; height: 10px; border-radius: 1px; background: var(--ink); opacity: 0.55; transform: translateX(-1px); }
-.tv-tick.err { background: var(--danger); opacity: 1; }
-.tv-tick.ask { background: var(--wait); opacity: 1; width: 4px; }
-.tv-lanes-foot { display: flex; justify-content: space-between; font: 400 11px var(--mono); color: var(--ink-dim); padding-left: 106px; }
-
 /* The lead's story. */
 .tv-flow { display: flex; flex-direction: column; gap: 10px; }
 .tv-lead { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: baseline; }
@@ -92,3 +81,83 @@
 .tv-summary-kicker { font: 400 13px var(--display); text-transform: uppercase; letter-spacing: 0.04em; color: var(--punk); }
 .tv-summary p { margin: 6px 0 0; font-size: 15px; line-height: 1.55; white-space: pre-wrap; }
 .tv-summary-facts { margin-top: 10px; font: 400 12px var(--mono); opacity: 0.85; }
+
+/* ---- The timeline: agents across, time down ---- */
+.tv-hint { font-size: 12.5px; color: var(--ink-dim); }
+.tl-wrap { overflow-x: auto; margin: 0 -4px; padding: 0 4px 6px; scrollbar-width: thin; }
+.tl-grid {
+  display: grid; column-gap: 10px; row-gap: 6px; align-items: start; position: relative; min-width: min-content;
+  transition: grid-template-columns 260ms cubic-bezier(.2, .8, .2, 1);
+}
+.tl-corner, .tl-time { font: 400 11px var(--mono); color: var(--ink-dim); text-align: right; padding-right: 4px; }
+.tl-corner { align-self: end; padding-bottom: 10px; text-transform: uppercase; letter-spacing: .06em; }
+.tl-time { padding-top: 6px; position: relative; z-index: 1; }
+.tl-time.same { opacity: 0; }
+.tl-band { align-self: stretch; background: color-mix(in srgb, var(--paper) 70%, transparent); border-radius: 8px; margin: -3px -5px; z-index: 0; }
+
+/* An agent's head. */
+.tl-head {
+  position: sticky; top: 0; z-index: 3; text-align: left; cursor: pointer; font: inherit; color: var(--ink);
+  display: flex; flex-direction: column; gap: 6px; padding: 10px 11px 9px; margin-bottom: 6px;
+  background: var(--white); border: 1px solid var(--line); border-radius: 14px;
+  border-top: 4px solid var(--agent);
+  box-shadow: 0 1px 0 rgba(20, 20, 20, .04), 0 8px 18px -14px var(--agent);
+  transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+.tl-head:hover { transform: translateY(-2px); box-shadow: 0 10px 24px -12px var(--agent); }
+.tl-head.open { background: color-mix(in srgb, var(--agent) 9%, var(--white)); }
+.tl-head.lead { --agent: var(--ink); }
+.tl-head.lead.open { background: var(--ink); color: var(--white); }
+.tl-head.lead.open .tv-count { color: color-mix(in srgb, var(--white) 70%, transparent); }
+.tl-head-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.tl-head-top b { font: 400 14px var(--display); letter-spacing: .01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tl-chev { margin-left: auto; font-size: 11px; opacity: .6; }
+.tl-orb { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--agent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent) 22%, transparent); }
+.tl-head.lead .tl-orb { background: var(--punk); box-shadow: 0 0 0 3px color-mix(in srgb, var(--punk) 35%, transparent); }
+.tl-head.live .tl-orb { animation: tl-pulse 1.3s ease-in-out infinite; }
+.tl-head-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tl-head-meta .pill { font-size: 10.5px; padding: 1px 7px; }
+.tl-device { font-size: 11px; color: var(--ink-dim); }
+
+/* A lifeline: the agent's time, top to bottom. */
+.tl-life {
+  justify-self: center; align-self: stretch; width: 3px; border-radius: 3px; z-index: 1; margin: 4px 0;
+  background: linear-gradient(var(--agent), color-mix(in srgb, var(--agent) 35%, transparent));
+}
+.tl-life.open { justify-self: start; margin-left: 6px; width: 2px; opacity: .55; }
+.tl-life.live { background: linear-gradient(var(--agent), var(--agent) 70%, transparent); box-shadow: 0 0 12px color-mix(in srgb, var(--agent) 60%, transparent); animation: tl-glow 1.8s ease-in-out infinite; }
+.tl-dotcell { justify-self: center; z-index: 2; display: grid; place-items: center; width: 28px; height: 22px; padding: 0; border: 0; background: none; cursor: pointer; }
+.tl-pip {
+  width: var(--size, 8px); height: var(--size, 8px); border-radius: 50%; background: var(--agent);
+  border: 2px solid var(--white); box-shadow: 0 0 0 1px color-mix(in srgb, var(--agent) 50%, transparent), 0 0 10px color-mix(in srgb, var(--agent) 45%, transparent);
+  transition: transform 140ms ease;
+}
+.tl-dotcell:hover .tl-pip { transform: scale(1.35); }
+.tl-pip.err { box-shadow: 0 0 0 2px var(--danger), 0 0 10px color-mix(in srgb, var(--danger) 50%, transparent); }
+.tl-pip.ask { background: var(--punk); box-shadow: 0 0 0 2px var(--ink); }
+
+/* A cell of an open trace. */
+.tl-cell { z-index: 2; min-width: 0; padding-left: 18px; position: relative; animation: tl-in 220ms ease both; }
+.tl-cell .tv-step { padding: 2px 0; }
+.tl-cell .tv-label { white-space: normal; overflow-wrap: anywhere; }
+.tl-item p { margin: 0; white-space: pre-wrap; }
+.tl-start { font-size: 13px; color: var(--ink-2); background: color-mix(in srgb, var(--agent) 8%, var(--white)); border: 1px solid color-mix(in srgb, var(--agent) 30%, transparent); border-radius: 10px; padding: 7px 10px; }
+.tl-start p { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
+.tl-start.full p { -webkit-line-clamp: unset; }
+.tl-kicker { display: block; font: 400 10.5px var(--display); text-transform: uppercase; letter-spacing: .06em; color: var(--agent); margin-bottom: 2px; }
+.tl-leadsay { font-size: 14px; }
+.tl-cell .tv-leadtool { padding-left: 0; }
+.tl-cell .tv-said { align-self: auto; max-width: none; }
+.tl-cell .tv-report { margin: 2px 0 0; }
+.tl-spawn {
+  display: inline-flex; align-items: center; gap: 7px; font: 600 12.5px var(--body); color: var(--ink); cursor: pointer;
+  background: color-mix(in srgb, var(--agent) 12%, var(--white)); border: 1px solid color-mix(in srgb, var(--agent) 45%, transparent);
+  border-radius: 999px; padding: 4px 11px 4px 9px;
+}
+.tl-spawn .tv-dot { background: var(--agent); }
+.tl-spawn:hover { background: color-mix(in srgb, var(--agent) 22%, var(--white)); }
+
+@keyframes tl-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes tl-pulse { 0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent) 22%, transparent); } 50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--agent) 0%, transparent); } }
+@keyframes tl-glow { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { .tl-grid, .tl-cell, .tl-head, .tl-life.live, .tl-orb { transition: none; animation: none; } }
