@@ -574,6 +574,31 @@ function make(scripts, extra = {}) {
   assert.equal(toolResult('t3', [img], false).is_error, undefined);
 }
 
+// 13d. A worker with the terminal installs a missing app itself (checked, from the vendor); with
+// "autoInstallApps": false it asks first instead.
+for (const auto of [true, false]) {
+  const seen = {};
+  const term = async (name) => ({
+    name, pid: null, close: async () => {},
+    tools: ['run_command'].map((n) => ({ name: n, description: n, inputSchema: { type: 'object', properties: {} } })),
+    client: { callTool: async () => ({ content: [{ type: 'text', text: 'ok' }] }) },
+  });
+  const { swarm } = make({
+    lead: ({ turn, lastText }) => turn === 1 ? use('spawn_agent', { name: 'Setup', goal: 'install Claude', servers: ['terminal'] }) : /No workers are running/.test(lastText) ? say('done') : use('wait'),
+    Setup: ({ system }) => { seen.rules = system; return say('installed'); },
+  }, { opts: { config: { ...baseConfig, ...(auto ? {} : { autoInstallApps: false }), servers: { terminal: { command: 'x', shared: true } } }, connect: (name) => term(name) } });
+  await swarm.run('install Claude');
+  assert.match(seen.rules, /# Command lines and Claude Code/);
+  if (auto) {
+    assert.match(seen.rules, /# Installing a Mac app the task needs/);
+    assert.match(seen.rules, /codesign --verify --deep --strict/);
+    assert.match(seen.rules, /installing a Mac app the task needs is the exception/);
+  } else {
+    assert.doesNotMatch(seen.rules, /Installing a Mac app/);
+    assert.match(seen.rules, /installs software system-wide, changes system settings/);
+  }
+}
+
 // 14. A message from the user releases a lead that is blocked on its own question.
 {
   const got = {};
