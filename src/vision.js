@@ -25,7 +25,7 @@ const MAX_POINTS = 12;
 export const LOOK_TOOL = {
   name: 'browser_look',
   description: 'See the page as a picture. Use it for what is drawn rather than built from page elements (a canvas game or board, a map, a chart, a drawing, a video frame), or to check how the page really looks. Returns the visible page, or with region one area of it enlarged so small details are readable; the pictures browser_click_at returns afterwards stay on that area, so when you work in one part of the page (a game board, a map) look at that part: smaller pictures are faster, and what moves elsewhere on the page (ads, videos) is left out. Positions in the picture (x to the right, y down, in its pixels, from its top-left corner) are what browser_click_at and region take. For ordinary pages prefer browser_snapshot and browser_click: they are exact and cheaper.',
-  inputSchema: {
+  input_schema: {
     type: 'object',
     properties: {
       region: {
@@ -41,7 +41,7 @@ export const LOOK_TOOL = {
 export const CLICK_AT_TOOL = {
   name: 'browser_click_at',
   description: 'Click or drag at positions in the picture browser_look last gave you, then get the picture as it is afterwards. Your cursor goes to each position in turn, so several positions in one call are fine and faster (a piece and then where it goes; several cells). It waits for the page to react and hold still before taking the new picture, and small pink rings in it show where your clicks landed, so you can see whether you hit what you meant: one call per move, with no separate look. For a real page element (a button, a link, a field) use browser_click with its ref instead.',
-  inputSchema: {
+  input_schema: {
     type: 'object',
     properties: {
       points: {
