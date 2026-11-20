@@ -121,3 +121,80 @@ export async function lookAfter(conn, agent, signal) {
     return { res, note: notes.join(' ') };
   } catch { return null; }
 }
+
+// ---- Reading an app window, shown -------------------------------------------------------------------------------
+// After a worker reads an app window (get_window_state), if text runs past its top or bottom, the window scrolls
+// under the resting cursor as a person reads it, through the driver's background scroll (the real pointer never
+// moves). Text below: read on down a couple of steps, and stay. Text only above (a chat at its newest message, as in
+// the Claude app): scroll up to where the reply starts, then back down by the same distance (the driver reports how
+// far each step went), ending where the worker left it, at the input. It plays while the model thinks; the worker's
+// next desktop action stops it first (stop()), and a chat is still put back. It only scrolls toward text that is
+// out of view: a step with nothing left to scroll is slow to fail.
+
+// Text the window shows only in part: elements cut off at its top or bottom edge come back one point tall there.
+// A few always sit at the top (sticky headers), so a handful is not enough to count.
+export function textOutOfView(sc) {
+  const b = sc?.window_bounds;
+  if (!b) return null;
+  const text = (sc.elements ?? []).filter((e) => /StaticText|Heading/.test(e.role ?? '') && e.frame);
+  const top = b.y, bottom = b.y + b.height;
+  const sliver = (e) => e.frame.h <= 2;
+  const above = text.filter((e) => (sliver(e) && Math.abs(e.frame.y - top) <= 2) || e.frame.y + e.frame.h < top).length;
+  const below = text.filter((e) => (sliver(e) && Math.abs(e.frame.y + e.frame.h - bottom) <= 2) || e.frame.y > bottom).length;
+  // Where to scroll: the biggest web or scroll area in the window, cut to the window.
+  const areas = (sc.elements ?? []).filter((e) => /AXWebArea|AXScrollArea/.test(e.role ?? '') && e.frame).sort((p, q) => q.frame.w * q.frame.h - p.frame.w * p.frame.h);
+  const f = areas[0]?.frame ?? { x: b.x, y: b.y, w: b.width, h: b.height };
+  const l = Math.max(f.x, b.x), r = Math.min(f.x + f.w, b.x + b.width), t = Math.max(f.y, top), d = Math.min(f.y + f.h, bottom);
+  return { above, below, spot: { x: Math.round((l + r) / 2), y: Math.round(t + (d - t) * 0.55) }, bounds: b, scale: sc.screenshot_scale || 1, pid: sc.pid, windowId: sc.window_id };
+}
+
+export const DESK_READ_STEPS = 2;
+export const DESK_READ_PAUSE_MS = 450;
+const MANY = 4;   // more cut-off lines than this at an edge: there is text beyond it
+
+/**
+ * Show reading an app window. turn(fn) runs fn in the desktop server's queue; busy() says to stop (the person
+ * started typing, or the job ended). Returns { done, stop }; done never rejects.
+ */
+export function readWindow(conn, sc, emit, { turn = (fn) => fn(), busy = () => false } = {}) {
+  let stopped = false, wake = null;
+  const stop = () => { stopped = true; wake?.(); };
+  const pause = (ms) => (stopped ? null : new Promise((r) => { wake = r; setTimeout(r, ms); }));
+  const done = (async () => {
+    const at = textOutOfView(sc);
+    if (!at || !Number.isInteger(at.pid) || at.windowId == null) return;
+    const x = Math.round((at.spot.x - at.bounds.x) * at.scale), y = Math.round((at.spot.y - at.bounds.y) * at.scale);
+    const step = async (direction) => {
+      if (busy()) return 0;
+      emit({ verb: 'scroll', screenX: at.spot.x, screenY: at.spot.y, dir: direction, ms: 450 });
+      await sleep(POINT_LEAD_MS);
+      const res = await turn(() => callTool(conn, 'scroll', { pid: at.pid, window_id: at.windowId, x, y, direction, amount: 6, post_action_wait: 'none' }));
+      if (!res || res.isError) return 0;
+      const said = (res.content ?? []).map((c) => c.text ?? '').join(' ');
+      return Number(said.match(/about (\d+) ?pt/)?.[1]) || (/scrolled/i.test(said) ? 1 : 0);
+    };
+    if (at.below > MANY) {
+      for (let i = 0; i < DESK_READ_STEPS && !stopped; i++) {
+        await pause(DESK_READ_PAUSE_MS);
+        if (stopped || !(await step('down'))) break;
+      }
+    } else if (at.above > MANY) {
+      let net = 0;
+      for (let i = 0; i < DESK_READ_STEPS && !stopped; i++) {
+        await pause(120);
+        if (stopped) break;
+        const moved = await step('up');
+        if (!moved) break;
+        net += moved;
+      }
+      // Back down to where it was, even when stopped (then without the pauses to read).
+      for (let i = 0; net > 0 && i < DESK_READ_STEPS + 3; i++) {
+        await pause(DESK_READ_PAUSE_MS);
+        const moved = await step('down');
+        if (!moved) break;
+        net -= moved;
+      }
+    }
+  })().catch(() => {});
+  return { done, stop };
+}

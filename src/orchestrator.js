@@ -7,8 +7,8 @@ import { connectServer, buildToolset, callTool, resolveSpec, toolName } from './
 import { pointBefore, scrollWithCursor, readPage, foundRef, SCROLL_TOOL } from './point.js';
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
-import { watchAds, onYouTube } from './adskip.js';
-import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS } from './deskpoint.js';
+import { watchAds } from './adskip.js';
+import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS, readWindow } from './deskpoint.js';
 import { READ_ONLY, noteTarget, userActive, collides, inBackground, WAIT_LABEL } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
 import { listSkills, readSkill, saveSkill } from './skills.js';
@@ -119,7 +119,7 @@ const TERMINAL_RULES = (AUTO) => `
 You have a terminal: run_command runs a shell command in a Terminal window of its own and returns its exact output and exit code; claude_code gives a coding task to Claude Code in a project folder.
 - Check the exit code and read the output before you go on. A non-zero code means it failed: read why, fix it, and try again, or report it.
 - A long-running command (a dev server, a watcher) keeps running when run_command returns. Note its command id, read it with read_output, and stop it with stop_command when you are done with it.
-- claude_code: write the task the way you would brief a developer (what to build, where the spec is, how to check it). Set allow_commands only when it needs to run things (installs, tests, builds). For follow-ups in the same folder, set continue_session: it is typed into the same Claude Code window. Read the files it says it wrote before you report them done.
+- claude_code: write the task the way you would brief a developer (what to build, where the spec is, how to check it). Set allow_commands only when it needs to run things (installs, tests, builds). When the user names a model or an effort level for Claude Code, pass them as model and effort (lower effort finishes sooner). For follow-ups in the same folder, set continue_session: it is typed into the same Claude Code window. Read the files it says it wrote before you report them done.
 - Claude Code runs in its own interface in a Terminal window: Senju opens it and types your task into its prompt box, and the user can watch and step in. Never open Claude Code or type into it with the desktop tools; use claude_code, then read_output, send_input (to answer a permission question it asks) and stop_command (to interrupt it).
 - Ask the user (ask_user) before a command that publishes or deploys, pushes to a remote, deletes or overwrites anything outside the workspace, installs software system-wide${AUTO}, changes system settings, signs in, or spends money, and say exactly what it will run. Read-only and workspace-local commands need no question.
 - Never put passwords, tokens or keys in a command line. If one is needed, hand off to the user.
@@ -186,7 +186,7 @@ Shared workspace folder for files: ${workspace}
 - When a game or tool shows its own on-screen keyboard or keypad (Wordle, a calculator), click its keys with browser_click, one key per call, and click its Enter key to submit each row, rather than typing on the keyboard.
 - When your subtask is to find a website, page, profile or link, finish by opening it the way a person would: click the matching search result's link with browser_click (not browser_navigate to the address), check the page that opens is the right one, and leave it open on screen. Do not stop at reading or reporting the address.
 - Clear anything that covers the page yourself, without asking the user: a cookie banner (accept or reject it), a newsletter or sign-up pop-up, an ad overlay or a chat bubble in the way. Click its close, "No thanks" or accept button with browser_click so the person sees the cursor do it, then carry on. Never close a box that asks the user to approve, pay or sign in for your task.
-- The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option, browser_scroll), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate, but never use a script to click, type, scroll or play for you, and never do many actions in one call.
+- The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option, browser_scroll), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate; when checking a page, gather every value you need in one browser_evaluate that returns an object, not one call per check, since each call costs a round trip of a few seconds. But never use a script to click, type, scroll or play for you, and never do many actions in one call.
 - Waiting for a page (a reply being written, a build, an upload): wait for what shows it is done, with browser_wait_for and text (words that appear when it is ready) or textGone (a "Stop", "Loading" or "Generating" label that goes away), not a fixed time. A fixed wait only for a few seconds at a time, when nothing on the page tells you.
 - The swarm shares a board. Use board_post to share a finding or partial result another agent could use now, without waiting until you finish. Posts by others reach you automatically on your next step, marked "New on the shared board"; use them if relevant and ignore them otherwise. board_read shows the whole board.
 - Before each tool call, say in at most eight words what you are doing, as a short plain sentence ("Opening the Claude app."). When the user has written to you, answer them first in full, natural sentences instead.
@@ -194,7 +194,8 @@ Shared workspace folder for files: ${workspace}
 - Long jobs: your older tool results are cleared from view as you go, and your history may be replaced by a summary. Before that can cost you anything, write down what you will need later: post key findings to the board, and save long work in progress to a file in the workspace folder when you have a files tool.
 - If your history has been summarized, trust the summary, re-check the current page or file, and carry on from the next step. Do not start over.
 - When finished, reply with a final report and call no more tools. Only stop when your subtask is actually complete or you are truly blocked; if you stop early, say exactly what is done and what remains.
-- End your final report with a short "Lessons" section for future jobs: the method that worked for anything that took trial and error (name the exact tool and how you used it), the dead ends, and what you needed from the user. Methods only: no passwords, codes, or personal details.
+- Keep the final report short, about 200 words at most: the results first (the numbers, file paths, URLs, what was and was not checked), then only what the agents waiting on you need to know. Others wait while you write it, so leave out anything they can read from the files themselves.
+- End your final report with a short "Lessons" section for future jobs, at most three one-line bullets: the method that worked for anything that took trial and error (name the exact tool and how you used it), the dead ends, and what you needed from the user. Methods only: no passwords, codes, or personal details.
 
 # Working with the other agents
 ${agent.dependsOn.length ? `You depend on: ${agent.dependsOn.map((n) => `"${n}"`).join(', ')}. Start now with any setup that does not need their results, such as opening your site and getting the user signed in. When you need their results, call wait_for. It blocks until they finish and returns their final reports. Do not guess what they will produce, and do not redo their work while you wait.` : 'You do not depend on any other agent. If you later find you need another agent\'s result, call wait_for.'}
@@ -734,7 +735,12 @@ export class Swarm {
   }
 
   // The lead's tools, rebuilt from whatever servers are connected right now.
-  leadToolset() { return leadTools(Object.keys(this.catalog ?? {}), Boolean(this.memory)); }
+  // During the job the lead has no save_skill: writing a skill before the final answer kept the user waiting
+  // (7-11 s at the very end). It saves skills in the retrospective, after the answer is out.
+  leadToolset(retro = false) {
+    const tools = leadTools(Object.keys(this.catalog ?? {}), Boolean(this.memory));
+    return retro ? tools : tools.filter((t) => t.name !== 'save_skill');
+  }
 
   describeServer(name) {
     const spec = this.config.servers[name] ?? {};
@@ -783,7 +789,7 @@ export class Swarm {
   // After a job: the lead looks back and writes what was learned into a skill.
   // Runs in the background so the user is not kept waiting for it.
   async learn({ messages, system }) {
-    const tools = this.leadToolset();
+    const tools = this.leadToolset(true);
     const signal = (this.learnAbort = new AbortController()).signal;
     this.emit({ type: 'lead', status: 'thinking', label: 'writing down what it learned' });
     try {
@@ -1276,8 +1282,8 @@ export class Swarm {
               else if (scriptScroll) { out = say(`Not run: browser_evaluate is for reading the page only, and a script that scrolls moves the page with no cursor to watch. Scroll with ${toolName(hit.conn.name, 'browser_scroll')} (a direction, or a target ref to bring into view), then read the page again.`, true); }
               const pointEmit = (point) => this.emit({ type: 'point', agentId: agent.id, point });
               const run = scripted || skipped || scriptScroll ? null : async () => {
-                // The cursor may still be reading this page (and scrolling it back): act once it is done.
-                if (hit.conn.reading) await Promise.race([hit.conn.reading, new Promise((r) => setTimeout(r, 3000))]);
+                // The cursor may still be reading this window: stop it (a chat is put back at its bottom) and act.
+                if (hit.conn.reading) { hit.conn.stopReading?.(); await Promise.race([hit.conn.reading, new Promise((r) => setTimeout(r, 3000))]); }
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 // Background input to another app never looks like the user typing, so only the rest is noted.
@@ -1314,12 +1320,29 @@ export class Swarm {
                 const onPoint = hit.conn.name === 'terminal' && !this.team && this.config.pointing !== false ? pointEmit : null;
                 let res = await callTool(hit.conn, hit.tool, input, signal, onPoint);
                 if (ownInput) this.lastDesktopAction = Date.now();
-                // On YouTube: from now on, skip each video ad with the cursor as soon as its Skip button shows.
-                if (spec.tile === 'playwright' && !res.isError && !hit.conn.adWatch && this.config.skipAds !== false && onYouTube(res, call.input)) {
-                  watchAds(hit.conn, (point) => this.emit({ type: 'point', agentId: agent.id, point }), (label) => this.trace(agent.name, 'note', { note: `skipped a video ad ("${label}")` }));
+                // From now on, close each ad that gets in the way (a video ad's Skip button, an ad over the page) with
+                // the cursor as soon as it shows (src/adskip.js), and say so with the worker's next result there.
+                if (spec.tile === 'playwright' && !res.isError && !hit.conn.adWatch && this.config.skipAds !== false) {
+                  const conn = hit.conn;
+                  watchAds(conn, (point) => this.emit({ type: 'point', agentId: agent.id, point }), (label) => {
+                    this.trace(agent.name, 'note', { note: `closed an ad ("${label}")` });
+                    (conn.adNotes ??= []).push(label);
+                  });
+                }
+                if (spec.tile === 'playwright' && hit.conn.adNotes?.length) {
+                  const which = hit.conn.adNotes.splice(0).map((l) => `"${l}"`).join(', ');
+                  res = { ...res, content: [...(res.content ?? []), { type: 'text', text: `(Meanwhile an ad in the way was closed for you with ${which}. If the page looks different, read it again.)` }] };
                 }
                 if (spec.kind === 'desktop') {
                   rememberFrames(agent, hit.tool, res);
+                  // It read an app window with text out of view: scroll it under the cursor while the model thinks
+                  // (src/deskpoint.js). On this Mac only, and never while the person is typing or clicking.
+                  if (hit.tool === 'get_window_state' && canShow && !calls.slice(callIndex + 1).some((c) => lookup.get(c.name)?.conn === hit.conn) && !res.isError && this.config.pointing !== false && this.config.showReading !== false && !this.userActive()) {
+                    const reading = readWindow(hit.conn, res.structured, pointEmit, { turn: (fn) => this.inTurn(hit.conn, fn), busy: () => this.userActive() || signal.aborted });
+                    agent.deskReading = reading.done;
+                    agent.stopDeskReading = reading.stop;
+                    reading.done.finally(() => { if (agent.deskReading === reading.done) { agent.deskReading = null; agent.stopDeskReading = null; } });
+                  }
                   // A launched app should be seen opening: show its window and let the cursor and slot follow it.
                   if (canShow && hit.tool === 'launch_app' && !res.isError) {
                     const shown = await showLaunched(hit.conn, res);
@@ -1365,6 +1388,9 @@ export class Swarm {
                 }
                 return res;
               };
+              // Still reading this agent's app window: stop it (a chat goes back to its bottom) before acting. Outside
+              // the serial queue, since the reading's own steps wait in that queue.
+              if (run && agent.deskReading && spec.kind === 'desktop') { agent.stopDeskReading?.(); await Promise.race([agent.deskReading, new Promise((r) => setTimeout(r, 4000))]); }
               if (run) out = spec.serial ? await this.inTurn(hit.conn, run) : await run();
             }
           }

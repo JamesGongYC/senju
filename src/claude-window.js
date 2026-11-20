@@ -12,6 +12,7 @@
 //   read from the transcript.
 // - The cursor: the terminal server sends points (screen positions of the window's lines) back to the app as
 //   progress notifications, and the app moves the agent's cursor there.
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -339,8 +340,25 @@ end tell`);
     this.quit();
     this.closed = true;
     await sleep(800);
-    if (this.windowId) await this.osascript(`tell application "Terminal" to close (every window whose id is ${this.windowId})`).catch(() => {});
+    if (this.windowId) await closeIdleWindow(this.osascript, this.windowId).catch(() => {});
   }
+}
+
+// Close a Terminal window only when nothing but its shell is left on it. Closing one that still runs something
+// (a server started in the background, say) makes Terminal ask "terminate running processes?", and while that
+// sheet is up Terminal answers no scripting at all: every later window would wait out its timeout. Terminal's
+// own process list leaves out background jobs, so this asks ps about every process on the window's tty.
+const SHELLS = new Set(['login', 'zsh', 'bash', 'sh', 'tee', 'cat', 'ps']);
+export async function closeIdleWindow(osascript, windowId) {
+  const id = Number(windowId);
+  const tty = await osascript(`tell application "Terminal" to get tty of tab 1 of (first window whose id is ${id})`);
+  if (!/^\/dev\/ttys\d+$/.test(tty)) return false;
+  const procs = await new Promise((resolve) => execFile('ps', ['-t', tty.slice(5), '-o', 'comm='], { timeout: 3000 }, (err, out) => resolve(err ? null : out)));
+  if (procs == null) return false;
+  const busy = procs.split('\n').map((c) => path.basename(c.trim()).replace(/^-/, '')).filter((c) => c && !SHELLS.has(c));
+  if (busy.length) return false;
+  await osascript(`tell application "Terminal" to close (every window whose id is ${id})`);
+  return true;
 }
 
 const TRUST = /trust this folder|directory you created or one you trust|Do you trust/i;
