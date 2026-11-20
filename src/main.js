@@ -113,6 +113,7 @@ function notify(title, body) {
 // select, the middle of the area that scrolls for scroll, or just the verb for open (address bar), back (back button) and key (stay put). The cursor glides there
 // and STAYS, relative to that agent's window, until the next point: it never snaps back to a parking spot.
 const pointing = new Map();   // agentId -> { dx, dy } from its window's top-left, or { x, y } when there is no window
+const frames = new Map();     // agentId -> the browser window frame (screen points) its last measured point was in
 const chromeTops = new Map(); // agentId -> height of the tab and address bars in that window, from measured points
 let lastTargets = {};
 const clampX = (x) => Math.max(0, Math.min(area.width - 20, x));
@@ -132,6 +133,11 @@ function cursorMove(agentId, point) {
   const scale = t?.rect && point?.windowW ? t.rect.w / point.windowW : 1;
   if (Number.isFinite(point?.chromeTop)) chromeTops.set(agentId, point.chromeTop);
   const verb = point?.verb;
+  // Reading: skim the lines of the page (or app window) it reads; rect is in screen points.
+  if (verb === 'read' && point.rect && Number.isFinite(point.rect.screenX)) {
+    const r = point.rect;
+    return { kind: 'read', ms: Number(point.ms) || 650, rect: { x: r.screenX - area.x, y: r.screenY - area.y, w: r.w, h: r.h } };
+  }
   if (verb === 'open' || verb === 'back') {
     if (!t?.rect) return null;
     // Chrome's address bar sits about 25 px above the page; the back button is at its left end.
@@ -163,9 +169,15 @@ const send = (event) => {
   if (!win || win.isDestroyed()) return;
   if (event.type === 'point') {
     if (lastTargets[event.agentId]?.elsewhere) return;   // acting on another desktop: nothing to show here
+    const pt = event.point;
+    // A measured point says which window it is in: keep the cursor with that window, even if the agent has others.
+    if (Number.isFinite(pt?.screenX) && Number.isFinite(pt?.x) && pt.windowW) frames.set(event.agentId, { x: pt.screenX - pt.x, y: pt.screenY - pt.y, w: pt.windowW, h: pt.windowH });
     const move = cursorMove(event.agentId, event.point);
     if (!move) return;
-    const rect = lastTargets[event.agentId]?.rect;
+    // A skim ends where it began, so where the cursor rests does not change.
+    if (move.kind === 'read') return win.webContents.send('swarm:event', { type: 'cursor', agentId: event.agentId, ...move });
+    const f = Number.isFinite(pt?.screenX) ? frames.get(event.agentId) : null;
+    const rect = f ? { x: f.x - area.x, y: f.y - area.y, w: f.w, h: f.h } : lastTargets[event.agentId]?.rect;
     pointing.set(event.agentId, rect ? { dx: move.x - rect.x, dy: move.y - rect.y } : { x: move.x, y: move.y });
     lastTargets = { ...lastTargets, [event.agentId]: { ...(lastTargets[event.agentId] ?? {}), x: move.x, y: move.y } };
     win.webContents.send('swarm:event', { type: 'cursor', agentId: event.agentId, ...move });
@@ -526,6 +538,7 @@ function startTracking() {
   stopTracking();
   pointing.clear();   // a new job: cursors start from their windows again
   chromeTops.clear();
+  frames.clear();
   // One look at a time: listing windows can take a while when the Mac is busy, and looks must not pile up.
   let ticking = false;
   const tick = async () => {
@@ -542,7 +555,10 @@ function startTracking() {
       if (TEAM && agent.device && agent.device !== cloud?.device.id) return;
       const appName = agent.server ? config.servers[agent.server]?.app : null;
       // The agent's own window if it has one, else the app's window, else its tile slot.
-      const own = agent.pids.length ? pickWindow(agent, null, windows, parents, i) : null;
+      const f = frames.get(agent.id);
+      const near = (a, b) => Math.abs(a - b) <= 4;
+      const same = f ? windows.find((w) => w.onScreen !== false && near(w.x, f.x) && near(w.y, f.y) && near(w.w, f.w) && near(w.h, f.h)) : null;
+      const own = same ?? (agent.pids.length ? pickWindow(agent, null, windows, parents, i) : null);
       const w = own ?? (agent.server ? pickWindow(agent, appName, windows, parents, i) : null) ?? agent.slot;
       // Its window is on another desktop (Space), or minimized: the overlay shows on every desktop,
       // so hide the cursor rather than leave it over windows it is not working in.
@@ -619,6 +635,7 @@ app.whenReady().then(() => {
     if (isRunning()) return send({ type: 'notice', message: 'A job is running. Stop it first, then reset.' });
     pointing.clear();
     chromeTops.clear();
+    frames.clear();
     lastTargets = {};
     if (!TEAM && swarm) { swarm.lastJob = null; await swarm.closeKept().catch(() => {}); }
     current = null;   // the next goal starts a new session

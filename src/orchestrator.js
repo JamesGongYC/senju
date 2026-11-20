@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { connectServer, buildToolset, callTool, resolveSpec, toolName } from './mcp.js';
-import { pointBefore, scrollWithCursor, SCROLL_TOOL } from './point.js';
+import { pointBefore, scrollWithCursor, readPage, SCROLL_TOOL } from './point.js';
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds, onYouTube } from './adskip.js';
@@ -1258,7 +1258,10 @@ export class Swarm {
               if (skipped) out = say('Not run: an earlier action in this reply failed, so the rest of the batch was stopped. Look at the window state returned with that failure and decide again.', true);
               else if (scripted) { out = say('Not run: browser_evaluate is for reading the page only. Do each click with browser_click, each entry with browser_type and each key with browser_press_key, one action per call, so the person can watch your cursor do it.', true); }
               else if (scriptScroll) { out = say(`Not run: browser_evaluate is for reading the page only, and a script that scrolls moves the page with no cursor to watch. Scroll with ${toolName(hit.conn.name, 'browser_scroll')} (a direction, or a target ref to bring into view), then read the page again.`, true); }
+              const pointEmit = (point) => this.emit({ type: 'point', agentId: agent.id, point });
               const run = scripted || skipped || scriptScroll ? null : async () => {
+                // The cursor may still be reading this page (and scrolling it back): act once it is done.
+                if (hit.conn.reading) await Promise.race([hit.conn.reading, new Promise((r) => setTimeout(r, 3000))]);
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 // Background input to another app never looks like the user typing, so only the rest is noted.
@@ -1299,6 +1302,12 @@ export class Swarm {
                 }
                 if (spec.kind === 'desktop') {
                   rememberFrames(agent, hit.tool, res);
+                  // Reading an app window: the cursor skims it while the model thinks.
+                  if (hit.tool === 'get_window_state' && !res.isError && this.config.pointing !== false && this.config.showReading !== false) {
+                    const w = agent.deskWindows?.get(res.structured?.window_id)?.bounds;
+                    const ww = w?.width ?? w?.w, wh = w?.height ?? w?.h;
+                    if (w && ww > 80 && wh > 80) pointEmit({ verb: 'read', rect: { screenX: w.x, screenY: w.y + 28, w: ww, h: wh - 28 }, ms: 650 });
+                  }
                   // A launched app should be seen opening: show its window and let the cursor and slot follow it.
                   if (canShow && hit.tool === 'launch_app' && !res.isError) {
                     const shown = await showLaunched(hit.conn, res);
@@ -1330,8 +1339,13 @@ export class Swarm {
                   const cleared = await clearPopups(hit.conn, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
                   if (cleared?.result) {
                     this.trace(agent.name, 'note', { note: `closed ${cleared.closed.join(', ')}` });
-                    return { ...cleared.result, content: [{ type: 'text', text: `Opened ${call.input?.url ?? 'the page'}. It opened under a ${cleared.closed.join(' and then a ')}, so that was closed for you. The page now:` }, ...cleared.result.content] };
+                    res = { ...cleared.result, content: [{ type: 'text', text: `Opened ${call.input?.url ?? 'the page'}. It opened under a ${cleared.closed.join(' and then a ')}, so that was closed for you. The page now:` }, ...cleared.result.content] };
                   }
+                }
+                // It read the page: the cursor skims it, scrolling down through a long page and back (src/point.js).
+                // Not awaited, so it plays while the model thinks; only after the last call on this window in the reply.
+                if (spec.tile === 'playwright' && this.config.pointing !== false && this.config.showReading !== false && !res.isError && lastHere && /^browser_(navigate|navigate_back|snapshot|take_screenshot|find|evaluate)$/.test(hit.tool)) {
+                  readPage(hit.conn, pointEmit, { scroll: /^browser_(navigate|snapshot)$/.test(hit.tool) });
                 }
                 return res;
               };

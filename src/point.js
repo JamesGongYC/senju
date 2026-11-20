@@ -3,20 +3,69 @@
 // moment so the cursor in the overlay gets there before the action does. Best effort: it never blocks the action.
 import { callTool } from './mcp.js';
 
-// Runs in the page on the element: return its centre in CSS px from the top-left of the browser window (x, y,
-// past the tab and address bars), the same point on the screen (screenX, screenY), the window's outer size, the
-// element's size (w, h), the height of the tab and address bars (chromeTop), and whether the centre is in view.
-// It does not scroll: an element out of view is first scrolled to by the cursor (scrollWithCursor).
-const MEASURE = `(el) => {
+// Where an element is, as { box, clipped, rect, m }:
+// - box: its bounding box in the TOP page's viewport (CSS px), so an element inside an iframe (claude.ai, mail
+//   clients, embedded editors) is placed where it really is, not where it sits inside its frame;
+// - clipped: whether its centre is hidden, out of its frame's viewport or outside a scrolling container;
+// - rect: its top-left inside its own frame (to place scrolling inside a frame);
+// - m: the browser window: screen position, outer and inner size (for the tab and address bars and page zoom).
+// Measured with Playwright itself (browser_run_code_unsafe, which agents never get) so frames are handled; a
+// server without it is measured from inside the page, which is exact for elements not in a frame. No scrolling.
+const IN_FRAME = `(el) => {
   const r = el.getBoundingClientRect();
-  const side = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-  const top = Math.max(0, window.outerHeight - window.innerHeight - side);
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-  const x = Math.round(side + cx), y = Math.round(top + cy);
-  return { x, y, screenX: Math.round(window.screenX + x), screenY: Math.round(window.screenY + y), windowW: window.outerWidth, windowH: window.outerHeight,
-    w: Math.round(r.width), h: Math.round(r.height), chromeTop: Math.round(top),
-    inView: r.width > 0 && r.height > 0 && cx >= 0 && cy >= 0 && cx <= window.innerWidth && cy <= window.innerHeight };
+  let clipped = cx < 0 || cy < 0 || cx > innerWidth || cy > innerHeight;
+  for (let n = el.parentElement; n && !clipped && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+    const s = getComputedStyle(n);
+    if (!/auto|scroll|hidden|clip/.test(s.overflowX + s.overflowY)) continue;
+    const p = n.getBoundingClientRect();
+    if (cx < p.left || cx > p.right || cy < p.top || cy > p.bottom) clipped = true;
+  }
+  return { clipped, rect: { left: r.left, top: r.top, width: r.width, height: r.height } };
 }`;
+const METRICS = `() => ({ sx: screenX, sy: screenY, ow: outerWidth, oh: outerHeight, iw: innerWidth, ih: innerHeight })`;
+const LOCATE = (target) => `async (page) => {
+  const t = ${JSON.stringify(String(target))};
+  const loc = page.locator(/^(f\\d+)?e\\d+$/.test(t) ? 'aria-ref=' + t : t).first();
+  const box = await loc.boundingBox({ timeout: 1500 });
+  if (!box) return null;
+  const inner = await loc.evaluate(${IN_FRAME}, null, { timeout: 1500 }).catch(() => ({ clipped: false, rect: null }));
+  return { box, ...inner, m: await page.evaluate(${METRICS}) };
+}`;
+const MEASURE = `(el) => {
+  const inner = (${IN_FRAME})(el);
+  const r = inner.rect;
+  return { box: { x: r.left, y: r.top, width: r.width, height: r.height }, ...inner, m: (${METRICS})() };
+}`;
+
+// A point in the top page's viewport (CSS px) as the cursor needs it: from the window's top-left in screen points
+// (x, y, past the tab and address bars), on the screen (screenX, screenY), the window's size and the bars' height.
+// Page zoom (Cmd +/-) scales CSS px to points; on a Mac the page fills the window's width, which gives the zoom.
+export function toScreen(m, cssX, cssY) {
+  const raw = m.iw > 0 ? m.ow / m.iw : 1;
+  const z = raw > 0.3 && raw < 3 && Math.abs(raw - 1) > 0.02 ? raw : 1;
+  const side = z === 1 ? Math.max(0, (m.ow - m.iw) / 2) : 0;
+  const top = Math.max(0, m.oh - m.ih * z - side);
+  const x = Math.round(side + cssX * z), y = Math.round(top + cssY * z);
+  return { x, y, screenX: Math.round(m.sx + x), screenY: Math.round(m.sy + y), windowW: m.ow, windowH: m.oh, chromeTop: Math.round(top), z };
+}
+
+const canLocate = (conn) => conn.tools?.some((t) => t.name === 'browser_run_code_unsafe');
+async function locate(conn, ref, element, signal) {
+  const res = canLocate(conn)
+    ? await within(callTool(conn, 'browser_run_code_unsafe', { code: LOCATE(ref) }, signal), MEASURE_MAX_MS)
+    : await within(callTool(conn, 'browser_evaluate', { element, target: ref, ref, function: MEASURE }, signal), MEASURE_MAX_MS);
+  const at = res && !res.isError ? evalResult(text(res)) : null;
+  return at?.box && at.m && Number.isFinite(at.box.x) ? at : null;
+}
+
+// The cursor's point for an element: its centre, its width in points, and whether it is in view.
+function elementPoint(at) {
+  const { box, m } = at;
+  const p = toScreen(m, box.x + box.width / 2, box.y + box.height / 2);
+  const inTop = box.x + box.width / 2 >= 0 && box.y + box.height / 2 >= 0 && box.x + box.width / 2 <= m.iw && box.y + box.height / 2 <= m.ih;
+  return { ...p, w: Math.round(box.width * p.z), h: Math.round(box.height * p.z), inView: box.width > 0 && box.height > 0 && inTop && !at.clipped };
+}
 
 // Typing that people can watch: the text appears a few letters at a time, at most TYPE_MAX_MS in all, then the
 // real browser_type sets it exactly. Field types that cannot hold part of a value are filled at once, and so are
@@ -47,7 +96,7 @@ export function evalResult(text) {
   try { return m ? JSON.parse(m[1]) : null; } catch { return null; }
 }
 
-export const POINT_LEAD_MS = 160;   // head start for the cursor's glide
+export const POINT_LEAD_MS = 200;   // head start for the cursor's glide (the overlay's glides take 100-190 ms)
 const MEASURE_MAX_MS = 2000;
 export const pointLeadMs = (point) => (point?.verb === 'key' ? 0 : POINT_LEAD_MS + (point?.verb === 'open' ? Number(point.typeMs) || 0 : 0));
 
@@ -75,16 +124,13 @@ export async function pointBefore(conn, tool, args, emit, signal) {
     if (ELEMENT_VERBS[tool] && ref) {
       const verb = ELEMENT_VERBS[tool];
       const element = String(args.element ?? 'element');
-      const measure = async () => {
-        const res = await within(callTool(conn, 'browser_evaluate', { element, target: ref, ref, function: MEASURE }, signal), MEASURE_MAX_MS);
-        return res && !res.isError ? evalResult(text(res)) : null;
-      };
-      let at = await measure();
-      if (!at || !Number.isFinite(at.x)) return;
+      let found = await locate(conn, ref, element, signal);
+      if (!found) return;
+      let at = elementPoint(found);
       // Out of view: the cursor scrolls the page to it first, as a person would, instead of the page jumping.
       if (at.inView === false && at.w > 0 && at.h > 0) {
-        const scrolled = await scrollWithCursor(conn, { target: ref, element }, emit, signal);
-        if (scrolled?.moved) at = (await measure()) ?? at;
+        const scrolled = await scrollWithCursor(conn, { target: ref, element }, emit, signal, found);
+        if (scrolled?.moved) { found = (await locate(conn, ref, element, signal)) ?? found; at = elementPoint(found); }
       }
       const typed = verb === 'type' ? String(args.text ?? '') : '';
       point = { verb, ...at, ...(verb === 'type' ? { chars: typed.length, typeMs: typeMs(typed.length) } : {}) };
@@ -158,11 +204,9 @@ const SCROLL_PLAN = (direction, pages) => `(el) => {
     if (e.top >= vt && e.bottom <= vb && e.left >= vl && e.right <= vr) return { inView: true };
     toward = e.top < vt ? 'up' : e.bottom > vb ? 'down' : e.left < vl ? 'left' : 'right';
   }
-  const side = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-  const top = Math.max(0, window.outerHeight - window.innerHeight - side);
-  const x = Math.round(side + (vl + vr) / 2), y = Math.round(top + vt + (vb - vt) * 0.55);
   const span = axis === 'y' ? vb - vt : vr - vl;
-  return { x, y, screenX: Math.round(window.screenX + x), screenY: Math.round(window.screenY + y), windowW: window.outerWidth, windowH: window.outerHeight, chromeTop: Math.round(top),
+  const er = el ? el.getBoundingClientRect() : null;
+  return { cx: (vl + vr) / 2, cy: vt + (vb - vt) * 0.55, el: er ? { left: er.left, top: er.top } : null, m: (${METRICS})(),
     dir: toward, toView: Boolean(el && !dir), delta: Math.round(Math.min(10, Math.max(0.1, pages)) * span * 0.85), page: !box };
 }`;
 
@@ -194,7 +238,7 @@ const say = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isE
  * Scroll with the ghost cursor. args: browser_scroll's input ({ direction?, pages?, target?, element? }).
  * Returns a tool result with .moved set when anything scrolled. Never throws.
  */
-export async function scrollWithCursor(conn, args, emit, signal) {
+export async function scrollWithCursor(conn, args, emit, signal, known = null) {
   try {
     const ref = args?.target ?? args?.ref;
     const element = String(args?.element ?? 'The element');
@@ -206,8 +250,15 @@ export async function scrollWithCursor(conn, args, emit, signal) {
     if (!plan) return say('Could not scroll here.', true);
     if (plan.error) return say(`Not scrolled: ${plan.error}`, true);
     if (plan.inView) return { ...say(`${element} is already in view.`), moved: false };
-    if (Number.isFinite(plan.x)) {
-      emit({ verb: 'scroll', ...plan, ms: SCROLL_MS });
+    // The plan is in its frame's own coordinates. In a frame, where the target really is on the page gives the
+    // frame's offset (and the window's metrics come from the top page).
+    let dx = 0, dy = 0, m = plan.m;
+    if (ref && plan.el) {
+      const at = known ?? await locate(conn, ref, element, signal);
+      if (at?.box && at.m) { dx = at.box.x - plan.el.left; dy = at.box.y - plan.el.top; m = at.m; }
+    }
+    if (Number.isFinite(plan.cx) && m) {
+      emit({ verb: 'scroll', ...toScreen(m, plan.cx + dx, plan.cy + dy), dir: plan.dir, ms: SCROLL_MS });
       await sleep(POINT_LEAD_MS, signal);
     }
     const ran = await within(callTool(conn, 'browser_evaluate', { ...on, function: SCROLL_RUN(plan) }, signal), MEASURE_MAX_MS + 1500);
@@ -222,4 +273,52 @@ export async function scrollWithCursor(conn, args, emit, signal) {
   } catch (err) {
     return say(`Could not scroll: ${err?.message ?? err}`, true);
   }
+}
+
+// ---- Reading, shown --------------------------------------------------------------------------------------------
+// When a worker reads a page (opening it, a snapshot), the cursor skims the text, and on a page longer than the
+// window the page scrolls down under it as it reads, then back to where it was. It runs while the model thinks
+// about what it read, so it costs no time; the worker's next action on that window waits for it to finish
+// (conn.reading), and the page is left exactly as it was found. Each page is read this way once.
+
+const READ_PLAN = `() => {
+  const root = document.scrollingElement || document.documentElement;
+  const room = root.scrollHeight - innerHeight;
+  const bodyScrolls = getComputedStyle(document.body).overflowY !== 'hidden' && getComputedStyle(root).overflowY !== 'hidden';
+  return { url: location.href, y0: root.scrollTop, room: bodyScrolls ? Math.max(0, room - root.scrollTop) : 0, ih: innerHeight, iw: innerWidth, m: (${METRICS})() };
+}`;
+const READ_RUN = (down, y0) => `async () => {
+  const root = document.scrollingElement || document.documentElement;
+  const rest = (ms) => new Promise((resolve) => { let done = false; const end = () => { if (!done) { done = true; resolve(); } }; document.addEventListener('scrollend', end, { once: true }); setTimeout(end, ms); });
+  root.scrollBy({ top: ${Math.round(down)}, behavior: 'smooth' });
+  await rest(900);
+  await new Promise((r) => setTimeout(r, 220));
+  root.scrollTo({ top: ${Math.round(y0)}, behavior: 'smooth' });
+  await rest(900);
+  if (Math.abs(root.scrollTop - ${Math.round(y0)}) > 2) root.scrollTo({ top: ${Math.round(y0)} });
+  return root.scrollTop;
+}`;
+export const READ_MS = 1300;      // a skim with scrolling; a skim alone takes SKIM_MS
+export const SKIM_MS = 650;
+
+/**
+ * Show the worker reading its page. scroll: false only skims (after a screenshot or a script that reads).
+ * Returns a promise for when the page is back as it was; never rejects.
+ */
+export function readPage(conn, emit, { scroll = true } = {}) {
+  const run = (async () => {
+    const planned = await within(callTool(conn, 'browser_evaluate', { function: READ_PLAN }), MEASURE_MAX_MS);
+    const plan = planned && !planned.isError ? evalResult(text(planned)) : null;
+    if (!plan?.m) return;
+    const tl = toScreen(plan.m, 0, 0), br = toScreen(plan.m, plan.iw, plan.ih);
+    const rect = { screenX: tl.screenX, screenY: tl.screenY, w: br.screenX - tl.screenX, h: br.screenY - tl.screenY };
+    const seen = (conn.readPages ??= new Set());
+    const scrolls = scroll && plan.room > plan.ih * 0.4 && !seen.has(plan.url);
+    seen.add(plan.url);
+    emit({ verb: 'read', rect, ms: scrolls ? READ_MS : SKIM_MS });
+    if (scrolls) await within(callTool(conn, 'browser_evaluate', { function: READ_RUN(Math.min(plan.room, plan.ih * 1.5), plan.y0) }), 3000);
+  })().catch(() => {});
+  conn.reading = run;
+  run.finally(() => { if (conn.reading === run) conn.reading = null; });
+  return run;
 }

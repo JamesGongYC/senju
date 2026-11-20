@@ -71,26 +71,80 @@ function cursorSvg(color) {
     `<path d="M8 3.5h8M12 3.5v17M8 20.5h8" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round"/></svg>`;
 }
 
-// One continuous glide from wherever the cursor is now (CSS restarts a transition from the current spot, even
-// mid-flight). Quick but easy to follow: 160 to 380 ms by distance. Returns the glide time.
-function moveCursor(agent, spot, ms, easing = 'cubic-bezier(0.25, 0.8, 0.35, 1)') {
+// Cursor motion that reads as a hand, only faster: a slightly curved path (a person's wrist arcs; a straight line
+// looks robotic), quick to start and easing into the target, with a brief settle on arrival. 100 to 190 ms by
+// distance, which stays inside the head start the agent gives the cursor before acting (POINT_LEAD_MS, 200 ms),
+// so the cursor is on the spot when the click lands. A new move starts from wherever the cursor is mid-flight.
+const GLIDE_MIN = 100, GLIDE_MAX = 190;
+const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+function render(agent, x, y) { agent.el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`; agent.cur = { x, y }; }
+function moveCursor(agent, spot, ms, easing = 'curve') {
   const x = Math.round(spot.x), y = Math.round(spot.y);
   const p = agent.pos;
   if (p && Math.abs(p.x - x) < 1 && Math.abs(p.y - y) < 1) return 0;
-  const dur = ms ?? (p ? Math.round(Math.min(380, 160 + Math.hypot(x - p.x, y - p.y) * 0.22)) : 300);
-  agent.el.style.transition = `transform ${dur}ms ${easing}, opacity 0.4s`;
-  agent.el.style.transform = `translate(${x}px, ${y}px)`;
   agent.pos = { x, y };
+  agent.el.style.transition = 'opacity 0.4s';
+  const from = agent.cur ?? p;
+  if (!from) { render(agent, x, y); return 0; }
+  const dist = Math.hypot(x - from.x, y - from.y);
+  const dur = ms ?? Math.round(Math.min(GLIDE_MAX, GLIDE_MIN + dist * 0.09));
+  // The arc bows to one side by up to 12% of the distance, alternating per move like a wrist would.
+  agent.bow = -(agent.bow ?? 1);
+  const bend = easing === 'linear' ? 0 : Math.min(60, dist * 0.12) * agent.bow;
+  const nx = dist ? -(y - from.y) / dist : 0, ny = dist ? (x - from.x) / dist : 0;
+  const c = { x: (from.x + x) / 2 + nx * bend, y: (from.y + y) / 2 + ny * bend };
+  const t0 = performance.now(), id = (agent.animId ?? 0) + 1;
+  agent.animId = id;
+  const step = (now) => {
+    if (agent.animId !== id) return;   // a newer move took over
+    const k = Math.min(1, (now - t0) / Math.max(1, dur));
+    const e = easing === 'linear' ? k : easeOut(k);
+    const u = 1 - e;
+    render(agent, u * u * from.x + 2 * u * e * c.x + e * e * x, u * u * from.y + 2 * u * e * c.y + e * e * y);
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
   return dur;
 }
 
+// Reading: the cursor skims the lines of what it is reading, left to right and down, like a finger running over
+// text, ending where it began reading. Purely on screen: it never waits on or changes the page.
+function skim(agent, rect, ms) {
+  const lines = Math.max(2, Math.min(5, Math.round(rect.h / 120)));
+  const per = ms / (lines * 2);
+  const left = rect.x + rect.w * 0.12, right = rect.x + rect.w * 0.78;
+  const at = (i) => rect.y + rect.h * (0.12 + (0.7 * i) / Math.max(1, lines - 1));
+  const start = agent.pos ? { ...agent.pos } : null;
+  const steps = [];
+  for (let i = 0; i < lines; i++) { const y = at(i); steps.push([{ x: left, y }, per * 0.6, 'curve'], [{ x: right, y: y + 4 }, per * 1.4, 'linear']); }
+  if (start) steps.push([start, per, 'curve']);
+  const run = (n) => {
+    if (n >= steps.length) { agent.el.classList.remove('reading'); agent.skimTimer = null; return; }
+    const [spot, ms, how] = steps[n];
+    moveCursor(agent, spot, ms, how);
+    agent.skimTimer = setTimeout(() => run(n + 1), ms);
+  };
+  stopSkim(agent);
+  agent.el.classList.add('reading');
+  run(0);
+}
+function stopSkim(agent) { clearTimeout(agent.skimTimer); agent.skimTimer = null; agent.el.classList.remove('reading'); }
+
 // Plays one action from main ('cursor' event): glide there, then a tap for a click, or for typing an I-beam that
-// runs along the field (or the address bar, with the url appearing in it) while the letters go in.
+// runs along the field (or the address bar, with the url appearing in it) while the letters go in; a wheel for a
+// scroll; a skim over the lines for reading.
 function playCursor(agent, e) {
-  agent.target = { ...(agent.target ?? {}), x: e.x, y: e.y };
+  if (Number.isFinite(e.x)) agent.target = { ...(agent.target ?? {}), x: e.x, y: e.y };   // a skim keeps its resting spot
   agent.el.classList.add('pinned');
   clearTimeout(agent.playTimer);
+  stopSkim(agent);
   agent.el.classList.remove('typing', 'tapping', 'scrolling');
+  if (e.kind === 'read' && e.rect) {
+    agent.busyUntil = Date.now() + e.ms;
+    skim(agent, e.rect, e.ms);
+    agent.playTimer = setTimeout(() => { agent.busyUntil = 0; }, e.ms);
+    return;
+  }
   if (e.kind === 'scroll') {
     // Glide onto the area, then the wheel turns (chevrons run the way the page moves) while it scrolls.
     const glide = moveCursor(agent, e);
