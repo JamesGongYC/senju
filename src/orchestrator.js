@@ -3,8 +3,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { connectServer, buildToolset, callTool, resolveSpec } from './mcp.js';
-import { pointBefore } from './point.js';
+import { connectServer, buildToolset, callTool, resolveSpec, toolName } from './mcp.js';
+import { pointBefore, scrollWithCursor, readPage, foundRef, SCROLL_TOOL } from './point.js';
 import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds, onYouTube } from './adskip.js';
@@ -185,9 +185,10 @@ Shared workspace folder for files: ${workspace}
 - When a game or tool shows its own on-screen keyboard or keypad (Wordle, a calculator), click its keys with browser_click, one key per call, and click its Enter key to submit each row, rather than typing on the keyboard.
 - When your subtask is to find a website, page, profile or link, finish by opening it the way a person would: click the matching search result's link with browser_click (not browser_navigate to the address), check the page that opens is the right one, and leave it open on screen. Do not stop at reading or reporting the address.
 - Clear anything that covers the page yourself, without asking the user: a cookie banner (accept or reject it), a newsletter or sign-up pop-up, an ad overlay or a chat bubble in the way. Click its close, "No thanks" or accept button with browser_click so the person sees the cursor do it, then carry on. Never close a box that asks the user to approve, pay or sign in for your task.
-- The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate, but never use a script to click, type or play for you, and never do many actions in one call.
+- The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option, browser_scroll), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate, but never use a script to click, type, scroll or play for you, and never do many actions in one call.
+- Waiting for a page (a reply being written, a build, an upload): wait for what shows it is done, with browser_wait_for and text (words that appear when it is ready) or textGone (a "Stop", "Loading" or "Generating" label that goes away), not a fixed time. A fixed wait only for a few seconds at a time, when nothing on the page tells you.
 - The swarm shares a board. Use board_post to share a finding or partial result another agent could use now, without waiting until you finish. Posts by others reach you automatically on your next step, marked "New on the shared board"; use them if relevant and ignore them otherwise. board_read shows the whole board.
-- Before each tool call, say in at most eight words what you are doing.
+- Before each tool call, say in at most eight words what you are doing, as a short plain sentence ("Opening the Claude app."). When the user has written to you, answer them first in full, natural sentences instead.
 - Long content goes in pieces. When you have to enter a lot of text (a write-up, a long document), put it in through several tool calls of at most about 800 words each, not one giant call. A single oversized call gets cut off and nothing is saved.
 - Long jobs: your older tool results are cleared from view as you go, and your history may be replaced by a summary. Before that can cost you anything, write down what you will need later: post key findings to the board, and save long work in progress to a file in the workspace folder when you have a files tool.
 - If your history has been summarized, trust the summary, re-check the current page or file, and carry on from the next step. Do not start over.
@@ -217,6 +218,7 @@ Some steps need the user's own hands, and not in your window: typing or pasting 
 - It waits for as long as the user needs. Do not nag, and do not carry on with steps that depend on it.
 - Afterwards, if you can check the result yourself (read the other window, list the ports, look for the file), do so. If it cannot be checked from here, take the user's Done as the answer.
 - Never ask the user to do something you can do with your own tools.
+- Files: never ask the user to copy, move, replace or delete files or folders outside the shared workspace folder, and never tell them something there "does not need to be kept": you cannot see what is in it, and a replaced folder is gone for good. If a tool cannot reach a file, put the file in the workspace folder with your own tools and use it from there.
 
 # Asking versus proceeding
 The user is busy with other work, so each question costs them attention. Ask only when a wrong guess would be expensive or hard to undo, or when you cannot proceed at all.
@@ -400,6 +402,7 @@ const leadTools = (serverNames, memory = false) => [
 const NOTE = (items) => items.map((m) => m.from === 'board' ? `New on the shared board from "${m.name}": ${m.text}`
   : m.from === 'agent' ? `Message from agent "${m.name}": ${m.text}`
   : m.from === 'system' ? `Notice: ${m.text}`
+  : m.from === 'user' && m.quick ? `Message from the user${m.name ? ` ${m.name}` : ''}: ${m.text}\n(You already answered this while your last step was running. Act on it if it changes your work; do not answer it again.)`
   : m.from === 'user' ? `Message from the user${m.name ? ` ${m.name}` : ''}: ${m.text}`
   : `Message from the lead: ${m.text}`).join('\n');
 
@@ -853,9 +856,22 @@ export class Swarm {
     const agent = this.agents.find((a) => a.id === target);
     if (!agent?.live) return false;
     this.trace(agent.name, 'message', { note: `from user: ${text}` });
-    agent.inbox.push({ from: 'user', text, name: who });
+    const item = { from: 'user', text, name: who };
+    agent.inbox.push(item);
     agent.interrupt?.();
     agent.poke?.();
+    // In the middle of a tool call that can take a while: answer now rather than when the call returns. Not while
+    // it waits on the user (its card says what for, and the message is read when they finish) or on another
+    // agent (wait_for is woken by the message instead).
+    if (agent.busy && !/^(wait_for|handoff|ask_user|user_task)$/.test(agent.busy.name) && agent.quickReply && this.config.quickReplies !== false) {
+      item.quick = true;
+      agent.quickReply(item).catch((err) => { this.trace(agent.name, 'error', { message: `quick reply failed: ${err?.message ?? err}` }); return false; }).then((ok) => {
+        if (ok) return;
+        // No quick answer: the worker answers on its next step as usual.
+        if (agent.inbox.includes(item)) item.quick = false;
+        else if (agent.live) agent.inbox.push({ from: 'user', text, name: who });
+      });
+    }
     return true;
   }
 
@@ -1020,7 +1036,7 @@ export class Swarm {
     };
     const takeInbox = () => {
       const items = agent.inbox.splice(0);
-      const fromUser = items.some((m) => m.from === 'user');
+      const fromUser = items.some((m) => m.from === 'user' && !m.quick);
       if (fromUser) agent.chatPending = true;
       return NOTE(items) + (fromUser ? `\n\n${ANSWER_NOW}` : '');
     };
@@ -1028,18 +1044,25 @@ export class Swarm {
     try {
       update({ status: 'starting', label: 'connecting tools' });
       const conns = [];
-      for (const name of agent.servers) {
-        if (this.shared.has(name)) { conns.push(this.shared.get(name)); continue; }
+      // Start this worker's own servers together (a browser takes a second or two to open), keeping their order.
+      const opened = await Promise.all(agent.servers.map(async (name) => {
+        if (this.shared.has(name)) return { conn: this.shared.get(name), shared: true };
         try {
-          const conn = await this.connect(name, this.serverSpec(name, agent), agent);
-          own.push(conn);
-          conns.push(conn);
-          if (conn.pid) agent.pids.push(conn.pid);
+          return { conn: await this.connect(name, this.serverSpec(name, agent), agent) };
         } catch (err) {
           this.emit({ type: 'notice', message: `${agent.name}: could not start "${name}": ${err?.message ?? err}` });
+          return null;
         }
+      }));
+      for (const o of opened) {
+        if (!o) continue;
+        conns.push(o.conn);
+        if (o.shared) continue;
+        own.push(o.conn);
+        if (o.conn.pid) agent.pids.push(o.conn.pid);
       }
-      const { tools, lookup } = buildToolset(conns);
+      // Browser windows also get browser_scroll, which the ghost cursor plays (src/point.js).
+      const { tools, lookup } = buildToolset(conns, (c) => (this.config.servers[c.name]?.tile === 'playwright' && c.tools.some((t) => t.name === 'browser_evaluate') ? [SCROLL_TOOL] : []));
       const others = this.agents.filter((a) => a.id !== agent.id && a.live);
       const skillNotes = (this.skills ? await Promise.all(agent.skills.map((n) => this.skills.read(n))) : []).filter(Boolean).map((k) => `## ${k.name}\n${k.body}`).join('\n\n');
       const desktop = agent.servers.some((sv) => this.config.servers[sv]?.kind === 'desktop');
@@ -1048,6 +1071,26 @@ export class Swarm {
       const messages = [{ role: 'user', content: 'Begin your subtask now.' }];
       const maxSteps = this.config.maxSteps ?? 300;
       const allTools = [...tools, ...BOARD_TOOLS, ...TEAM_TOOLS, ...HUMAN_TOOLS];
+      // The user wrote while this worker is inside a long tool call (Claude Code, a build, a wait): answer now, in
+      // plain words, from the conversation so far, instead of leaving them waiting minutes for the step to end.
+      // The step keeps running. Same system prompt, tools and history as the worker's own calls, so it reads them
+      // from cache; tool_choice none means it can only talk.
+      agent.quickReply = async (item) => {
+        const turn = agent.liveTurn;
+        if (!turn) return false;
+        const copy = JSON.parse(JSON.stringify(messages));
+        const done = new Set(turn.results.map((r) => r.tool_use_id));
+        const secs = Math.round((Date.now() - (agent.busy?.since ?? Date.now())) / 1000);
+        const pending = turn.calls.filter((c) => !done.has(c.id)).map((c) => ({ type: 'tool_result', tool_use_id: c.id, content: [{ type: 'text', text: c.id === agent.busy?.id ? `Still running (for ${secs}s so far); its result is not back yet.` : 'Not started yet: it runs after the step before it.' }] }));
+        copy.push({ role: 'user', content: [...JSON.parse(JSON.stringify(turn.results)), ...pending, { type: 'text', text: `Message from the user${item.name ? ` ${item.name}` : ''}: ${item.text}\n\n(Your step is still running, so this is a quick reply while it runs. Answer the user directly, in one to three plain, natural sentences written to them: what you are doing right now, how far along it is, and what comes next, or the answer to what they asked. Do not call tools; the step keeps running. If they want a change, say you will make it as soon as this step finishes.)` }] });
+        const res = await this.llm.create({ model: this.config.workerModel ?? this.config.model, max_tokens: 1500, system, tools: allTools, tool_choice: { type: 'none' }, messages: copy, ...this.longRunParams(), ...this.effortParams('worker') }, { signal });
+        this.account(agent.name, res);
+        const reply = res.content.filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
+        if (!reply || signal.aborted) return false;
+        this.trace(agent.name, 'message', { note: `quick reply to the user: ${reply}` });
+        this.emit({ type: 'chat', from: agent.id, name: agent.name, text: clip(reply, 2000) });
+        return true;
+      };
       this.trace(agent.name, 'start', { note: `tools: ${allTools.map((t) => t.name).join(', ')}` });
       let finalText = '';
       let cutoffs = 0;
@@ -1122,8 +1165,8 @@ export class Swarm {
           agent.chatPending = false;
           replyNudges = 0;
           // Last resort if it still said nothing, as for the lead: a factual line from what it is doing.
-          const next = calls.map((c) => c.name.replace(/^.*__/, '').replace(/_/g, ' '));
-          this.emit({ type: 'chat', from: agent.id, name: agent.name, text: text || `Working on: ${agent.goal.slice(0, 200)}${next.length ? ` Next step: ${next.join(', ')}.` : ''}` });
+          const next = calls.map((c) => c.name.replace(/^.*__/, '').replace(/^browser_/, '').replace(/_/g, ' '));
+          this.emit({ type: 'chat', from: agent.id, name: agent.name, text: text || `I'm still working on ${agent.goal.split(/[.\n]/)[0].slice(0, 160).replace(/^\w/, (c) => c.toLowerCase())}.${next.length ? ` Right now I'm doing: ${next.join(', ')}.` : ''}` });
         }
         if (calls.length === 0) {
           // A message that arrived during the final turn still gets a response.
@@ -1133,11 +1176,13 @@ export class Swarm {
         }
 
         const results = [];
+        agent.liveTurn = { calls, results };
         let batchStopped = null;   // the desktop server whose batch stopped at a failure in this reply
         for (const [callIndex, call] of calls.entries()) {
           if (signal.aborted) throw new Error('cancelled');
           await this.gate(agent, update, signal);
           const t0 = Date.now();
+          agent.busy = { id: call.id, name: call.name, since: t0 };
           const say = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
           let out;
           if (call.name === 'board_post') {
@@ -1221,10 +1266,17 @@ export class Swarm {
               const skipped = batchStopped === hit.conn && desktopAct;
               if (spec.kind === 'desktop' && !skipped) this.noteTarget(agent, call.input);
               // The person watches each cursor: a script that clicks, types or changes the page would act unseen.
-              const scripted = hit.tool === 'browser_evaluate' && /\.click\(|dispatchEvent|\.value\s*=|\.submit\(|\.focus\(|innerHTML\s*=|textContent\s*=/.test(String(call.input?.function ?? ''));
+              const fn = hit.tool === 'browser_evaluate' ? String(call.input?.function ?? '') : '';
+              const scripted = /\.click\(|dispatchEvent|\.value\s*=|\.submit\(|\.focus\(|innerHTML\s*=|textContent\s*=/.test(fn);
+              // Scrolling by script moves the page with no cursor to watch; browser_scroll does it with the cursor.
+              const scriptScroll = spec.tile === 'playwright' && /scrollIntoView|scroll(To|By)\s*\(|\.scroll\s*\(|scroll(Top|Left)\s*[-+]?=(?!=)/.test(fn);
               if (skipped) out = say('Not run: an earlier action in this reply failed, so the rest of the batch was stopped. Look at the window state returned with that failure and decide again.', true);
               else if (scripted) { out = say('Not run: browser_evaluate is for reading the page only. Do each click with browser_click, each entry with browser_type and each key with browser_press_key, one action per call, so the person can watch your cursor do it.', true); }
-              const run = scripted || skipped ? null : async () => {
+              else if (scriptScroll) { out = say(`Not run: browser_evaluate is for reading the page only, and a script that scrolls moves the page with no cursor to watch. Scroll with ${toolName(hit.conn.name, 'browser_scroll')} (a direction, or a target ref to bring into view), then read the page again.`, true); }
+              const pointEmit = (point) => this.emit({ type: 'point', agentId: agent.id, point });
+              const run = scripted || skipped || scriptScroll ? null : async () => {
+                // The cursor may still be reading this page (and scrolling it back): act once it is done.
+                if (hit.conn.reading) await Promise.race([hit.conn.reading, new Promise((r) => setTimeout(r, 3000))]);
                 // Hold the action while the user is typing or clicking, then act and note the time,
                 // so the input this action produces is not mistaken for the user's.
                 // Background input to another app never looks like the user typing, so only the rest is noted.
@@ -1234,6 +1286,12 @@ export class Swarm {
                 if (spec.tile === 'playwright' && hit.tool === 'browser_press_key' && this.config.pointing !== false) {
                   const tapped = await clickOnScreenKey(hit.conn, call.input?.key, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
                   if (tapped) return { ...tapped, content: [{ type: 'text', text: `Clicked the on-screen "${call.input?.key}" key.` }, ...tapped.content] };
+                }
+                // Scrolling is the cursor's too: it moves onto the area, then the page scrolls under it.
+                if (hit.own && hit.tool === 'browser_scroll') {
+                  const emit = this.config.pointing === false ? () => {} : (point) => this.emit({ type: 'point', agentId: agent.id, point });
+                  const { moved, ...res } = await scrollWithCursor(hit.conn, call.input, emit, signal);
+                  return res;
                 }
                 // A browser window of its own: send the ghost cursor to where this action lands first.
                 if (spec.tile === 'playwright' && this.config.pointing !== false) await pointBefore(hit.conn, hit.tool, call.input, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
@@ -1290,8 +1348,17 @@ export class Swarm {
                   const cleared = await clearPopups(hit.conn, (point) => this.emit({ type: 'point', agentId: agent.id, point }), signal);
                   if (cleared?.result) {
                     this.trace(agent.name, 'note', { note: `closed ${cleared.closed.join(', ')}` });
-                    return { ...cleared.result, content: [{ type: 'text', text: `Opened ${call.input?.url ?? 'the page'}. It opened under a ${cleared.closed.join(' and then a ')}, so that was closed for you. The page now:` }, ...cleared.result.content] };
+                    res = { ...cleared.result, content: [{ type: 'text', text: `Opened ${call.input?.url ?? 'the page'}. It opened under a ${cleared.closed.join(' and then a ')}, so that was closed for you. The page now:` }, ...cleared.result.content] };
                   }
+                }
+                // It read the page: scroll on through a long page, or to the one thing it read if that is out of view
+                // (src/point.js). Not awaited, so it plays while the model thinks; only after the last call on this
+                // window in the reply.
+                if (spec.tile === 'playwright' && this.config.pointing !== false && this.config.showReading !== false && !res.isError && lastHere) {
+                  const resText = res.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+                  const target = hit.tool === 'browser_find' ? foundRef(resText) : hit.tool === 'browser_evaluate' ? (call.input?.target ?? call.input?.ref ?? null) : null;
+                  if (target) readPage(hit.conn, pointEmit, { target, element: String(call.input?.element ?? 'what it read') });
+                  else if (/^browser_(navigate|snapshot)$/.test(hit.tool)) readPage(hit.conn, pointEmit);
                 }
                 return res;
               };
@@ -1300,6 +1367,7 @@ export class Swarm {
           }
           this.trace(agent.name, 'tool', { name: call.name, isError: Boolean(out.isError), result: out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' ').slice(0, 1500) });
           this.emitStep(agent.id, call, out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' '), Boolean(out.isError), t0);
+          agent.busy = null;
           results.push(toolResult(call.id, out.content, out.isError));
         }
         messages.push({ role: 'user', content: results });
@@ -1341,6 +1409,9 @@ export class Swarm {
       if (this.config.keepWindows === false || signal.aborted) await Promise.all(own.map((c) => c.close().catch(() => {})));
       else for (const c of own) this.kept.add(c);
       agent.pids = [];
+      agent.busy = null;
+      agent.liveTurn = null;
+      agent.quickReply = null;
     }
   }
 

@@ -65,30 +65,74 @@ const add = (parent, tag, cls, text) => {
 
 function cursorSvg(color) {
   return `<svg class="arrow" viewBox="0 0 24 24"><path d="M4 2.5l15.5 8.2-6.6 1.9-2.6 6.6z" fill="${color}" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>` +
+    `<svg class="wheel" viewBox="0 0 24 24"><path d="M7 9l5-5 5 5M7 15l5 5 5-5" fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>` +
+    `<path d="M7 9l5-5 5 5M7 15l5 5 5-5" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
     `<svg class="ibeam" viewBox="0 0 24 24"><path d="M8 3.5h8M12 3.5v17M8 20.5h8" fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/>` +
     `<path d="M8 3.5h8M12 3.5v17M8 20.5h8" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round"/></svg>`;
 }
 
-// One continuous glide from wherever the cursor is now (CSS restarts a transition from the current spot, even
-// mid-flight). Quick but easy to follow: 160 to 380 ms by distance. Returns the glide time.
-function moveCursor(agent, spot, ms, easing = 'cubic-bezier(0.25, 0.8, 0.35, 1)') {
+// Cursor motion that reads as a hand, only faster: a slightly curved path (a person's wrist arcs; a straight line
+// looks robotic), quick to start and easing into the target. 120 to 220 ms by distance, inside the head start the
+// agent gives the cursor before acting (POINT_LEAD_MS, 230 ms), so the cursor is on the spot when the click lands.
+// Played with the Web Animations API on the compositor, and the end position is set first, so a cursor is always
+// where it should be even if the overlay is not painting animations. A new move starts from wherever the cursor is
+// mid-flight.
+const GLIDE_MIN = 120, GLIDE_MAX = 220;
+const at = (x, y) => `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
+function shownAt(agent) {
+  // Where the cursor is on screen right now, mid-animation included.
+  const m = new DOMMatrixReadOnly(getComputedStyle(agent.el).transform);
+  return Number.isFinite(m.m41) ? { x: m.m41, y: m.m42 } : agent.pos;
+}
+function moveCursor(agent, spot, ms, easing = 'curve') {
   const x = Math.round(spot.x), y = Math.round(spot.y);
   const p = agent.pos;
   if (p && Math.abs(p.x - x) < 1 && Math.abs(p.y - y) < 1) return 0;
-  const dur = ms ?? (p ? Math.round(Math.min(380, 160 + Math.hypot(x - p.x, y - p.y) * 0.22)) : 300);
-  agent.el.style.transition = `transform ${dur}ms ${easing}, opacity 0.4s`;
-  agent.el.style.transform = `translate(${x}px, ${y}px)`;
+  const from = p ? shownAt(agent) : null;
+  agent.anim?.cancel();
+  agent.anim = null;
   agent.pos = { x, y };
+  agent.el.style.transition = 'opacity 0.4s';
+  agent.el.style.transform = at(x, y);
+  if (!from) return 0;
+  const dist = Math.hypot(x - from.x, y - from.y);
+  if (dist < 2) return 0;
+  const dur = ms ?? Math.round(Math.min(GLIDE_MAX, GLIDE_MIN + dist * 0.1));
+  // The arc bows to one side by up to 12% of the distance, alternating per move like a wrist would.
+  agent.bow = -(agent.bow ?? 1);
+  const bend = easing === 'linear' ? 0 : Math.min(60, dist * 0.12) * agent.bow;
+  const nx = -(y - from.y) / dist, ny = (x - from.x) / dist;
+  const c = { x: (from.x + x) / 2 + nx * bend, y: (from.y + y) / 2 + ny * bend };
+  const frames = [];
+  for (let i = 0; i <= 12; i++) {
+    const k = i / 12, u = 1 - k;
+    frames.push({ transform: at(u * u * from.x + 2 * u * k * c.x + k * k * x, u * u * from.y + 2 * u * k * c.y + k * k * y) });
+  }
+  agent.anim = agent.el.animate(frames, { duration: dur, easing: easing === 'linear' ? 'linear' : 'cubic-bezier(0.2, 0.7, 0.3, 1)' });
   return dur;
 }
 
 // Plays one action from main ('cursor' event): glide there, then a tap for a click, or for typing an I-beam that
-// runs along the field (or the address bar, with the url appearing in it) while the letters go in.
+// runs along the field (or the address bar, with the url appearing in it) while the letters go in; a wheel for a
+// scroll.
 function playCursor(agent, e) {
+  if (!Number.isFinite(e.x)) return;
   agent.target = { ...(agent.target ?? {}), x: e.x, y: e.y };
   agent.el.classList.add('pinned');
   clearTimeout(agent.playTimer);
-  agent.el.classList.remove('typing', 'tapping');
+  agent.el.classList.remove('typing', 'tapping', 'scrolling');
+  if (e.kind === 'scroll') {
+    // Glide onto the area, then the wheel turns (chevrons run the way the page moves) while it scrolls.
+    const glide = moveCursor(agent, e);
+    const ms = Math.max(200, e.ms || 450);
+    agent.busyUntil = Date.now() + glide + ms;
+    agent.playTimer = setTimeout(() => {
+      agent.el.dataset.dir = e.dir || 'down';
+      agent.el.classList.add('scrolling');
+      agent.playTimer = setTimeout(() => { agent.el.classList.remove('scrolling'); agent.busyUntil = 0; }, ms);
+    }, glide);
+    return;
+  }
   if (e.kind === 'type' && e.from) {
     const glide = moveCursor(agent, e.from);
     const ms = Math.max(80, e.ms || 0);

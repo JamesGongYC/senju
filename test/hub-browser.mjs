@@ -60,7 +60,7 @@ ws.on('message', (raw) => {
   if (m.t === 'call') {
     got.calls.push(m.tool);
     // The page answers the cursor's measuring script with where the element is on screen.
-    const text = m.tool === 'browser_evaluate' ? '### Result\n{"x":120,"y":300,"screenX":520,"screenY":640,"windowW":800,"windowH":600,"w":90,"h":20,"chromeTop":87}' : 'ok';
+    const text = m.tool === 'browser_evaluate' ? '### Result\n{"box":{"x":75,"y":203,"width":90,"height":20},"clipped":false,"rect":{"left":75,"top":203},"m":{"sx":400,"sy":340,"ow":800,"oh":600,"iw":800,"ih":513}}' : 'ok';
     ws.send(JSON.stringify({ t: 'result', rid: m.rid, content: [{ type: 'text', text }] }));
   }
 });

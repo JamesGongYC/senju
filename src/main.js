@@ -110,9 +110,10 @@ function notify(title, body) {
 
 // Ghost cursors on what an agent is doing.
 // The orchestrator emits (src/point.js) { type: 'point', agentId, point } just before an action: an element's centre for click, type and
-// select, or just the verb for open (address bar), back (back button) and key (stay put). The cursor glides there
+// select, the middle of the area that scrolls for scroll, or just the verb for open (address bar), back (back button) and key (stay put). The cursor glides there
 // and STAYS, relative to that agent's window, until the next point: it never snaps back to a parking spot.
 const pointing = new Map();   // agentId -> { dx, dy } from its window's top-left, or { x, y } when there is no window
+const frames = new Map();     // agentId -> the browser window frame (screen points) its last measured point was in
 const chromeTops = new Map(); // agentId -> height of the tab and address bars in that window, from measured points
 let lastTargets = {};
 const clampX = (x) => Math.max(0, Math.min(area.width - 20, x));
@@ -153,6 +154,8 @@ function cursorMove(agentId, point) {
     const end = Math.min(spot.x + half - 8 * scale, from.x + (point.chars ?? 0) * 7 * scale);
     return { x: clampX(Math.max(from.x, end)), y: spot.y, from, kind: 'type', ms: Number(point.typeMs) || 0 };
   }
+  // Scroll: rest on the area that scrolls and play the wheel while the page moves under the cursor.
+  if (verb === 'scroll') return { ...spot, kind: 'scroll', dir: ['up', 'down', 'left', 'right'].includes(point.dir) ? point.dir : 'down', ms: Number(point.ms) || 450 };
   return { ...spot, kind: 'click', ms: 0 };
 }
 
@@ -161,9 +164,13 @@ const send = (event) => {
   if (!win || win.isDestroyed()) return;
   if (event.type === 'point') {
     if (lastTargets[event.agentId]?.elsewhere) return;   // acting on another desktop: nothing to show here
+    const pt = event.point;
+    // A measured point says which window it is in: keep the cursor with that window, even if the agent has others.
+    if (Number.isFinite(pt?.screenX) && Number.isFinite(pt?.x) && pt.windowW) frames.set(event.agentId, { x: pt.screenX - pt.x, y: pt.screenY - pt.y, w: pt.windowW, h: pt.windowH });
     const move = cursorMove(event.agentId, event.point);
     if (!move) return;
-    const rect = lastTargets[event.agentId]?.rect;
+    const f = Number.isFinite(pt?.screenX) ? frames.get(event.agentId) : null;
+    const rect = f ? { x: f.x - area.x, y: f.y - area.y, w: f.w, h: f.h } : lastTargets[event.agentId]?.rect;
     pointing.set(event.agentId, rect ? { dx: move.x - rect.x, dy: move.y - rect.y } : { x: move.x, y: move.y });
     lastTargets = { ...lastTargets, [event.agentId]: { ...(lastTargets[event.agentId] ?? {}), x: move.x, y: move.y } };
     win.webContents.send('swarm:event', { type: 'cursor', agentId: event.agentId, ...move });
@@ -460,7 +467,9 @@ function createWindow() {
     resizable: false, movable: false, minimizable: false, maximizable: false, fullscreenable: false,
     skipTaskbar: true, alwaysOnTop: true, show: false,
     ...(isMac ? { type: 'panel' } : {}),   // panel: takes keys without activating our app
-    webPreferences: { preload: path.join(ROOT, 'src', 'preload.cjs'), contextIsolation: true },
+    // The overlay is never the focused window; without this Chromium may slow its timers and animations,
+    // and the cursors lag behind what the agents do.
+    webPreferences: { preload: path.join(ROOT, 'src', 'preload.cjs'), contextIsolation: true, backgroundThrottling: false },
   });
   win.setAlwaysOnTop(true, 'screen-saver');
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
@@ -524,7 +533,15 @@ function startTracking() {
   stopTracking();
   pointing.clear();   // a new job: cursors start from their windows again
   chromeTops.clear();
+  frames.clear();
+  // One look at a time: listing windows can take a while when the Mac is busy, and looks must not pile up.
+  let ticking = false;
   const tick = async () => {
+    if (ticking) return;
+    ticking = true;
+    try { await look(); } finally { ticking = false; }
+  };
+  const look = async () => {
     if (!isRunning() || !win?.isVisible()) return;
     const [windows, parents] = await Promise.all([listWindows({ all: true }), processParents()]);
     const targets = {};
@@ -533,7 +550,10 @@ function startTracking() {
       if (TEAM && agent.device && agent.device !== cloud?.device.id) return;
       const appName = agent.server ? config.servers[agent.server]?.app : null;
       // The agent's own window if it has one, else the app's window, else its tile slot.
-      const own = agent.pids.length ? pickWindow(agent, null, windows, parents, i) : null;
+      const f = frames.get(agent.id);
+      const near = (a, b) => Math.abs(a - b) <= 4;
+      const same = f ? windows.find((w) => w.onScreen !== false && near(w.x, f.x) && near(w.y, f.y) && near(w.w, f.w) && near(w.h, f.h)) : null;
+      const own = same ?? (agent.pids.length ? pickWindow(agent, null, windows, parents, i) : null);
       const w = own ?? (agent.server ? pickWindow(agent, appName, windows, parents, i) : null) ?? agent.slot;
       // Its window is on another desktop (Space), or minimized: the overlay shows on every desktop,
       // so hide the cursor rather than leave it over windows it is not working in.
@@ -610,6 +630,7 @@ app.whenReady().then(() => {
     if (isRunning()) return send({ type: 'notice', message: 'A job is running. Stop it first, then reset.' });
     pointing.clear();
     chromeTops.clear();
+    frames.clear();
     lastTargets = {};
     if (!TEAM && swarm) { swarm.lastJob = null; await swarm.closeKept().catch(() => {}); }
     current = null;   // the next goal starts a new session

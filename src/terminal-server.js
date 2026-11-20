@@ -13,6 +13,7 @@ import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -47,13 +48,15 @@ function folder(cwd) {
 
 // Start a command. In a Terminal window it runs in the user's own shell (their PATH, their tools);
 // hidden, it runs in a login zsh.
-async function start(command, cwd, title) {
+// display: what the window's header shows instead of the raw command (Claude Code's long wrapper line).
+// kind: 'claude' or 'command'. A new window closes the finished windows of its own kind (see closeFinished).
+async function start(command, cwd, title, display = command, kind = 'command') {
   const id = String(++seq);
   const dir = path.join(ROOT, id);
   fs.mkdirSync(dir);
   fs.writeFileSync(path.join(dir, 'cmd.sh'), `${command}\n`);
   fs.writeFileSync(path.join(dir, 'out.log'), '');
-  const run = { id, dir, command, cwd, title, windowId: null, child: null, started: Date.now(), readFrom: 0 };
+  const run = { id, dir, command, cwd, title, windowId: null, child: null, started: Date.now(), readFrom: 0, logFile: null, kind };
   runs.set(id, run);
   const log = path.join(dir, 'out.log'), exit = path.join(dir, 'exit'), pid = path.join(dir, 'pid');
 
@@ -62,7 +65,8 @@ async function start(command, cwd, title) {
     // The line typed into the new window. It starts with a space so it stays out of the shell history.
     // The subshell writes its pid (to stop it later), runs the command with its output copied to the log,
     // and the exit code is written down afterwards: PIPESTATUS for bash, pipestatus for zsh.
-    fs.writeFileSync(path.join(dir, 'banner'), `\x1b[2m── ${title ?? 'Senju'} · ${cwd}\x1b[0m\n\x1b[1m$ ${command}\x1b[0m\n`);
+    fs.writeFileSync(path.join(dir, 'banner'), `\x1b[2m── ${title ?? 'Senju'} · ${cwd}\x1b[0m\n\x1b[1m$ ${display}\x1b[0m\n`);
+    closeFinished(kind);
     const line = ` clear; cat ${q(path.join(dir, 'banner'))}; ( sh -c 'echo $PPID' > ${q(pid)}; cd ${q(cwd)} && source ${q(path.join(dir, 'cmd.sh'))} ) 2>&1 | tee ${q(log)}; echo "\${PIPESTATUS[0]}\${pipestatus[1]}" > ${q(exit)}`;
     try {
       const wid = await osascript(`tell application "Terminal"
@@ -90,6 +94,19 @@ end tell`);
   return run;
 }
 
+// Finished windows close when the next one of their kind opens, so they do not pile up on top of each other:
+// a finished command's when the next command starts, a finished Claude Code window (worth looking back at) only
+// when Claude Code is started again. Output stays in the log. A window still running, or that ended under a
+// second ago, stays open.
+function closeFinished(kind) {
+  for (const run of runs.values()) {
+    if (run.kind !== kind || !run.windowId || run.closed || status(run) === null) continue;
+    try { if (Date.now() - fs.statSync(path.join(run.dir, 'exit')).mtimeMs < 1000) continue; } catch { continue; }
+    run.closed = true;
+    osascript(`tell application "Terminal" to close (every window whose id is ${run.windowId})`).catch(() => {});
+  }
+}
+
 function status(run) {
   const file = path.join(run.dir, 'exit');
   if (!fs.existsSync(file)) return null;
@@ -97,17 +114,23 @@ function status(run) {
   return Number.isFinite(code) ? code : 1;
 }
 
-// Wait until the command ends or the time is up.
-async function wait(run, seconds) {
+// Wait until the command ends or the time is up. If the call is cancelled while it waits (the user stopped the
+// job, or the worker was stopped), the command is stopped too: otherwise it would carry on in its window with
+// no one waiting for it (a Claude Code run kept building, and spending, after its job was stopped).
+async function wait(run, seconds, signal) {
   const until = Date.now() + Math.max(0, seconds) * 1000;
-  while (status(run) === null && Date.now() < until) await sleep(250);
+  while (status(run) === null && Date.now() < until && !signal?.aborted) await sleep(250);
+  if (signal?.aborted && status(run) === null) { kill(run); return null; }
   if (status(run) !== null) await sleep(100);   // let the last of the output reach the log
   return status(run);
 }
 
 // What the command printed since the agent last read, cut to the last OUTPUT_LIMIT characters.
+// A run can keep a shorter account for the agent than what its window shows (Claude Code: no code, no command
+// output); then that is what the agent reads.
 function newOutput(run) {
-  const all = stripAnsi(fs.readFileSync(path.join(run.dir, 'out.log'), 'utf8')).replace(SESSION_NOISE, '');
+  const file = run.logFile && fs.existsSync(run.logFile) ? run.logFile : path.join(run.dir, 'out.log');
+  const all = stripAnsi(fs.readFileSync(file, 'utf8')).replace(SESSION_NOISE, '');
   const fresh = all.slice(run.readFrom);
   run.readFrom = all.length;
   return fresh.length > OUTPUT_LIMIT ? `[… ${fresh.length - OUTPUT_LIMIT} earlier characters cut; the whole log is ${path.join(run.dir, 'out.log')}]\n${fresh.slice(-OUTPUT_LIMIT)}` : fresh;
@@ -137,18 +160,25 @@ function kill(run) {
   execFile('pkill', ['-TERM', '-P', String(pid)], () => { try { process.kill(pid, 'SIGTERM'); } catch { /* gone */ } });
 }
 
-// The prompt is passed through a file, so no quoting can break it. -p runs Claude Code without its
-// full-screen interface and prints its final answer. Edits are accepted; shell commands only if allowed.
+// The prompt is passed through a file, so no quoting can break it. Claude Code runs without its full-screen
+// interface, through claude-stream.js, which streams what it does into the window as it works (a bare
+// `claude -p` prints nothing until it is done) and ends with its final answer. Edits are accepted; shell
+// commands only if allowed. The wrapper runs on the app's own runtime, so Node need not be installed.
+const STREAM = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-stream.js');
+// It may read and edit the whole workspace (--add-dir), not only the project folder: the spec and data other
+// agents wrote are usually there.
 function claudeCommand(dir, { prompt, allow_commands, continue_session, model }) {
   const file = path.join(dir, 'prompt.txt');
   fs.writeFileSync(file, String(prompt));
   return [
-    `${process.env.SENJU_CLAUDE ? q(process.env.SENJU_CLAUDE) : 'claude'} -p "$(cat ${q(file)})"`,
+    `${HIDDEN ? '' : 'SENJU_COLOR=1 '}ELECTRON_RUN_AS_NODE=1 ${q(process.execPath)} ${q(STREAM)} ${q(file)}`,
+    process.env.SENJU_CLAUDE ? `--claude ${q(process.env.SENJU_CLAUDE)}` : null,
+    `--summary ${q(path.join(dir, 'summary.log'))}`,
+    `--add-dir ${q(WORKSPACE)}`,
     '--permission-mode acceptEdits',
     allow_commands ? '--allowedTools Bash' : null,
     continue_session ? '--continue' : null,
     model ? `--model ${q(model)}` : null,
-    '< /dev/null',   // it would otherwise wait for piped input first
   ].filter(Boolean).join(' ');
 }
 
@@ -202,12 +232,12 @@ const TOOLS = [
 const text = (t, isError = false) => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) });
 const clampSecs = (v, dflt) => Math.min(1800, Math.max(1, Number(v) || dflt));
 
-async function call(name, args = {}) {
+async function call(name, args = {}, signal = null) {
   if (name === 'run_command') {
     const command = String(args.command ?? '').trim();
     if (!command) return text('Give a command.', true);
     const run = await start(command, folder(args.cwd), 'Senju');
-    return text(report(run, await wait(run, clampSecs(args.timeout_seconds, 120))));
+    return text(report(run, await wait(run, clampSecs(args.timeout_seconds, 120), signal)));
   }
   if (name === 'claude_code') {
     const prompt = String(args.prompt ?? '').trim();
@@ -215,15 +245,17 @@ async function call(name, args = {}) {
     const cwd = path.resolve(WORKSPACE, String(args.cwd ?? '.').replace(/^~(?=$|\/)/, os.homedir()));
     fs.mkdirSync(cwd, { recursive: true });
     const dir = fs.mkdtempSync(path.join(ROOT, 'claude-'));
-    const run = await start(claudeCommand(dir, { ...args, prompt }), cwd, 'Claude Code · Senju');
-    const code = await wait(run, clampSecs(args.timeout_seconds, 900));
+    const shown = `claude "${prompt.replace(/\s+/g, ' ').slice(0, 90)}${prompt.length > 90 ? '…' : ''}"${args.allow_commands ? ' (may run commands)' : ''}`;
+    const run = await start(claudeCommand(dir, { ...args, prompt }), cwd, 'Claude Code · Senju', shown, 'claude');
+    run.logFile = path.join(dir, 'summary.log');
+    const code = await wait(run, clampSecs(args.timeout_seconds, 900), signal);
     const out = report(run, code);
     if (code === 127 || /command not found: claude|claude: command not found/.test(out)) return text(`${out}\n\nClaude Code is not installed on this computer (the claude command is missing). Ask the user to install it: npm install -g @anthropic-ai/claude-code`, true);
     return text(out, code !== null && code !== 0);
   }
   if (name === 'read_output') {
     const run = find(args.id);
-    return text(report(run, await wait(run, clampSecs(args.wait_seconds, 60))));
+    return text(report(run, await wait(run, clampSecs(args.wait_seconds, 60), signal)));
   }
   if (name === 'send_input') {
     const run = find(args.id);
@@ -244,8 +276,8 @@ async function call(name, args = {}) {
 
 const server = new Server({ name: 'senju-terminal', version: '1.0.0' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  try { return await call(req.params.name, req.params.arguments ?? {}); } catch (err) { return text(String(err?.message ?? err), true); }
+server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
+  try { return await call(req.params.name, req.params.arguments ?? {}, extra?.signal); } catch (err) { return text(String(err?.message ?? err), true); }
 });
 
 // Leave nothing behind: stop commands still running in the background and remove the logs.
