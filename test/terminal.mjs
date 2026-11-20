@@ -11,8 +11,22 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'senju-term-test-'));
 const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'senju-term-bin-'));
-// A stand-in for the claude CLI that prints what it was asked.
-fs.writeFileSync(path.join(bin, 'claude'), '#!/bin/sh\necho "claude args: $*"\necho built > index.html\n');
+// A stand-in for the claude CLI: it writes a file and streams JSON events, as claude --output-format stream-json does.
+fs.writeFileSync(path.join(bin, 'claude'), `#!/bin/sh
+echo "claude args: $*" >&2
+echo built > index.html
+echo '{"type":"system","subtype":"init","model":"fake-model"}'
+echo '{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text"}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Building the "}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"site now."}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_stop"}}'
+echo '{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Write"}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\\"file_path\\": \\"index.html\\", \\"content\\": \\"<h1>"}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_stop"}}'
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Building the site now."}]}}'
+echo '{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"lint failed"}]}}'
+echo '{"type":"result","subtype":"success","is_error":false,"duration_ms":65000,"num_turns":3,"total_cost_usd":0.12,"result":"Built index.html."}'
+`);
 fs.chmodSync(path.join(bin, 'claude'), 0o755);
 
 const client = new Client({ name: 'test', version: '1' });
@@ -56,8 +70,17 @@ assert.match(r.text, /Exited with code/);
 
 // Claude Code: the prompt arrives intact, edits are accepted, commands only when allowed.
 r = await call('claude_code', { prompt: 'Build "the site" & test it', cwd: 'site' });
-assert.match(r.text, /claude args: -p Build "the site" & test it --permission-mode acceptEdits/);
+assert.match(r.text, /claude args: -p Build "the site" & test it --output-format stream-json --verbose --include-partial-messages --permission-mode acceptEdits/);
 assert.doesNotMatch(r.text, /allowedTools/);
+// What it does shows as it works, readably, then its final answer; it is printed once, not twice.
+assert.match(r.text, /Claude Code started \(fake-model\)/);
+assert.equal(r.text.match(/Building the site now\./g)?.length, 1);
+assert.match(r.text, /→ Write index\.html/);
+assert.match(r.text, /✗ lint failed/);
+assert.match(r.text, /Done in 1m 5s · 3 turns · \$0\.12/);
+assert.match(r.text, /Final answer:\nBuilt index\.html\./);
+assert.match(r.text, /Exited with code 0/);
+assert.doesNotMatch(r.text, /"type":/, 'no raw JSON');
 assert.ok(fs.existsSync(path.join(ws, 'site', 'index.html')));
 r = await call('claude_code', { prompt: 'again', cwd: 'site', allow_commands: true, continue_session: true });
 assert.match(r.text, /--allowedTools Bash --continue/);

@@ -173,7 +173,7 @@ Shared workspace folder for files: ${workspace}
 - The person watches your cursor, so work the way a person would: one visible action per call (browser_click, browser_type, browser_press_key, browser_select_option, browser_scroll), in order, on the page's real buttons and fields. For a game, click each cell or key as a move. Read the page with browser_snapshot or browser_evaluate, but never use a script to click, type, scroll or play for you, and never do many actions in one call.
 - Waiting for a page (a reply being written, a build, an upload): wait for what shows it is done, with browser_wait_for and text (words that appear when it is ready) or textGone (a "Stop", "Loading" or "Generating" label that goes away), not a fixed time. A fixed wait only for a few seconds at a time, when nothing on the page tells you.
 - The swarm shares a board. Use board_post to share a finding or partial result another agent could use now, without waiting until you finish. Posts by others reach you automatically on your next step, marked "New on the shared board"; use them if relevant and ignore them otherwise. board_read shows the whole board.
-- Before each tool call, say in at most eight words what you are doing.
+- Before each tool call, say in at most eight words what you are doing, as a short plain sentence ("Opening the Claude app."). When the user has written to you, answer them first in full, natural sentences instead.
 - Long content goes in pieces. When you have to enter a lot of text (a write-up, a long document), put it in through several tool calls of at most about 800 words each, not one giant call. A single oversized call gets cut off and nothing is saved.
 - Long jobs: your older tool results are cleared from view as you go, and your history may be replaced by a summary. Before that can cost you anything, write down what you will need later: post key findings to the board, and save long work in progress to a file in the workspace folder when you have a files tool.
 - If your history has been summarized, trust the summary, re-check the current page or file, and carry on from the next step. Do not start over.
@@ -387,6 +387,7 @@ const leadTools = (serverNames, memory = false) => [
 const NOTE = (items) => items.map((m) => m.from === 'board' ? `New on the shared board from "${m.name}": ${m.text}`
   : m.from === 'agent' ? `Message from agent "${m.name}": ${m.text}`
   : m.from === 'system' ? `Notice: ${m.text}`
+  : m.from === 'user' && m.quick ? `Message from the user${m.name ? ` ${m.name}` : ''}: ${m.text}\n(You already answered this while your last step was running. Act on it if it changes your work; do not answer it again.)`
   : m.from === 'user' ? `Message from the user${m.name ? ` ${m.name}` : ''}: ${m.text}`
   : `Message from the lead: ${m.text}`).join('\n');
 
@@ -840,9 +841,22 @@ export class Swarm {
     const agent = this.agents.find((a) => a.id === target);
     if (!agent?.live) return false;
     this.trace(agent.name, 'message', { note: `from user: ${text}` });
-    agent.inbox.push({ from: 'user', text, name: who });
+    const item = { from: 'user', text, name: who };
+    agent.inbox.push(item);
     agent.interrupt?.();
     agent.poke?.();
+    // In the middle of a tool call that can take a while: answer now rather than when the call returns. Not while
+    // it waits on the user (its card says what for, and the message is read when they finish) or on another
+    // agent (wait_for is woken by the message instead).
+    if (agent.busy && !/^(wait_for|handoff|ask_user|user_task)$/.test(agent.busy.name) && agent.quickReply && this.config.quickReplies !== false) {
+      item.quick = true;
+      agent.quickReply(item).catch((err) => { this.trace(agent.name, 'error', { message: `quick reply failed: ${err?.message ?? err}` }); return false; }).then((ok) => {
+        if (ok) return;
+        // No quick answer: the worker answers on its next step as usual.
+        if (agent.inbox.includes(item)) item.quick = false;
+        else if (agent.live) agent.inbox.push({ from: 'user', text, name: who });
+      });
+    }
     return true;
   }
 
@@ -1007,7 +1021,7 @@ export class Swarm {
     };
     const takeInbox = () => {
       const items = agent.inbox.splice(0);
-      const fromUser = items.some((m) => m.from === 'user');
+      const fromUser = items.some((m) => m.from === 'user' && !m.quick);
       if (fromUser) agent.chatPending = true;
       return NOTE(items) + (fromUser ? `\n\n${ANSWER_NOW}` : '');
     };
@@ -1042,6 +1056,26 @@ export class Swarm {
       const messages = [{ role: 'user', content: 'Begin your subtask now.' }];
       const maxSteps = this.config.maxSteps ?? 300;
       const allTools = [...tools, ...BOARD_TOOLS, ...TEAM_TOOLS, ...HUMAN_TOOLS];
+      // The user wrote while this worker is inside a long tool call (Claude Code, a build, a wait): answer now, in
+      // plain words, from the conversation so far, instead of leaving them waiting minutes for the step to end.
+      // The step keeps running. Same system prompt, tools and history as the worker's own calls, so it reads them
+      // from cache; tool_choice none means it can only talk.
+      agent.quickReply = async (item) => {
+        const turn = agent.liveTurn;
+        if (!turn) return false;
+        const copy = JSON.parse(JSON.stringify(messages));
+        const done = new Set(turn.results.map((r) => r.tool_use_id));
+        const secs = Math.round((Date.now() - (agent.busy?.since ?? Date.now())) / 1000);
+        const pending = turn.calls.filter((c) => !done.has(c.id)).map((c) => ({ type: 'tool_result', tool_use_id: c.id, content: [{ type: 'text', text: c.id === agent.busy?.id ? `Still running (for ${secs}s so far); its result is not back yet.` : 'Not started yet: it runs after the step before it.' }] }));
+        copy.push({ role: 'user', content: [...JSON.parse(JSON.stringify(turn.results)), ...pending, { type: 'text', text: `Message from the user${item.name ? ` ${item.name}` : ''}: ${item.text}\n\n(Your step is still running, so this is a quick reply while it runs. Answer the user directly, in one to three plain, natural sentences written to them: what you are doing right now, how far along it is, and what comes next, or the answer to what they asked. Do not call tools; the step keeps running. If they want a change, say you will make it as soon as this step finishes.)` }] });
+        const res = await this.llm.create({ model: this.config.workerModel ?? this.config.model, max_tokens: 1500, system, tools: allTools, tool_choice: { type: 'none' }, messages: copy, ...this.longRunParams(), ...this.effortParams('worker') }, { signal });
+        this.account(agent.name, res);
+        const reply = res.content.filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
+        if (!reply || signal.aborted) return false;
+        this.trace(agent.name, 'message', { note: `quick reply to the user: ${reply}` });
+        this.emit({ type: 'chat', from: agent.id, name: agent.name, text: clip(reply, 2000) });
+        return true;
+      };
       this.trace(agent.name, 'start', { note: `tools: ${allTools.map((t) => t.name).join(', ')}` });
       let finalText = '';
       let cutoffs = 0;
@@ -1116,8 +1150,8 @@ export class Swarm {
           agent.chatPending = false;
           replyNudges = 0;
           // Last resort if it still said nothing, as for the lead: a factual line from what it is doing.
-          const next = calls.map((c) => c.name.replace(/^.*__/, '').replace(/_/g, ' '));
-          this.emit({ type: 'chat', from: agent.id, name: agent.name, text: text || `Working on: ${agent.goal.slice(0, 200)}${next.length ? ` Next step: ${next.join(', ')}.` : ''}` });
+          const next = calls.map((c) => c.name.replace(/^.*__/, '').replace(/^browser_/, '').replace(/_/g, ' '));
+          this.emit({ type: 'chat', from: agent.id, name: agent.name, text: text || `I'm still working on ${agent.goal.split(/[.\n]/)[0].slice(0, 160).replace(/^\w/, (c) => c.toLowerCase())}.${next.length ? ` Right now I'm doing: ${next.join(', ')}.` : ''}` });
         }
         if (calls.length === 0) {
           // A message that arrived during the final turn still gets a response.
@@ -1127,11 +1161,13 @@ export class Swarm {
         }
 
         const results = [];
+        agent.liveTurn = { calls, results };
         let batchStopped = null;   // the desktop server whose batch stopped at a failure in this reply
         for (const [callIndex, call] of calls.entries()) {
           if (signal.aborted) throw new Error('cancelled');
           await this.gate(agent, update, signal);
           const t0 = Date.now();
+          agent.busy = { id: call.id, name: call.name, since: t0 };
           const say = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
           let out;
           if (call.name === 'board_post') {
@@ -1304,6 +1340,7 @@ export class Swarm {
           }
           this.trace(agent.name, 'tool', { name: call.name, isError: Boolean(out.isError), result: out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' ').slice(0, 1500) });
           this.emitStep(agent.id, call, out.content.map((c) => c.type === 'text' ? c.text : `[${c.type}]`).join(' '), Boolean(out.isError), t0);
+          agent.busy = null;
           results.push(toolResult(call.id, out.content, out.isError));
         }
         messages.push({ role: 'user', content: results });
@@ -1345,6 +1382,9 @@ export class Swarm {
       if (this.config.keepWindows === false || signal.aborted) await Promise.all(own.map((c) => c.close().catch(() => {})));
       else for (const c of own) this.kept.add(c);
       agent.pids = [];
+      agent.busy = null;
+      agent.liveTurn = null;
+      agent.quickReply = null;
     }
   }
 

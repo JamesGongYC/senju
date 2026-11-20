@@ -13,6 +13,7 @@ import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -137,18 +138,21 @@ function kill(run) {
   execFile('pkill', ['-TERM', '-P', String(pid)], () => { try { process.kill(pid, 'SIGTERM'); } catch { /* gone */ } });
 }
 
-// The prompt is passed through a file, so no quoting can break it. -p runs Claude Code without its
-// full-screen interface and prints its final answer. Edits are accepted; shell commands only if allowed.
+// The prompt is passed through a file, so no quoting can break it. Claude Code runs without its full-screen
+// interface, through claude-stream.js, which streams what it does into the window as it works (a bare
+// `claude -p` prints nothing until it is done) and ends with its final answer. Edits are accepted; shell
+// commands only if allowed. The wrapper runs on the app's own runtime, so Node need not be installed.
+const STREAM = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-stream.js');
 function claudeCommand(dir, { prompt, allow_commands, continue_session, model }) {
   const file = path.join(dir, 'prompt.txt');
   fs.writeFileSync(file, String(prompt));
   return [
-    `${process.env.SENJU_CLAUDE ? q(process.env.SENJU_CLAUDE) : 'claude'} -p "$(cat ${q(file)})"`,
+    `ELECTRON_RUN_AS_NODE=1 ${q(process.execPath)} ${q(STREAM)} ${q(file)}`,
+    process.env.SENJU_CLAUDE ? `--claude ${q(process.env.SENJU_CLAUDE)}` : null,
     '--permission-mode acceptEdits',
     allow_commands ? '--allowedTools Bash' : null,
     continue_session ? '--continue' : null,
     model ? `--model ${q(model)}` : null,
-    '< /dev/null',   // it would otherwise wait for piped input first
   ].filter(Boolean).join(' ');
 }
 
