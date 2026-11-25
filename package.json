@@ -6,7 +6,7 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node test/smoke.mjs && node test/hub.mjs && node test/hub-browser.mjs && node test/cloud.mjs && node test/billing.mjs && node test/sessions.mjs && node test/terminal.mjs && node test/scroll.mjs && node test/quick-reply.mjs && node test/desk-read.mjs && node test/ads.mjs && node test/vision.mjs && node test/models.mjs",
+    "test": "node test/smoke.mjs && node test/hub.mjs && node test/hub-browser.mjs && node test/cloud.mjs && node test/billing.mjs && node test/sessions.mjs && node test/terminal.mjs && node test/scroll.mjs && node test/quick-reply.mjs && node test/desk-read.mjs && node test/ads.mjs && node test/vision.mjs && node test/models.mjs && node test/sampling.mjs",
     "demo": "electron . --demo",
     "doctor": "node scripts/doctor.mjs",
     "server": "node server/index.js",

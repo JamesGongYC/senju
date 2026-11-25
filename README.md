@@ -126,6 +126,8 @@ Senju runs on Claude by default, and on any model behind an OpenAI-compatible AP
 - **App website.** OpenRouter shows the app's name in its usage pages. Set `"appUrl"` in `swarm.config.json` (or `SENJU_APP_URL`) to send your website along with it; nothing is sent without one.
 - **What each model can do.** Every model has a profile: context size, longest reply, whether it sees images, and its price. Claude keeps everything: server-side compaction, tool-result clearing, caching and effort. Other models get their history fitted by the app (old results shrunk, then the oldest steps left out, with a note). A model with a small context gets fewer tool definitions. A model that cannot see images gets a note in place of each screenshot, no picture tools, and is told to work from the window and page text.
 - **Ripple.** `ripple-65b-preview` is text only, with a 1M-token context on OpenRouter, at $0.10 / $0.30 per million tokens. Other providers may serve a shorter context: set it under `models`.
+- **Temperature.** Workers on models other than Claude sample at 0.2 by default, since their turns are tool calls. The lead, and Claude, keep the endpoint's default. Set `"temperature"` to a number, to `{ "lead": ..., "worker": ... }`, or to `null` to send none. An endpoint that accepts only its default is detected and left alone.
+- **Ripple on your own GPU.** [tools/gpu/](tools/gpu/README.md) serves Ripple on one B200 with vLLM and DFlash2 speculative decoding: about 1.4 s a worker turn against 8 s on OpenRouter. It has the measurements behind the drafter settings and the worker temperature, and a record/replay benchmark for your own traffic.
 - **Your own settings.** Override a profile, or add a provider:
 
 ```json
