@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('senju', {
   connectOpenRouter: () => call('connect-openrouter'),
   openUrl: (url) => call('open-url', url),
   setModels: (models) => call('set-models', models),
+  routerModels: () => call('router-models'),
   signIn: (email, password) => call('sign-in', email, password),
   signOut: () => call('sign-out'),
   openWeb: () => call('open-web'),

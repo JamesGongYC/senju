@@ -107,6 +107,19 @@ function dropSwarm() {
   swarm = null;
   old.shutdown?.().catch?.(() => {});
 }
+// OpenRouter's live catalogue of models that can call tools, as "openrouter:<id>", for the "Other model…" field.
+// Its list is public; fetched once per run, and an empty list if it cannot be reached.
+let routerModels = null;
+async function openRouterModels() {
+  if (routerModels) return routerModels;
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/models', { signal: AbortSignal.timeout(8000) });
+    const data = (await res.json())?.data ?? [];
+    routerModels = data.filter((m) => m.supported_parameters?.includes('tools')).map((m) => ({ id: `openrouter:${m.id}`, label: m.name ?? m.id })).sort((a, b) => a.id.localeCompare(b.id));
+  } catch { return []; }
+  return routerModels;
+}
+
 const haveKeys = () => DEMO || missingKeys(config, keysFromEnv(process.env, config)).length === 0;
 
 // The models Senju runs on: the lead's and the workers', saved in the data folder's swarm.config.json.
@@ -119,7 +132,17 @@ function modelState() {
     lead: describe(config.plannerModel ?? config.model),
     worker: describe(config.workerModel ?? config.model),
     providers: Object.entries(allProviders(config)).map(([id, p]) => ({ id, label: p.label, hint: p.keyHint, needsKey: Boolean(p.keyEnv), hasKey: !p.keyEnv || Boolean(keys[id]), savable: Boolean(PROVIDERS[id]), limits: p.limits ?? null, connect: Boolean(p.connect) })),
-    suggestions: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'openrouter:ricursiveai/ripple-65b-preview', 'openrouter:anthropic/claude-sonnet-5.5', 'openai:gpt-5', 'together:ricursiveai/ripple-65b-preview', 'ollama:llama3.3'],
+    // The dropdown's choices, by provider. Anything else is typed under "Other model…".
+    choices: [
+      { group: 'Anthropic', models: [
+        { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5' },
+        { id: 'claude-opus-5-5', label: 'Claude Opus 5.5' },
+        { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5' },
+      ] },
+      { group: 'OpenRouter', models: [
+        { id: 'openrouter:ricursiveai/ripple-65b-preview', label: 'Ripple 65B Preview (text only)' },
+      ] },
+    ],
   };
 }
 function setModels({ lead, worker }) {
@@ -385,6 +408,7 @@ const launcherHandlers = {
   'connect-openrouter': async () => { await connectOpenRouter(); return launcherState(); },
   'open-url': (url) => { if (KEY_PAGES.test(String(url))) shell.openExternal(String(url)); },
   'set-models': (models) => { setModels(models ?? {}); return launcherState(); },
+  'router-models': () => openRouterModels(),
   'sign-in': async (email, password) => {
     if (!cloud) throw new Error('Still reaching the team server. Try again in a moment.');
     await cloud.signIn(String(email ?? '').trim(), String(password ?? ''));

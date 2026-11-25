@@ -105,6 +105,8 @@ button { font: inherit; }
 .panel-card.wide { width: min(560px, 100%); }
 .models { display: flex; flex-direction: column; gap: 12px; }
 .model-field { display: flex; flex-direction: column; gap: 4px; }
+.model-pick { display: flex; flex-direction: column; gap: 6px; }
+.model-pick select.field { appearance: auto; }
 .models .small { font-size: 12px; }
 .models .row.left { justify-content: flex-start; margin-top: 0; }
 .keys { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }

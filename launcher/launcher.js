@@ -95,15 +95,32 @@ function modelsForm({ firstRun = false } = {}) {
   const box = h('div', { class: 'models' });
   if (!m) return box;
   const err = h('p', { class: 'error-text' });
-  const list = h('datalist', { id: 'model-suggestions' }, m.suggestions.map((v) => h('option', { value: v })));
+  // A dropdown of models by provider, and "Other model…" to type any provider:model. The typed field suggests
+  // OpenRouter's live list of models that can call tools (a datalist only shows entries matching what is typed,
+  // which is why it is not the main control).
+  const list = h('datalist', { id: 'model-suggestions' });
+  call('routerModels').then((models) => list.replaceChildren(...models.map((x) => h('option', { value: x.id }, x.label)))).catch(() => {});
   const plain = (k) => (k?.startsWith('anthropic:') ? k.slice(10) : k);
-  const field = (info) => h('input', { class: 'field', list: 'model-suggestions', value: plain(info.key) ?? '', spellcheck: false });
+  const known = new Set(m.choices.flatMap((g) => g.models.map((x) => x.id)));
+  const OTHER = '__other';
+  const field = (info) => {
+    const current = plain(info.key) ?? '';
+    const select = h('select', { class: 'field' },
+      m.choices.map((g) => h('optgroup', { label: g.group }, g.models.map((x) => h('option', { value: x.id, selected: x.id === current }, x.label)))),
+      h('option', { value: OTHER, selected: !known.has(current) }, 'Other model…'));
+    const typed = h('input', { class: 'field', list: 'model-suggestions', value: known.has(current) ? '' : current, placeholder: 'provider:model, for example openrouter:qwen/qwen3-coder', spellcheck: false });
+    typed.hidden = known.has(current);
+    select.addEventListener('change', () => { typed.hidden = select.value !== OTHER; if (!typed.hidden) typed.focus(); });
+    const wrap = h('div', { class: 'model-pick' }, select, typed);
+    wrap.value = () => (select.value === OTHER ? typed.value.trim() : select.value);
+    return wrap;
+  };
   const lead = field(m.lead), worker = field(m.worker);
   const about = (info) => (info.error ? h('span', { class: 'error-text small' }, info.error)
     : h('span', { class: 'dim small' }, [info.label, info.vision ? 'sees images' : 'text only', `${Math.round(info.context / 1000)}K context`, info.price ? `$${info.price.input}/$${info.price.output} per M tokens` : null].filter(Boolean).join(' · ')));
   const saveModels = async () => {
     err.textContent = '';
-    try { app.s = await call('setModels', { lead: lead.value, worker: worker.value }); if (firstRun) route(); else render(); } catch (e) { err.textContent = e.message; }
+    try { app.s = await call('setModels', { lead: lead.value(), worker: worker.value() }); if (firstRun) route(); else render(); } catch (e) { err.textContent = e.message; }
   };
   const needed = new Set([m.lead.provider, m.worker.provider].filter(Boolean));
   const keyRow = (p) => {
@@ -139,7 +156,7 @@ function modelsForm({ firstRun = false } = {}) {
     h('label', { class: 'model-field' }, h('span', { class: 'kicker' }, 'Lead (plans and talks to you)'), lead, about(m.lead)),
     h('label', { class: 'model-field' }, h('span', { class: 'kicker' }, 'Workers (do the steps)'), worker, about(m.worker)),
     h('div', { class: 'row left' }, h('button', { class: 'btn btn-punk btn-sm', onclick: saveModels }, 'Use these models')),
-    h('p', { class: 'dim small' }, 'A Claude id (claude-sonnet-5-5) or provider:model, for example openrouter:ricursiveai/ripple-65b-preview.'),
+    h('p', { class: 'dim small' }, 'Other model: a Claude id, or provider:model with provider openrouter, openai, together, groq or ollama. Suggestions are OpenRouter’s models that can use tools.'),
     app.s.team
       ? h('p', { class: 'dim small' }, 'Cloud sessions run on the API keys saved on the web page (Billing). Add a key there for each provider your models use.')
       : h('div', { class: 'keys' }, h('span', { class: 'kicker' }, 'API keys'),
