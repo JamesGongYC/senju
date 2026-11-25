@@ -23,6 +23,7 @@ export const PROVIDERS = {
 
 // What is known about particular models. Prices are dollars per million tokens.
 const CLAUDE = { vision: true, tools: true, parallelTools: true, serverContext: true, caching: true, effort: 'output_config', context: 200000, maxOutput: 64000 };
+const RIPPLE = { vision: false, tools: true, parallelTools: true, context: 1048576, maxOutput: 32768, effort: 'reasoning', price: { input: 0.1, output: 0.3 } };
 const KNOWN = [
   { match: /^anthropic:claude-.*opus/, profile: { ...CLAUDE, price: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 } } },
   { match: /^anthropic:claude-.*sonnet/, profile: { ...CLAUDE, price: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 } } },
@@ -32,7 +33,11 @@ const KNOWN = [
   { match: /^openrouter:anthropic\//, profile: { vision: true, tools: true, parallelTools: true, context: 200000, maxOutput: 32000 } },
   // Ripple 65B Preview (ricursiveAI, November 2026), as OpenRouter lists it: text only, tool calling, a 1M context,
   // replies up to 131K, reasoning effort. Other providers may serve a shorter context: set it under "models".
-  { match: /ripple-65b/, profile: { vision: false, tools: true, parallelTools: true, context: 1048576, maxOutput: 32768, effort: 'reasoning', price: { input: 0.1, output: 0.3 } } },
+  // On OpenRouter, a call without tools (a lead's long planning call, a summary) can be routed to Together, which
+  // serves Ripple with a 131K context and rejects any request with tools. Skipping it keeps every call on a 1M
+  // endpoint with tool calling ("route" is sent as OpenRouter's provider routing object).
+  { match: /^openrouter:.*ripple-65b/, profile: { ...RIPPLE, route: { ignore: ['together'] } } },
+  { match: /ripple-65b/, profile: RIPPLE },
   { match: /^(openai|openrouter):(openai\/)?gpt-/, profile: { vision: true, tools: true, parallelTools: true, context: 128000, maxOutput: 16384, effort: 'reasoning_effort' } },
   { match: /^(openai|openrouter):(openai\/)?o\d/, profile: { vision: true, tools: true, parallelTools: true, context: 200000, maxOutput: 32000, effort: 'reasoning_effort' } },
   { match: /^openrouter:google\/gemini/, profile: { vision: true, tools: true, parallelTools: true, context: 1000000, maxOutput: 32000 } },

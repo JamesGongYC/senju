@@ -1520,6 +1520,7 @@ export class Swarm {
     }
     this.leadCtx = { messages, system };
     let replyNudges = 0;
+    let leadShrunk = false;   // shrank the history once after the context window filled up
     let nudged = false;   // told once that workers are still running; after that a text-only reply just keeps waiting
     let lastText = '';
 
@@ -1538,8 +1539,27 @@ export class Swarm {
     for (let turn = 0; turn < MAX_LEAD_TURNS; turn++) {
       if (signal.aborted) throw new Error('cancelled');
       lead('thinking', this.agents.length ? 'reviewing' : 'planning');
-      const res = await this.think(this.leadState, 'lead', request, signal);
+      let res;
+      try {
+        res = await this.think(this.leadState, 'lead', request, signal);
+      } catch (err) {
+        // The provider refused the request as too long (a 400 from an OpenAI-compatible endpoint): shrink once.
+        if (!tooLong(err) || leadShrunk) throw err;
+        leadShrunk = true;
+        this.trace('lead', 'error', { message: `context too long, shrinking history and retrying: ${err.message}` });
+        prune(messages, 1, 200);
+        continue;
+      }
       this.trace('lead', 'response', describeResponse(res, turn + 1));
+      if (res.stop_reason === 'model_context_window_exceeded' && !res.content.some((b) => b.type === 'tool_use' || (b.type === 'text' && b.text.trim()))) {
+        // The window itself is full and nothing came back. Asking for a briefer reply would not help (it looped up
+        // to MAX_LEAD_TURNS times): shrink old results hard and go again, once.
+        if (leadShrunk) throw new Error('lead context window exceeded even after shrinking the history');
+        leadShrunk = true;
+        this.trace('lead', 'error', { message: 'context window exceeded; shrinking history and retrying' });
+        prune(messages, 1, 200);
+        continue;
+      }
       if (res.stop_reason === 'max_tokens' || res.stop_reason === 'model_context_window_exceeded') {
         const kept = res.content.filter((b) => b.type === 'compaction' || (b.type === 'text' && b.text.trim()));
         messages.push({ role: 'assistant', content: kept.some((b) => b.type === 'text') ? kept : [...kept, { type: 'text', text: '(cut off)' }] });

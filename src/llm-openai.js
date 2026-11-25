@@ -108,6 +108,8 @@ export function toChat(params, profile) {
   const level = effort ? ({ low: 'low', medium: 'medium', high: 'high', xhigh: 'high', max: 'high' })[effort] ?? 'medium' : null;
   if (level && profile.effort === 'reasoning_effort') req.reasoning_effort = level;
   if (level && profile.effort === 'reasoning') req.reasoning = { effort: level, exclude: true };
+  // Provider routing on a gateway that supports it (OpenRouter's "provider" object), from the model's profile.
+  if (profile.route) req.provider = profile.route;
   return req;
 }
 
@@ -127,7 +129,10 @@ export function fromChat(body, model) {
   const choice = body.choices?.[0] ?? {};
   const msg = choice.message ?? {};
   const content = [];
-  const text = typeof msg.content === 'string' ? msg.content : Array.isArray(msg.content) ? msg.content.map((p) => p.text ?? '').join('') : '';
+  const raw = typeof msg.content === 'string' ? msg.content : Array.isArray(msg.content) ? msg.content.map((p) => p.text ?? '').join('') : '';
+  // Reasoning normally arrives apart from the content (and is not kept). A server run without a reasoning parser
+  // leaves it inline as <think>…</think>; that is the model's scratch work, not a reply, so it is cut out.
+  const text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^[\s\S]*?<\/think>/i, '');
   if (text.trim()) content.push({ type: 'text', text });
   let bad = 0;
   for (const [i, c] of (msg.tool_calls ?? []).entries()) {
@@ -183,11 +188,13 @@ export function makeOpenAiClient({ baseURL, apiKey, headers = {}, fetchImpl = gl
         clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
       }
-      // Some gateways report an upstream failure inside a 200.
-      const failed = !res.ok || (data && typeof data === 'object' && data.error && !data.choices);
+      // Some gateways report an upstream failure inside a 200, or return a 200 with no choices at all
+      // (seen on OpenRouter under load): both are transient, not an empty reply from the model.
+      const empty = res.ok && !(data && typeof data === 'object' && data.choices?.length);
+      const failed = !res.ok || empty || (data && typeof data === 'object' && data.error && !data.choices);
       if (!failed) return data;
-      const status = res.ok ? Number(data.error?.code) || 502 : res.status;
-      if ((status === 429 || status >= 500) && attempt < maxRetries) {
+      const status = res.ok ? Number(data?.error?.code) || 502 : res.status;
+      if ((status === 408 || status === 409 || status === 425 || status === 429 || status >= 500) && attempt < maxRetries) {
         const wait = Number(res.headers?.get?.('retry-after')) * 1000 || Math.min(30_000, 500 * 2 ** attempt);
         await sleep(wait, signal);
         continue;
