@@ -11,7 +11,7 @@ const state = {
   team: null,            // the org on screen, from /api/team
   orgs: [],              // every org this person is in: their personal org first, then teams
   teamId: null,          // which of them is selected (remembered in this browser)
-  hasKey: false, billing: null,
+  hasKey: false, keys: null, billing: null,
   ws: null, people: [], liveSession: null,   // presence from the hub
   page: 'sessions', sessions: [], selected: null, detail: null, tv: null, watching: false,
 };
@@ -356,12 +356,14 @@ function libraryPage() {
 
 function billingPage() {
   const err = h('p', { class: 'error-text' });
-  const keyCall = async (method, body) => {
-    try { await api(method, '/api/key', body); } catch (x) { err.textContent = x.message; return; }
-    state.hasKey = method === 'POST';
+  // Your own API keys, one per provider. The server only says which providers have one.
+  const keyCall = async (method, body, provider = null) => {
+    try { state.keys = await api(method, `/api/key${provider ? `?provider=${encodeURIComponent(provider)}` : ''}`, body); } catch (x) { err.textContent = x.message; return; }
+    state.hasKey = state.keys.providers.length > 0;
     await loadBilling();
     render();
   };
+  if (!state.keys) { api('GET', '/api/key').then((k) => { state.keys = k; render(); }).catch(() => {}); }
   const b = state.billing;
   const pay = async (path, body) => {
     try { location.href = (await api('POST', path, body ?? {})).url; } catch (x) { err.textContent = x.message; }   // Stripe's own page takes the card
@@ -385,11 +387,12 @@ function billingPage() {
     plan,
     h('section', { class: 'card' },
       h('div', { class: 'card-head' }, h('h2', { class: 'display' }, b?.hosted ? 'Or bring your own key' : 'Your API key')),
-      h('p', { class: 'dim' }, 'Sessions you start run on your Anthropic key, free of credits. It is encrypted on the server and never shown again, and teammates cannot use it for their own sessions.'),
-      state.hasKey
-        ? h('p', {}, 'A key is saved. ', h('button', { class: 'link', onclick: () => keyCall('DELETE') }, 'Remove it'))
-        : h('form', { class: 'inline', onsubmit: (ev) => { ev.preventDefault(); keyCall('POST', { key: new FormData(ev.target).get('key') }); } },
-          h('input', { class: 'field', name: 'key', type: 'password', placeholder: 'sk-ant-…', required: true, autocomplete: 'off' }), h('button', { class: 'btn btn-punk' }, 'Save')),
+      h('p', { class: 'dim' }, 'Sessions you start run on your own keys, free of credits: one per provider your models use (chosen in the Senju desktop app, under Models & keys). Keys are encrypted on the server and never shown again, and teammates cannot use them for their own sessions.'),
+      (state.keys?.known ?? [{ id: 'anthropic', label: 'Anthropic', hint: 'sk-ant-…' }]).map((p) => (state.keys?.providers ?? []).includes(p.id)
+        ? h('p', { class: 'key-saved' }, h('b', {}, p.label), ': a key is saved. ', h('button', { class: 'link', onclick: () => keyCall('DELETE', undefined, p.id) }, 'Remove it'))
+        : h('form', { class: 'inline', onsubmit: (ev) => { ev.preventDefault(); keyCall('POST', { key: new FormData(ev.target).get('key'), provider: p.id }); } },
+          h('span', { class: 'key-label' }, p.label),
+          h('input', { class: 'field', name: 'key', type: 'password', placeholder: p.hint, required: true, autocomplete: 'off' }), h('button', { class: 'btn btn-punk' }, 'Save'))),
       err));
 }
 

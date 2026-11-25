@@ -565,13 +565,15 @@ function renderKeyPrompt(e) {
   if (e.goal) goalWaitingForKey = e.goal;
   box.hidden = false;
   box.innerHTML = '';
-  add(box, 'div', 'acct-title', 'Add your Anthropic API key');
+  const PROVIDER = { anthropic: ['Anthropic', 'sk-ant-...'], openrouter: ['OpenRouter', 'sk-or-...'], openai: ['OpenAI', 'sk-...'], together: ['Together AI', 'API key'], groq: ['Groq', 'gsk_...'] };
+  const [label, hint] = PROVIDER[e.providers?.[0]] ?? ['API', 'API key'];
+  add(box, 'div', 'acct-title', `Add your ${label} key`);
   const form = add(box, 'form', 'acct-form');
-  const input = add(form, 'input'); input.type = 'password'; input.placeholder = 'sk-ant-...'; input.required = true; input.autocomplete = 'off';
+  const input = add(form, 'input'); input.type = 'password'; input.placeholder = hint; input.required = true; input.autocomplete = 'off';
   add(form, 'button', '', 'Save').type = 'submit';
   form.addEventListener('submit', (ev) => { ev.preventDefault(); window.swarm.saveKey(input.value.trim()); });
   input.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') ev.stopPropagation(); });
-  add(box, 'div', 'acct-note', 'Agents run on your own key. It is encrypted with your Mac\'s keychain and stays on this computer.');
+  add(box, 'div', 'acct-note', 'Agents run on your own key. It is encrypted with your Mac\'s keychain and stays on this computer. Choose models and add other keys in the Senju window (Models & keys).');
   if (e.error) add(box, 'div', 'acct-error', e.error);
   input.focus();
 }

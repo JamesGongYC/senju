@@ -11,7 +11,8 @@ import { listWindows, processParents, pickWindow, frontApp } from './windows.js'
 import { demoLlm, demoConnect, demoConfigServers } from './demo.js';
 import { placeWindow } from './place.js';
 import { callTool } from './mcp.js';
-import { makeLlm as claude } from './llm.js';
+import { makeLlm as modelClient } from './llm.js';
+import { PROVIDERS, providers as allProviders, guessProvider, checkKey, keysFromEnv, missingKeys, resolveModel, modelKey } from './models.js';
 import { ToolHost } from './toolhost.js';
 import { CloudClient, supabaseAuth } from './cloud.js';
 import { DEFAULT_HUB } from './config.js';
@@ -36,22 +37,75 @@ if (app.isPackaged) {
   }
 }
 
-// The solo API key, encrypted with the system keychain and kept in the data folder.
-const keyFile = () => path.join(dataDir(), 'api-key.bin');
+// The solo API keys, one per provider, encrypted with the system keychain and kept in the data folder:
+// api-key.bin for Anthropic (the name from before other providers), api-key-<provider>.bin for the rest.
+const keyFile = (provider = 'anthropic') => path.join(dataDir(), provider === 'anthropic' ? 'api-key.bin' : `api-key-${provider}.bin`);
 function loadSavedKey() {
-  try {
-    if (!process.env.ANTHROPIC_API_KEY && fs.existsSync(keyFile()) && safeStorage.isEncryptionAvailable()) {
-      process.env.ANTHROPIC_API_KEY = safeStorage.decryptString(fs.readFileSync(keyFile()));
-    }
-  } catch { /* unreadable: ask again */ }
+  for (const [name, p] of Object.entries(PROVIDERS)) {
+    try {
+      if (p.keyEnv && !process.env[p.keyEnv] && fs.existsSync(keyFile(name)) && safeStorage.isEncryptionAvailable()) {
+        process.env[p.keyEnv] = safeStorage.decryptString(fs.readFileSync(keyFile(name)));
+      }
+    } catch { /* unreadable: ask again */ }
+  }
 }
-function saveKey(key) {
-  if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(key)) return 'That does not look like an Anthropic API key.';
-  if (!safeStorage.isEncryptionAvailable()) return 'This computer cannot store the key securely. Put ANTHROPIC_API_KEY=... in a .env file in the data folder instead.';
+// provider: which one the key is for; guessed from the key, else the provider of the models that still need one.
+function saveKey(key, provider = null) {
+  provider ||= guessProvider(key) || missingKeys(config, keysFromEnv(process.env, config))[0] || 'anthropic';
+  const p = allProviders(config)[provider];
+  const problem = checkKey(provider, key, config);
+  if (problem) return problem;
+  if (!PROVIDERS[provider]) return `Put ${p.keyEnv}=... in a .env file in the data folder for ${p.label}.`;
+  if (!safeStorage.isEncryptionAvailable()) return `This computer cannot store the key securely. Put ${p.keyEnv}=... in a .env file in the data folder instead.`;
   fs.mkdirSync(dataDir(), { recursive: true });
-  fs.writeFileSync(keyFile(), safeStorage.encryptString(key), { mode: 0o600 });
-  process.env.ANTHROPIC_API_KEY = key;
+  fs.writeFileSync(keyFile(provider), safeStorage.encryptString(key), { mode: 0o600 });
+  process.env[p.keyEnv] = key;
+  dropSwarm();   // the next job builds its client with the new key
   return null;
+}
+function forgetKey(provider) {
+  const p = PROVIDERS[provider];
+  if (!p?.keyEnv) return;
+  try { fs.rmSync(keyFile(provider), { force: true }); } catch { /* gone */ }
+  delete process.env[p.keyEnv];
+  dropSwarm();
+}
+// Settings changed: the next job builds a new swarm (with the new client). One that is running keeps going.
+function dropSwarm() {
+  if (!swarm || isRunning()) return;
+  const old = swarm;
+  swarm = null;
+  old.shutdown?.().catch?.(() => {});
+}
+const haveKeys = () => DEMO || missingKeys(config, keysFromEnv(process.env, config)).length === 0;
+
+// The models Senju runs on: the lead's and the workers', saved in the data folder's swarm.config.json.
+function modelState() {
+  const keys = keysFromEnv(process.env, config);
+  const describe = (spec) => {
+    try { const m = resolveModel(spec, config); return { key: m.key, provider: m.provider, label: m.providerInfo.label, vision: m.vision, context: m.context, price: m.price ?? null }; } catch (err) { return { key: spec, error: err.message }; }
+  };
+  return {
+    lead: describe(config.plannerModel ?? config.model),
+    worker: describe(config.workerModel ?? config.model),
+    providers: Object.entries(allProviders(config)).map(([id, p]) => ({ id, label: p.label, hint: p.keyHint, needsKey: Boolean(p.keyEnv), hasKey: !p.keyEnv || Boolean(keys[id]), savable: Boolean(PROVIDERS[id]) })),
+    suggestions: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'openrouter:ricursiveai/ripple-65b-preview', 'openrouter:anthropic/claude-sonnet-5.5', 'openai:gpt-5', 'together:ricursiveai/ripple-65b-preview', 'ollama:llama3.3'],
+  };
+}
+function setModels({ lead, worker }) {
+  const next = {};
+  for (const [field, spec] of [['plannerModel', lead], ['workerModel', worker]]) {
+    if (!spec) continue;
+    next[field] = resolveModel(String(spec).trim(), config).key;   // throws on an unknown provider
+  }
+  const file = path.join(dataDir(), 'swarm.config.json');
+  const saved = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+  // A bare Claude id stays bare, as the file had it before.
+  const tidy = (k) => (k.startsWith('anthropic:') ? k.slice('anthropic:'.length) : k);
+  for (const [k, v] of Object.entries(next)) { saved[k] = tidy(v); config[k] = tidy(v); }
+  fs.writeFileSync(file, `${JSON.stringify(saved, null, 2)}\n`);
+  dropSwarm();   // the next job runs on the new models
+  return modelState();
 }
 const isMac = process.platform === 'darwin';
 // Two ways to work, chosen each time the app opens: Local (this Mac only, nothing leaves it) or
@@ -193,7 +247,7 @@ const send = (event) => {
 
 function makeLlm() {
   if (DEMO) return demoLlm;
-  return process.env.ANTHROPIC_API_KEY ? claude(process.env.ANTHROPIC_API_KEY) : null;
+  return haveKeys() ? modelClient(keysFromEnv(process.env, config), config) : null;
 }
 
 // ---- Sessions: every job belongs to one, and the launcher shows it live ----------------------------
@@ -241,11 +295,11 @@ async function runGoal(goal, sessionId = null) {
   if (TEAM) {
     if (!cloud) throw new Error('Not connected to your team yet.');
     if (cloud.running) throw new Error('Your team already has a session running.');
-    cloud.startSession(goal, sessionId);
+    cloud.startSession(goal, sessionId, { lead: config.plannerModel ?? config.model, worker: config.workerModel ?? config.model });
     return { sessionId };
   }
   if (swarm?.running) throw new Error('The last job is still wrapping up. Send it again in a moment.');
-  if (!ensureSwarm()) { send({ type: 'need_key', goal }); throw new Error('Add your Anthropic API key first.'); }
+  if (!ensureSwarm()) { send({ type: 'need_key', goal, providers: missingKeys(config, keysFromEnv(process.env, config)) }); throw new Error(`Add your ${missingKeys(config, keysFromEnv(process.env, config)).map((p) => allProviders(config)[p]?.label ?? p).join(' and ') || 'API'} key first.`); }
   let meta = sessionId ? sessions.get(sessionId) : null;
   if (!meta) { meta = sessions.create(goal); swarm.lastJob = null; }   // a new session starts fresh, like a new chat
   const before = meta.turns.at(-1);
@@ -288,7 +342,7 @@ function launcherState() {
   return {
     mode, team: TEAM, demo: DEMO, lastMode: lastMode(), fixedMode: DEMO ? 'local' : normalMode(config.mode),
     org: TEAM ? lastAccount?.team ?? null : null,
-    hasKey: DEMO || Boolean(process.env.ANTHROPIC_API_KEY), account: lastAccount, running: isRunning(),
+    hasKey: haveKeys(), models: modelState(), account: lastAccount, running: isRunning(),
     current: TEAM ? teamLive?.id ?? null : current?.id ?? null, hotkey: pretty(hotkey), webUrl: HUB,
   };
 }
@@ -296,7 +350,9 @@ function launcherState() {
 const launcherHandlers = {
   state: () => launcherState(),
   'choose-mode': async (next) => { await setMode(next); return launcherState(); },
-  'save-key': (key) => { const problem = saveKey(String(key ?? '').trim()); if (problem) throw new Error(problem); return launcherState(); },
+  'save-key': (key, provider) => { const problem = saveKey(String(key ?? '').trim(), provider ?? null); if (problem) throw new Error(problem); return launcherState(); },
+  'forget-key': (provider) => { forgetKey(String(provider ?? '')); return launcherState(); },
+  'set-models': (models) => { setModels(models ?? {}); return launcherState(); },
   'sign-in': async (email, password) => {
     if (!cloud) throw new Error('Still reaching the team server. Try again in a moment.');
     await cloud.signIn(String(email ?? '').trim(), String(password ?? ''));

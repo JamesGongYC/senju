@@ -147,7 +147,8 @@ export class CloudClient {
   }
 
   // ---- What the person at this computer can do -----------------------------------------------
-  startSession(goal, continueId = null) { this.say({ t: 'start', goal, ...(continueId ? { continueId } : {}) }); }
+  // models: { lead, worker } from this app's settings; the server checks them and runs the session on them.
+  startSession(goal, continueId = null, models = null) { this.say({ t: 'start', goal, ...(continueId ? { continueId } : {}), ...(models ? { models } : {}) }); }
   chat(text, target) { this.say({ t: 'chat', text, target }); }
   answer(qid, text) { this.say({ t: 'answer', qid, text }); }
   cancel() { this.say({ t: 'cancel' }); }

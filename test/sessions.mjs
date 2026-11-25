@@ -138,7 +138,7 @@ const config = { model: 'fake', maxAgents: 2, maxSteps: 4, servers: {} };
   const makeLlm = (key) => ({
     async create(params) {
       await sleep(5);
-      keys.push(key);
+      keys.push(typeof key === "string" ? key : key?.anthropic);
       const isLead = params.tools?.[0]?.name === 'spawn_agent';
       if (!isLead) return { content: [say('typed it')], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } };
       leadSaw.push(params.messages.map(textOf).join('\n---\n'));

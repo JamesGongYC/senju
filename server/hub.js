@@ -10,6 +10,7 @@
 import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { costMicro, dollars, isActive } from './billing.js';
+import { parseKeys, resolveModel, missingKeys, providers, providersOf } from '../src/models.js';
 import { Swarm } from '../src/orchestrator.js';
 
 const slug = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'computer';
@@ -35,9 +36,11 @@ export class Hub {
    * @param {object} o.config     swarm settings: model, maxAgents, maxSteps, context, tokenBudget
    * @param {string} [o.traceDir]
    */
-  // hostedKey and pricing are set when the server sells hosted sessions; without them everyone brings a key.
+  // hostedKey (one Anthropic key, or { provider: key }) and pricing are set when the server sells hosted
+  // sessions; without them everyone brings their own keys.
   constructor({ store, makeLlm, config, traceDir = null, log = () => {}, hostedKey = null, pricing = null }) {
-    this.hostedKey = pricing ? hostedKey : null;
+    this.hostedKeys = pricing ? parseKeys(hostedKey) : {};
+    this.hostedKey = Object.keys(this.hostedKeys).length ? this.hostedKeys : null;
     this.pricing = pricing;
     this.store = store;
     this.makeLlm = makeLlm;
@@ -155,7 +158,7 @@ export class Hub {
       return this.send(client, { t: 'error', code: 'view_only', message: 'The web page is for watching and managing. Start, continue and steer sessions from the Senju desktop app.' });
     }
     switch (msg.t) {
-      case 'start': return this.start(client, String(msg.goal ?? '').trim(), msg.continueId ? String(msg.continueId) : null);
+      case 'start': return this.start(client, String(msg.goal ?? '').trim(), msg.continueId ? String(msg.continueId) : null, msg.models ?? null);
       case 'opened': case 'result': { // replies to our calls into a computer
         const waiting = client.rpc.get(msg.rid);
         if (!waiting) return;
@@ -217,7 +220,8 @@ export class Hub {
 
   // ---- Sessions ---------------------------------------------------------------------------
 
-  async start(client, goal, continueId = null) {
+  // models: { lead, worker } chosen in the desktop app, or null for the server's own (SWARM_MODEL).
+  async start(client, goal, continueId = null, models = null) {
     const team = client.team;
     if (!goal) return;
     if (team.session) return this.send(client, { t: 'error', message: `${team.session.owner.name} already has a session running. Write to its lead to change the plan.` });
@@ -227,17 +231,31 @@ export class Hub {
       prior = await this.store.getSession(continueId);
       if (!prior || prior.teamId !== team.id) return this.send(client, { t: 'error', code: 'no_session', message: 'That session is not in your team.' });
     }
-    // Whoever starts the session pays for it: with their own key if they saved one, otherwise from their credits.
-    let key = await this.store.getKey(client.user.id);
-    let hosted = false;
-    if (!key) {
-      if (!this.hostedKey) return this.send(client, { t: 'error', code: 'no_key', message: 'Add your Anthropic API key in the web app first. A session runs on the key of whoever starts it.' });
-      const account = await this.store.getBilling(client.user.id);
-      if (!isActive(account.status)) return this.send(client, { t: 'error', code: 'no_plan', message: 'Hosted sessions need a subscription. Subscribe in the web app, or save your own Anthropic key there to run for free.' });
-      if (account.credits < this.pricing.minStartMicro) return this.send(client, { t: 'error', code: 'no_credits', message: `You have ${dollars(Math.max(0, account.credits))} of credits left, which is not enough to start. Add credits in the web app.` });
-      key = this.hostedKey;
-      hosted = true;
+    // The models it runs on: the starter's choice, if each one names a provider this server knows.
+    const sessionConfig = { ...this.config, servers: {} };
+    for (const [role, field] of [['lead', 'plannerModel'], ['worker', 'workerModel']]) {
+      const want = models?.[role];
+      if (!want) continue;
+      try { sessionConfig[field] = resolveModel(want, this.config).key; } catch (err) { return this.send(client, { t: 'error', code: 'bad_model', message: err.message }); }
     }
+    // Whoever starts the session pays for it: with their own keys where they saved one, and from their credits for
+    // the rest, on the server's hosted keys.
+    const own = parseKeys(await this.store.getKey(client.user.id));
+    // A model named without a provider (tests, older settings) runs on whatever key there is, as before.
+    const missing = providersOf(sessionConfig).length ? missingKeys(sessionConfig, own) : Object.keys(own).length ? [] : ['anthropic'];
+    const viaHost = missing.filter((p) => this.hostedKeys[p]);
+    const uncovered = missing.filter((p) => !this.hostedKeys[p]);
+    if (uncovered.length) {
+      const names = uncovered.map((p) => providers(this.config)[p]?.label ?? p).join(' and ');
+      return this.send(client, { t: 'error', code: 'no_key', message: `Add your ${names} API key in the web app first. A session runs on the keys of whoever starts it.` });
+    }
+    const hosted = viaHost.length > 0;
+    if (hosted) {
+      const account = await this.store.getBilling(client.user.id);
+      if (!isActive(account.status)) return this.send(client, { t: 'error', code: 'no_plan', message: 'Hosted sessions need a subscription. Subscribe in the web app, or save your own API keys there to run for free.' });
+      if (account.credits < this.pricing.minStartMicro) return this.send(client, { t: 'error', code: 'no_credits', message: `You have ${dollars(Math.max(0, account.credits))} of credits left, which is not enough to start. Add credits in the web app.` });
+    }
+    const key = { ...Object.fromEntries(viaHost.map((p) => [p, this.hostedKeys[p]])), ...own };
 
     const s = {
       id: prior?.id ?? crypto.randomUUID(), team, goal,
@@ -252,10 +270,10 @@ export class Hub {
       people: new Map([[client.user.id, client.user.name]]),   // participants, for memory attribution
       // The session's current picture, for people who join late: built per person in snapshot().
       spawns: new Map(), latest: new Map(), leadLast: null, stateNow: 'planning', log: [], done: null,
-      billing: hosted ? { cost: 0, charged: 0, n: 0, out: false, chain: Promise.resolve() } : null,
+      billing: hosted ? { cost: 0, charged: 0, n: 0, out: false, chain: Promise.resolve(), providers: new Set(viaHost) } : null,
     };
     const store = this.store;
-    const config = { ...this.config, servers: {} };
+    const config = sessionConfig;
     s.swarm = new Swarm({
       llm: this.makeLlm(key),
       config,
@@ -320,7 +338,13 @@ export class Hub {
   // frequent so that a crash loses little, and the session stops as soon as the balance is gone.
   meter(s, usage, final = false) {
     const b = s.billing;
-    b.cost = costMicro(usage, this.pricing);
+    // Only what ran on the hosted keys is charged: tokens on the starter's own keys are theirs.
+    let billed = usage;
+    if (usage.byModel) {
+      const mine = (m) => { try { return b.providers.has(resolveModel(m, this.config).provider); } catch { return true; } };
+      billed = { ...usage, byModel: Object.fromEntries(Object.entries(usage.byModel).filter(([m]) => mine(m))) };
+    }
+    b.cost = costMicro(billed, this.pricing, this.config);
     const due = b.cost - b.charged;
     if (due <= 0 || (!final && due < CHARGE_STEP)) return b.chain;
     b.charged = b.cost;

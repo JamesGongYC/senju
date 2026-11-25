@@ -8,6 +8,7 @@
 // Money is counted in micro-dollars (1,000,000 = $1.00) so that small token costs are not rounded away.
 // Stripe is called over plain HTTPS with no library: three calls and one signature check.
 import crypto from 'node:crypto';
+import { resolveModel } from '../src/models.js';
 
 export const MICRO = 1_000_000;
 const num = (v, fallback) => (Number.isFinite(Number(v)) && v !== '' && v != null ? Number(v) : fallback);
@@ -29,8 +30,24 @@ export function pricing(env = process.env) {
 }
 
 // The price of a session so far, in micro-dollars. `usage` is the running total the swarm reports.
-export function costMicro(usage, p) {
-  const dollars = ((usage.input ?? 0) * p.input + (usage.output ?? 0) * p.output + (usage.cacheRead ?? 0) * p.cacheRead + (usage.cacheWrite ?? 0) * p.cacheWrite) / 1e6;
+// With usage.byModel (tokens per model), each model is priced at its own rates: Claude models at the rates above
+// (set by env, since the hosted key is Anthropic's), others at their profile's price in src/models.js, and a model
+// with no known price at the rates above. `config` carries any "models" overrides.
+export function costMicro(usage, p, config = {}) {
+  const at = (u, r) => ((u.input ?? 0) * r.input + (u.output ?? 0) * r.output + (u.cacheRead ?? 0) * (r.cacheRead ?? r.input) + (u.cacheWrite ?? 0) * (r.cacheWrite ?? r.input)) / 1e6;
+  const byModel = usage.byModel ?? null;
+  let dollars = 0;
+  if (!byModel) dollars = at(usage, p);
+  else {
+    for (const [model, u] of Object.entries(byModel)) {
+      let rates = p;
+      try {
+        const m = resolveModel(model, config);
+        if (!m.providerInfo.native && m.price) rates = m.price;
+      } catch { /* unknown name: the default rates */ }
+      dollars += at(u, rates);
+    }
+  }
   return Math.ceil(dollars * p.markup * MICRO);
 }
 

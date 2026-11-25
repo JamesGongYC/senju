@@ -97,7 +97,7 @@ const makeLlm = (key) => ({
   async create(params, { signal } = {}) {
     await sleep(10);
     if (signal?.aborted) throw new Error('aborted');
-    seen.keys.push(key); seen.calls++;
+    seen.keys.push(typeof key === "string" ? key : key?.anthropic); seen.calls++;
     const usage = { input_tokens: 100000, output_tokens: 20000 };
     const isLead = params.tools?.[0]?.name === 'spawn_agent';
     const last = params.messages.at(-1);

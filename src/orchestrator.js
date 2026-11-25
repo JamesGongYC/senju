@@ -9,6 +9,7 @@ import { clearPopups } from './popups.js';
 import { clickOnScreenKey } from './keys.js';
 import { watchAds } from './adskip.js';
 import { VISION_TOOLS, MOVES_VIEW, look, clickAt, canSee } from './vision.js';
+import { fitTools } from './models.js';
 import { widenWindowState, rememberFrames, pointDesk, showLaunched, reveal, OFF_SPACE, lookAfter, ACTS, readWindow } from './deskpoint.js';
 import { READ_ONLY, noteTarget, userActive, collides, inBackground, WAIT_LABEL } from './desktop.js';
 import { Tracer, describeResponse } from './trace.js';
@@ -429,6 +430,11 @@ What a good skill looks like:
 
 Separately, if a participant stated a lasting preference or fact during this job that is not yet remembered, save it with remember, attributed to the person who said it. Skip anything that only mattered for this job.` : ''}`;
 
+// For a worker whose model cannot see images (src/models.js): screenshots reach it as a short note.
+const NO_VISION_RULES = `
+# You cannot see images
+Your model reads text only. Screenshots reach you as a note, not a picture. Read windows from get_window_state's element tree and pages from browser_snapshot, and act on elements by their tokens and refs, never by position on a screenshot.`;
+
 const MAX_SPAWNS = 24;      // total workers per job
 const WORKER_MAX_TOKENS = 16000;
 const LEAD_MAX_TOKENS = 8000;
@@ -528,15 +534,27 @@ export class Swarm {
    */
   // How hard the model thinks per call ("effort" in swarm.config.json: a level, or { lead, worker }).
   // Lower effort answers sooner; the default (no setting) is the model's own.
-  effortParams(role) {
+  // What the model can do (src/models.js), or null for a client that does not say (tests, the demo).
+  profile(model) {
+    try { return this.llm.profile?.(model) ?? null; } catch { return null; }
+  }
+  leadModel() { return this.config.plannerModel ?? this.config.model; }
+  workerModel() { return this.config.workerModel ?? this.config.model; }
+
+  effortParams(role, model = null) {
+    const p = model ? this.profile(model) : null;
+    if (p && !p.effort) return {};
     const e = this.config.effort;
     const level = typeof e === 'string' ? e : e?.[role];
     return level ? { output_config: { effort: level } } : {};
   }
 
-  longRunParams() {
+  longRunParams(model = null) {
     const c = this.config.context ?? {};
     if (!this.serverContext || c.enabled === false) return {};
+    // Compaction, clearing and caching are Anthropic's: other models get their history fitted by the client.
+    const p = model ? this.profile(model) : null;
+    if (p && !p.serverContext) return {};
     return {
       betas: CONTEXT_BETAS,
       cache_control: { type: 'ephemeral' },
@@ -558,14 +576,28 @@ export class Swarm {
     };
   }
 
-  // Count tokens, report them, and enforce the job's token budget.
-  account(who, res) {
+  // Is history trimmed by the app for this model (no server-side compaction)?
+  clientTrim(model) {
+    const p = this.profile(model);
+    return !this.serverContext || this.config.context?.enabled === false || Boolean(p && !p.serverContext);
+  }
+
+  // Count tokens, report them, and enforce the job's token budget. Tokens are also counted per model, since
+  // the lead and the workers can run on different ones at different prices.
+  account(who, res, model = null) {
     const u = res.usage ?? {};
     this.usage.calls++;
     this.usage.input += u.input_tokens ?? 0;
     this.usage.output += u.output_tokens ?? 0;
     this.usage.cacheRead += u.cache_read_input_tokens ?? 0;
     this.usage.cacheWrite += u.cache_creation_input_tokens ?? 0;
+    const name = model ?? res.model ?? 'unknown';
+    const m = ((this.usage.byModel ??= {})[name] ??= { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+    m.input += u.input_tokens ?? 0;
+    m.output += u.output_tokens ?? 0;
+    m.cacheRead += u.cache_read_input_tokens ?? 0;
+    m.cacheWrite += u.cache_creation_input_tokens ?? 0;
+    if (res.trimmed) this.trace(who, 'context', { note: `${res.trimmed} old messages left out of the request to fit the model's context` });
     this.emit({ type: 'usage', ...this.usage });
     for (const block of res.content ?? []) {
       if (block.type === 'compaction') {
@@ -712,9 +744,10 @@ export class Swarm {
       owner.interrupted = false;
       owner.interrupt = () => { owner.interrupted = true; turn.abort(); };
       try {
-        const res = await this.llm.create(prepare(), { signal: turn.signal });
+        const req = prepare();
+        const res = await this.llm.create(req, { signal: turn.signal });
         if (signal.aborted) throw new Error('cancelled');
-        this.account(who, res);
+        this.account(who, res, req.model);
         if (signal.aborted) throw new Error('cancelled');
         if (owner.interrupted) { this.trace(who, 'interrupt', { note: 'user message arrived; discarding reply and asking again' }); continue; }
         return res;
@@ -797,9 +830,9 @@ export class Swarm {
     try {
       messages.push({ role: 'user', content: RETRO(await this.skills.list(), Boolean(this.memory)) });
       for (let turn = 0; turn < 6; turn++) {
-        const res = await this.llm.create({ model: this.config.plannerModel ?? this.config.model, max_tokens: LEAD_MAX_TOKENS, system, tools, messages, ...this.longRunParams() }, { signal });
+        const res = await this.llm.create({ model: this.leadModel(), max_tokens: LEAD_MAX_TOKENS, system, tools, messages, ...this.longRunParams(this.leadModel()) }, { signal });
         if (signal.aborted) return;
-        this.account('lead', res);
+        this.account('lead', res, this.leadModel());
         this.trace('lead', 'response', describeResponse(res, `retro ${turn + 1}`));
         messages.push({ role: 'assistant', content: res.content });
         const calls = res.content.filter((b) => b.type === 'tool_use');
@@ -1072,16 +1105,19 @@ export class Swarm {
       }
       // Browser windows also get browser_scroll, which the ghost cursor plays (src/point.js), and the tools to see
       // the page as a picture and click by position in it (src/vision.js).
+      // A model that cannot see images gets no picture tools; one with a small context, fewer tools (src/models.js).
+      const wprof = this.profile(this.workerModel());
+      const sees = wprof ? wprof.vision !== false : true;
       const { tools, lookup } = buildToolset(conns, (c) => (this.config.servers[c.name]?.tile === 'playwright' && c.tools.some((t) => t.name === 'browser_evaluate')
-        ? [SCROLL_TOOL, ...(this.config.vision !== false && canSee(c) ? VISION_TOOLS : [])] : []));
+        ? [SCROLL_TOOL, ...(this.config.vision !== false && sees && canSee(c) ? VISION_TOOLS : [])] : []));
       const others = this.agents.filter((a) => a.id !== agent.id && a.live);
       const skillNotes = (this.skills ? await Promise.all(agent.skills.map((n) => this.skills.read(n))) : []).filter(Boolean).map((k) => `## ${k.name}\n${k.body}`).join('\n\n');
       const desktop = agent.servers.some((sv) => this.config.servers[sv]?.kind === 'desktop');
       const terminal = tools.some((t) => /(^|__)run_command$/.test(t.name));
-      const system = [{ type: 'text', text: WORKER_SYSTEM(agent, others, this.workspace, skillNotes, desktop, Boolean(this.team)) + (terminal ? TERMINAL_RULES(this.config.autoInstallApps === false ? '' : ' (installing a Mac app the task needs is the exception: see below)') + (this.config.autoInstallApps === false ? '' : APP_INSTALL_RULES) : ''), cache_control: { type: 'ephemeral' } }];
+      const system = [{ type: 'text', text: WORKER_SYSTEM(agent, others, this.workspace, skillNotes, desktop, Boolean(this.team)) + (terminal ? TERMINAL_RULES(this.config.autoInstallApps === false ? '' : ' (installing a Mac app the task needs is the exception: see below)') + (this.config.autoInstallApps === false ? '' : APP_INSTALL_RULES) : '') + (sees ? '' : NO_VISION_RULES), cache_control: { type: 'ephemeral' } }];
       const messages = [{ role: 'user', content: 'Begin your subtask now.' }];
       const maxSteps = this.config.maxSteps ?? 300;
-      const allTools = [...tools, ...BOARD_TOOLS, ...TEAM_TOOLS, ...HUMAN_TOOLS];
+      const allTools = fitTools([...tools, ...BOARD_TOOLS, ...TEAM_TOOLS, ...HUMAN_TOOLS], wprof);
       // The user wrote while this worker is inside a long tool call (Claude Code, a build, a wait): answer now, in
       // plain words, from the conversation so far, instead of leaving them waiting minutes for the step to end.
       // The step keeps running. Same system prompt, tools and history as the worker's own calls, so it reads them
@@ -1094,8 +1130,8 @@ export class Swarm {
         const secs = Math.round((Date.now() - (agent.busy?.since ?? Date.now())) / 1000);
         const pending = turn.calls.filter((c) => !done.has(c.id)).map((c) => ({ type: 'tool_result', tool_use_id: c.id, content: [{ type: 'text', text: c.id === agent.busy?.id ? `Still running (for ${secs}s so far); its result is not back yet.` : 'Not started yet: it runs after the step before it.' }] }));
         copy.push({ role: 'user', content: [...JSON.parse(JSON.stringify(turn.results)), ...pending, { type: 'text', text: `Message from the user${item.name ? ` ${item.name}` : ''}: ${item.text}\n\n(Your step is still running, so this is a quick reply while it runs. Answer the user directly, in one to three plain, natural sentences written to them: what you are doing right now, how far along it is, and what comes next, or the answer to what they asked. Do not call tools; the step keeps running. If they want a change, say you will make it as soon as this step finishes.)` }] });
-        const res = await this.llm.create({ model: this.config.workerModel ?? this.config.model, max_tokens: 1500, system, tools: allTools, tool_choice: { type: 'none' }, messages: copy, ...this.longRunParams(), ...this.effortParams('worker') }, { signal });
-        this.account(agent.name, res);
+        const res = await this.llm.create({ model: this.workerModel(), max_tokens: 1500, system, tools: allTools, tool_choice: { type: 'none' }, messages: copy, ...this.longRunParams(this.workerModel()), ...this.effortParams('worker', this.workerModel()) }, { signal });
+        this.account(agent.name, res, this.workerModel());
         const reply = res.content.filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
         if (!reply || signal.aborted) return false;
         this.trace(agent.name, 'message', { note: `quick reply to the user: ${reply}` });
@@ -1114,8 +1150,8 @@ export class Swarm {
           if (typeof last.content === 'string') last.content = [{ type: 'text', text: last.content }];
           last.content.push({ type: 'text', text: takeInbox() });
         }
-        if (!this.serverContext || this.config.context?.enabled === false) prune(messages);   // client-side fallback only
-        return { model: this.config.workerModel ?? this.config.model, max_tokens: WORKER_MAX_TOKENS, system, tools: allTools, messages, ...this.longRunParams(), ...this.effortParams('worker') };
+        if (this.clientTrim(this.workerModel())) prune(messages);   // no server-side compaction for this model
+        return { model: this.workerModel(), max_tokens: WORKER_MAX_TOKENS, system, tools: allTools, messages, ...this.longRunParams(this.workerModel()), ...this.effortParams('worker', this.workerModel()) };
       };
 
       for (let step = 0; step < maxSteps; step++) {
@@ -1428,8 +1464,8 @@ export class Swarm {
           messages.push({ role: 'user', content: ask });
         }
         try {
-          const res = await this.llm.create({ model: this.config.model, max_tokens: 2000, system, tools: allTools, messages, ...this.longRunParams() }, { signal });
-          this.account(agent.name, res);
+          const res = await this.llm.create({ model: this.workerModel(), max_tokens: 2000, system, tools: allTools, messages, ...this.longRunParams(this.workerModel()) }, { signal });
+          this.account(agent.name, res, this.workerModel());
           const text = res.content.filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
           if (text) finalText = text;
         } catch { /* keep the last note we have */ }
@@ -1495,7 +1531,8 @@ export class Swarm {
         last.content.push({ type: 'text', text: `Updates:\n${this.drainEvents()}` });
       }
       if (this.leadChat) lead('thinking', 'reading your message');
-      return { model: this.config.plannerModel ?? this.config.model, max_tokens: LEAD_MAX_TOKENS, system, tools: this.leadToolset(), messages, ...this.longRunParams(), ...this.effortParams('lead') };
+      if (this.clientTrim(this.leadModel())) prune(messages, 6, 600);
+      return { model: this.leadModel(), max_tokens: LEAD_MAX_TOKENS, system, tools: this.leadToolset(), messages, ...this.longRunParams(this.leadModel()), ...this.effortParams('lead', this.leadModel()) };
     };
 
     for (let turn = 0; turn < MAX_LEAD_TURNS; turn++) {

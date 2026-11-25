@@ -18,6 +18,7 @@ import { handleApi } from './api.js';
 import { SupabaseStore } from './store-supabase.js';
 import { Billing, verifyWebhook } from './billing.js';
 import { makeLlm } from '../src/llm.js';
+import { keysFromEnv, parseKeys, guessProvider, checkKey, providers as allProviders, resolveModel } from '../src/models.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const env = process.env;
@@ -38,12 +39,15 @@ if (missing.length) {
 if (publicKey === secretKey) { console.error('SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY are the same value. The secret key must never be the one sent to browsers.'); process.exit(1); }
 const store = new SupabaseStore({ url: env.SUPABASE_URL, serviceKey: secretKey, encryptionSecret: env.KEY_ENCRYPTION_SECRET });
 const billing = new Billing({ store, env, log: (...a) => console.error(...a) });
-const hostedKey = env.ANTHROPIC_API_KEY || null;
-if (hostedKey && !billing.enabled) console.error('ANTHROPIC_API_KEY is set but STRIPE_SECRET_KEY is not: nobody can buy credits, so hosted sessions cannot start.');
+// Hosted keys, by provider: ANTHROPIC_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, GROQ_API_KEY.
+const hostedKeys = keysFromEnv(env);
+const hostedKey = Object.keys(hostedKeys).length ? hostedKeys : null;
+if (hostedKey && !billing.enabled) console.error('Hosted API keys are set but STRIPE_SECRET_KEY is not: nobody can buy credits, so hosted sessions cannot start.');
 if (billing.enabled && !billing.webhookSecret) console.error('STRIPE_WEBHOOK_SECRET is not set: payments will be taken but credits will not be added.');
+// The models sessions run on unless the desktop app that starts one chooses others.
 const model = env.SWARM_MODEL ?? 'claude-sonnet-5-5';
 const config = {
-  model, plannerModel: model,
+  model, plannerModel: model, ...(env.SWARM_WORKER_MODEL ? { workerModel: env.SWARM_WORKER_MODEL } : {}),
   maxAgents: Number(env.SWARM_MAX_AGENTS ?? 4), maxSteps: 300, tokenBudget: Number(env.SWARM_TOKEN_BUDGET ?? 40000000),
   context: { enabled: true, clearToolResultsAt: 200000, keepToolResults: 10, compactAt: 500000 },
 };
@@ -61,7 +65,8 @@ const signedIn = (req) => store.verifyToken((req.headers.authorization ?? '').re
 // Where Stripe sends people back to. Set PUBLIC_URL in production; locally the request's own address is right.
 const originOf = (req) => (env.PUBLIC_URL || `${req.headers['x-forwarded-proto'] ?? 'http'}://${req.headers.host}`).replace(/\/+$/, '');
 
-const hub = new Hub({ store, makeLlm, config, hostedKey, pricing: hostedKey ? billing.p : null, traceDir: env.SWARM_TRACE_DIR ?? null, log: (...a) => console.error(...a) });
+for (const m of [config.model, config.workerModel].filter(Boolean)) { try { resolveModel(m, config); } catch (err) { console.error(`SWARM_MODEL / SWARM_WORKER_MODEL: ${err.message}`); process.exit(1); } }
+const hub = new Hub({ store, makeLlm: (keys) => makeLlm(keys, config), config, hostedKey, pricing: hostedKey ? billing.p : null, traceDir: env.SWARM_TRACE_DIR ?? null, log: (...a) => console.error(...a) });
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -73,17 +78,31 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/health') return json(res, 200, { ok: true });
     // What a client needs to reach Supabase. The publishable key is public by design.
     if (url.pathname === '/api/config') return json(res, 200, { supabaseUrl: env.SUPABASE_URL, supabaseAnonKey: publicKey });
+    // Your own API keys, one per provider. They are never sent back: GET lists which providers have one.
     if (url.pathname === '/api/key') {
       const user = await signedIn(req);
       if (!user) return json(res, 401, { error: 'Sign in again.' });
-      if (req.method === 'DELETE') { await store.deleteKey(user.id); return json(res, 200, { ok: true }); }
-      if (req.method === 'POST') {
-        const key = String((await readBody(req)).key ?? '').trim();
-        if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(key)) return json(res, 400, { error: 'That does not look like an Anthropic API key.' });
-        await store.setKey(user.id, key);
-        return json(res, 200, { ok: true });
+      const saved = parseKeys(await store.getKey(user.id));
+      const list = () => ({ providers: Object.keys(saved), known: Object.entries(allProviders(config)).filter(([, p]) => p.keyEnv).map(([id, p]) => ({ id, label: p.label, hint: p.keyHint })) });
+      if (req.method === 'GET') return json(res, 200, list());
+      if (req.method === 'DELETE') {
+        const which = url.searchParams.get('provider');
+        if (which) delete saved[which]; else for (const k of Object.keys(saved)) delete saved[k];
+        if (Object.keys(saved).length) await store.setKey(user.id, JSON.stringify(saved)); else await store.deleteKey(user.id);
+        return json(res, 200, { ok: true, ...list() });
       }
-      return json(res, 405, { error: 'Use POST or DELETE.' });
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        const key = String(body.key ?? '').trim();
+        const provider = String(body.provider ?? '') || guessProvider(key);
+        if (!provider) return json(res, 400, { error: 'Choose which provider this key is for.' });
+        const problem = checkKey(provider, key, config);
+        if (problem) return json(res, 400, { error: problem });
+        saved[provider] = key;
+        await store.setKey(user.id, JSON.stringify(saved));
+        return json(res, 200, { ok: true, ...list() });
+      }
+      return json(res, 405, { error: 'Use GET, POST or DELETE.' });
     }
     // ---- Sessions, skills, memory, team (the control page) ----
     if (url.pathname.startsWith('/api/') && await handleApi({ req, url, user: await signedIn(req), store, hub, json: (code, body) => (json(res, code, body), true), readBody })) return;

@@ -44,7 +44,7 @@ const scripts = {
 };
 const makeLlm = (key) => ({
   async create(params, { signal } = {}) {
-    seen.keys.push(key);
+    seen.keys.push(typeof key === "string" ? key : key?.anthropic);
     await sleep(15);
     if (signal?.aborted) throw new Error('aborted');
     const isLead = params.tools?.[0]?.name === 'spawn_agent';

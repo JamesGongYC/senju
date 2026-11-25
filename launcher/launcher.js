@@ -17,7 +17,7 @@ async function call(name, ...args) {
 const app = {
   s: null,                 // the main process's state (mode, account, running…)
   view: 'loading',         // choose | key | signin | home
-  panel: 'new',            // new | session | library
+  panel: 'new',            // new | session | library | models
   selected: null,          // session id
   sessions: [],
   detail: null,            // the selected session's meta
@@ -76,21 +76,64 @@ function chooseScreen() {
     h('p', { class: 'stage-foot' }, 'You can switch any time from the ◎ menu bar icon.'));
 }
 
+// Local without keys for the chosen models: choose the models, then add the keys they need.
 function keyScreen() {
-  const input = h('input', { class: 'field', type: 'password', placeholder: 'sk-ant-…', autofocus: true });
-  const err = h('p', { class: 'error-text' });
-  const save = async () => {
-    try { app.s = await call('saveKey', input.value); route(); } catch (e) { err.textContent = e.message; }
-  };
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
   return h('main', { class: 'stage centered' },
     h('header', { class: 'top drag' }, h('span', { class: 'logo display' }, 'Senju')),
-    h('div', { class: 'panel-card' },
+    h('div', { class: 'panel-card wide' },
       h('div', { class: 'choice-kicker' }, 'Local'),
-      h('h2', { class: 'display card-title' }, 'Your API key'),
-      h('p', { class: 'dim' }, 'Local sessions run on your own Anthropic key. It is stored encrypted in this Mac’s keychain and never leaves it.'),
-      input, err,
-      h('div', { class: 'row' }, h('button', { class: 'btn btn-ghost', onclick: () => back() }, '← Back'), h('button', { class: 'btn btn-punk', onclick: save }, 'Save key'))));
+      h('h2', { class: 'display card-title' }, 'Models & keys'),
+      h('p', { class: 'dim' }, 'Local sessions run on your own API keys. They are stored encrypted in this Mac’s keychain and never leave it.'),
+      modelsForm({ firstRun: true }),
+      h('div', { class: 'row' }, h('button', { class: 'btn btn-ghost', onclick: () => back() }, '← Back'))));
+}
+
+// The models the lead and the workers run on, and an API key per provider. Used on the key screen and in the
+// "Models & keys" panel.
+function modelsForm({ firstRun = false } = {}) {
+  const m = app.s.models;
+  const box = h('div', { class: 'models' });
+  if (!m) return box;
+  const err = h('p', { class: 'error-text' });
+  const list = h('datalist', { id: 'model-suggestions' }, m.suggestions.map((v) => h('option', { value: v })));
+  const plain = (k) => (k?.startsWith('anthropic:') ? k.slice(10) : k);
+  const field = (info) => h('input', { class: 'field', list: 'model-suggestions', value: plain(info.key) ?? '', spellcheck: false });
+  const lead = field(m.lead), worker = field(m.worker);
+  const about = (info) => (info.error ? h('span', { class: 'error-text small' }, info.error)
+    : h('span', { class: 'dim small' }, [info.label, info.vision ? 'sees images' : 'text only', `${Math.round(info.context / 1000)}K context`, info.price ? `$${info.price.input}/$${info.price.output} per M tokens` : null].filter(Boolean).join(' · ')));
+  const saveModels = async () => {
+    err.textContent = '';
+    try { app.s = await call('setModels', { lead: lead.value, worker: worker.value }); if (firstRun) route(); else render(); } catch (e) { err.textContent = e.message; }
+  };
+  const needed = new Set([m.lead.provider, m.worker.provider].filter(Boolean));
+  const keyRow = (p) => {
+    const input = h('input', { class: 'field', type: 'password', placeholder: p.hint, autocomplete: 'off' });
+    const save = async () => {
+      err.textContent = '';
+      try { app.s = await call('saveKey', input.value, p.id); if (firstRun && app.s.hasKey) route(); else render(); } catch (e) { err.textContent = e.message; }
+    };
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+    const status = !p.needsKey ? 'no key needed' : p.hasKey ? 'saved' : needed.has(p.id) ? 'needed for your models' : 'not set';
+    const forget = async () => { app.s = await call('forgetKey', p.id); render(); };
+    return h('div', { class: `key-row${needed.has(p.id) && !p.hasKey ? ' need' : ''}` },
+      h('div', { class: 'key-name' }, h('b', {}, p.label), h('span', { class: 'dim small' }, status)),
+      p.needsKey && p.savable
+        ? (p.hasKey ? h('button', { class: 'link', onclick: forget }, 'Remove')
+          : h('div', { class: 'key-input' }, input, h('button', { class: 'btn btn-punk btn-sm', onclick: save }, 'Save')))
+        : null);
+  };
+  // Keys matter only for Local: Cloud sessions use the keys saved on the web page.
+  const shown = m.providers.filter((p) => needed.has(p.id) || (p.needsKey && p.hasKey) || ['anthropic', 'openrouter'].includes(p.id));
+  box.append(list,
+    h('label', { class: 'model-field' }, h('span', { class: 'kicker' }, 'Lead (plans and talks to you)'), lead, about(m.lead)),
+    h('label', { class: 'model-field' }, h('span', { class: 'kicker' }, 'Workers (do the steps)'), worker, about(m.worker)),
+    h('div', { class: 'row left' }, h('button', { class: 'btn btn-punk btn-sm', onclick: saveModels }, 'Use these models')),
+    h('p', { class: 'dim small' }, 'A Claude id (claude-sonnet-5-5) or provider:model, for example openrouter:ricursiveai/ripple-65b-preview.'),
+    app.s.team
+      ? h('p', { class: 'dim small' }, 'Cloud sessions run on the API keys saved on the web page (Billing). Add a key there for each provider your models use.')
+      : h('div', { class: 'keys' }, h('span', { class: 'kicker' }, 'API keys'), shown.map(keyRow)),
+    err);
+  return box;
 }
 
 function signinScreen() {
@@ -168,6 +211,7 @@ function homeScreen() {
     sessionList(),
     h('div', { class: 'side-bottom' },
       h('button', { class: `side-link${app.panel === 'library' ? ' on' : ''}`, onclick: () => { app.panel = 'library'; render(); } }, 'Skills & memory'),
+      h('button', { class: `side-link${app.panel === 'models' ? ' on' : ''}`, onclick: () => { app.panel = 'models'; render(); } }, 'Models & keys'),
       s.team ? h('button', { class: 'side-link', onclick: () => call('openWeb') }, 'Manage orgs on the web ↗') : null,
       h('div', { class: 'side-account' },
         h('span', {}, s.team ? (s.account?.user?.name ?? '') : 'On this Mac only'),
@@ -175,6 +219,7 @@ function homeScreen() {
         s.team ? h('button', { class: 'link light', onclick: async () => { await call('signOut'); } }, 'Sign out') : null)));
   let main;
   if (app.panel === 'library') main = libraryPanel();
+  else if (app.panel === 'models') main = h('section', { class: 'main models-panel' }, h('h2', { class: 'display' }, 'Models & keys'), modelsForm());
   else if (app.panel === 'session' && app.selected) main = sessionPanel();
   else main = newPanel();
   return h('div', { class: 'home' }, side, main);
@@ -319,7 +364,7 @@ senju.onEvent(async (msg) => {
     app.s = { ...app.s, running: msg.running };
     if (app.view === 'home') {
       const box = document.querySelector('.composer');
-      if (box && app.panel !== 'library') box.replaceWith(composer({ sessionId: app.panel === 'session' ? app.selected : null, placeholder: 'Continue this session: the lead remembers everything so far' }));
+      if (box && app.panel !== 'library' && app.panel !== 'models') box.replaceWith(composer({ sessionId: app.panel === 'session' ? app.selected : null, placeholder: 'Continue this session: the lead remembers everything so far' }));
       loadSessions();
     }
   } else if (msg.kind === 'sessions') {

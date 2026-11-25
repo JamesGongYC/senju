@@ -6,7 +6,7 @@ A prompt bar at the top of your screen. Type a goal, and a swarm of Claude agent
 
 ```bash
 npm install
-cp .env.example .env      # then paste your Anthropic API key into .env
+cp .env.example .env      # then paste your API key into .env (or add it in the app)
 npm start
 ```
 
@@ -115,6 +115,25 @@ After every finished job that used workers, the lead runs a short retrospective 
 - **How it improves.** If a skill already covers the same ground, the lead reads it and saves a merged, corrected version. The old version is kept in `skills/.history/`.
 - **You are in control.** Skills are plain files. Read them, edit them, or delete them. A toast tells you whenever one is created or improved. Set `"skills": false` in `swarm.config.json` to turn this off.
 
+## Models
+
+Senju runs on Claude by default, and on any model behind an OpenAI-compatible API: OpenRouter, OpenAI, Together, Groq, Ollama on this Mac, or your own endpoint. The lead and the workers can run on different models. Choose them in the Senju window under **Models & keys** (or `plannerModel` and `workerModel` in `swarm.config.json`), and add an API key for each provider they use.
+
+- **Names.** A Claude id on its own (`claude-sonnet-5-5`), or `provider:model`, for example `openrouter:ricursiveai/ripple-65b-preview`, `openai:gpt-5`, `together:ricursiveai/ripple-65b-preview` or `ollama:llama3.3`.
+- **Keys.** Local keys are stored encrypted in the keychain, one per provider (or `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `TOGETHER_API_KEY`, `GROQ_API_KEY` in `.env`). Cloud sessions use the keys you save on the web page, one per provider; the server can also host keys of each kind and charge credits for them.
+- **What each model can do.** Every model has a profile: context size, longest reply, whether it sees images, and its price. Claude keeps everything: server-side compaction, tool-result clearing, caching and effort. Other models get their history fitted by the app (old results shrunk, then the oldest steps left out, with a note). A model with a small context gets fewer tool definitions. A model that cannot see images gets a note in place of each screenshot, no picture tools, and is told to work from the window and page text.
+- **Ripple.** `ripple-65b-preview` is text only, with a 1M-token context on OpenRouter, at $0.10 / $0.30 per million tokens. Other providers may serve a shorter context: set it under `models`.
+- **Your own settings.** Override a profile, or add a provider:
+
+```json
+"models": { "openrouter:ricursiveai/ripple-65b-preview": { "context": 65536 } },
+"providers": { "mylab": { "baseURL": "https://llm.mylab.dev/v1", "keyEnv": "MYLAB_API_KEY" } }
+```
+
+On the server, `SWARM_MODEL` and `SWARM_WORKER_MODEL` set the models for sessions that don't choose their own. The desktop app sends its chosen models when it starts a Cloud session.
+
+The Claude Code terminal tool still runs Claude Code, whatever the agents' own models are.
+
 ## Long-running jobs
 
 Jobs can run for hours. These are set under `context`, `maxSteps` and `tokenBudget` in `swarm.config.json`:
@@ -127,7 +146,7 @@ Jobs can run for hours. These are set under `context`, `maxSteps` and `tokenBudg
 - **Steps.** A worker gets `maxSteps` model turns (default 300).
 - **Keep-awake and notifications.** The Mac stays awake while a job runs, and you get a banner when an agent needs you or the job finishes.
 
-If the model or account rejects the server-side features, the app says so once and falls back to trimming old tool results itself. Set `"context": { "enabled": false }` to force that fallback.
+These server-side features are Claude's. Other models (see Models) have their history fitted by the app. If a Claude model or account rejects the server-side features, the app says so once and falls back to trimming old tool results itself. Set `"context": { "enabled": false }` to force that fallback.
 
 ## Traces
 
