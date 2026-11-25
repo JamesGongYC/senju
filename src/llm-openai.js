@@ -95,6 +95,7 @@ export function toChat(params, profile) {
     if (later.length) out.push({ role: 'user', content: later.every((p) => p.type === 'text') ? later.map((p) => p.text).join('\n') : later });
   }
   const req = { model: profile.id, messages: out, max_tokens: params.max_tokens };
+  if (typeof params.temperature === 'number') req.temperature = params.temperature;
   if (params.tools?.length && profile.tools !== false) {
     req.tools = params.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description ?? '', parameters: t.input_schema ?? { type: 'object', properties: {} } } }));
     const tc = params.tool_choice?.type;
@@ -149,6 +150,9 @@ export function fromChat(body, model) {
 }
 
 // An error that looks like the Anthropic SDK's, so the orchestrator's checks (too long, rejected) still work.
+// Some endpoints (reasoning models above all) accept only their default temperature.
+const TEMPERATURE_REFUSED = /temperature.*(not supported|unsupported|only the default|does not support)/i;
+
 function apiError(status, body) {
   const msg = body?.error?.message ?? body?.message ?? (typeof body === 'string' ? body : JSON.stringify(body ?? {}));
   const err = new Error(`${status} ${msg}`);
@@ -208,10 +212,22 @@ export function openAiCreate(client, model) {
     const { messages, trimmed } = fitMessages(params.messages ?? [], budget, fixed);
     const profile = { ...model, resultChars: Math.max(4000, Math.floor(model.context * CHARS_PER_TOKEN * 0.15)) };
     const req = toChat({ ...params, messages, max_tokens: maxOut }, profile);
-    let reply = fromChat(await client.post(req, signal), model.key);
+    // A temperature refusal drops the setting for this client from then on, and the request goes again.
+    if (client.noTemperature) delete req.temperature;
+    const send = async () => {
+      try {
+        return await client.post(req, signal);
+      } catch (err) {
+        if (err?.status !== 400 || !('temperature' in req) || !TEMPERATURE_REFUSED.test(err.message)) throw err;
+        client.noTemperature = true;
+        delete req.temperature;
+        return client.post(req, signal);
+      }
+    };
+    let reply = fromChat(await send(), model.key);
     // Tool arguments that are not JSON: ask once more before handing back an empty call.
     if (reply.badToolArgs) {
-      const again = fromChat(await client.post(req, signal), model.key);
+      const again = fromChat(await send(), model.key);
       if (!again.badToolArgs) {
         again.usage.input_tokens += reply.usage.input_tokens; again.usage.output_tokens += reply.usage.output_tokens;
         reply = again;

@@ -437,6 +437,9 @@ Your model reads text only. Screenshots reach you as a note, not a picture. Read
 
 const MAX_SPAWNS = 24;      // total workers per job
 const WORKER_MAX_TOKENS = 16000;
+// Default sampling temperature per role for models behind an OpenAI-compatible API (see samplingParams). The lead,
+// and every Claude model, keep the endpoint's default unless "temperature" is set in swarm.config.json.
+const DEFAULT_TEMPERATURE = { worker: 0.2 };
 const LEAD_MAX_TOKENS = 8000;
 
 // Old tool results (page snapshots above all) dominate the context. Keep the most
@@ -543,10 +546,23 @@ export class Swarm {
 
   effortParams(role, model = null) {
     const p = model ? this.profile(model) : null;
-    if (p && !p.effort) return {};
-    const e = this.config.effort;
+    const e = p && !p.effort ? null : this.config.effort;
     const level = typeof e === 'string' ? e : e?.[role];
-    return level ? { output_config: { effort: level } } : {};
+    return { ...(level ? { output_config: { effort: level } } : {}), ...this.samplingParams(role, model) };
+  }
+
+  // Sampling temperature per role. config.temperature is a number (every role) or { lead, worker }; null or a
+  // missing role leaves the endpoint's default. Without a setting, workers on OpenAI-compatible models get 0.2:
+  // their turns are tool calls, which gain nothing from randomness, and predictable text is what a speculative
+  // decoding drafter guesses best, so on a self-hosted server with a drafter (tools/gpu/) the turns also get faster.
+  samplingParams(role, model = null) {
+    let t = this.config.temperature;
+    if (t === undefined) {
+      const p = model ? this.profile(model) : null;
+      t = p && !p.providerInfo?.native ? DEFAULT_TEMPERATURE : null;
+    }
+    const value = typeof t === 'number' ? t : t?.[role];
+    return typeof value === 'number' ? { temperature: value } : {};
   }
 
   longRunParams(model = null) {
