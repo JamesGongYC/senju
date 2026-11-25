@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('senju', {
   chooseMode: (mode) => call('choose-mode', mode),
   saveKey: (key, provider) => call('save-key', key, provider),
   forgetKey: (provider) => call('forget-key', provider),
+  connectOpenRouter: () => call('connect-openrouter'),
+  openUrl: (url) => call('open-url', url),
   setModels: (models) => call('set-models', models),
   signIn: (email, password) => call('sign-in', email, password),
   signOut: () => call('sign-out'),

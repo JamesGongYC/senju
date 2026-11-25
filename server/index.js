@@ -18,6 +18,7 @@ import { handleApi } from './api.js';
 import { SupabaseStore } from './store-supabase.js';
 import { Billing, verifyWebhook } from './billing.js';
 import { makeLlm } from '../src/llm.js';
+import { exchange as openRouterExchange } from '../src/openrouter-connect.js';
 import { keysFromEnv, parseKeys, guessProvider, checkKey, providers as allProviders, resolveModel } from '../src/models.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -78,12 +79,27 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/health') return json(res, 200, { ok: true });
     // What a client needs to reach Supabase. The publishable key is public by design.
     if (url.pathname === '/api/config') return json(res, 200, { supabaseUrl: env.SUPABASE_URL, supabaseAnonKey: publicKey });
+    // "Connect OpenRouter" from the web page: OpenRouter sent the person back with a code; the page sends it here
+    // with its PKCE secret, and the key it is swapped for is saved like a pasted one. The key never reaches the page.
+    if (url.pathname === '/api/key/openrouter' && req.method === 'POST') {
+      const user = await signedIn(req);
+      if (!user) return json(res, 401, { error: 'Sign in again.' });
+      const body = await readBody(req);
+      const code = String(body.code ?? ''), verifier = String(body.verifier ?? '');
+      if (!code || !/^[A-Za-z0-9_-]{43,128}$/.test(verifier)) return json(res, 400, { error: 'That connection request is incomplete. Try Connect OpenRouter again.' });
+      let key;
+      try { key = await openRouterExchange(code, verifier); } catch (err) { return json(res, 400, { error: err.message }); }
+      const saved = parseKeys(await store.getKey(user.id));
+      saved.openrouter = key;
+      await store.setKey(user.id, JSON.stringify(saved));
+      return json(res, 200, { ok: true, providers: Object.keys(saved) });
+    }
     // Your own API keys, one per provider. They are never sent back: GET lists which providers have one.
     if (url.pathname === '/api/key') {
       const user = await signedIn(req);
       if (!user) return json(res, 401, { error: 'Sign in again.' });
       const saved = parseKeys(await store.getKey(user.id));
-      const list = () => ({ providers: Object.keys(saved), known: Object.entries(allProviders(config)).filter(([, p]) => p.keyEnv).map(([id, p]) => ({ id, label: p.label, hint: p.keyHint })) });
+      const list = () => ({ providers: Object.keys(saved), known: Object.entries(allProviders(config)).filter(([, p]) => p.keyEnv).map(([id, p]) => ({ id, label: p.label, hint: p.keyHint, limits: p.limits ?? null, connect: Boolean(p.connect) })) });
       if (req.method === 'GET') return json(res, 200, list());
       if (req.method === 'DELETE') {
         const which = url.searchParams.get('provider');

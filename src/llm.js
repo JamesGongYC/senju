@@ -27,8 +27,10 @@ export function makeLlm(keys, config = {}, { fetchImpl } = {}) {
       const info = m.providerInfo;
       const apiKey = byProvider[m.provider] ?? (info.apiKey || null);
       if (info.keyEnv && !apiKey) throw new Error(`No ${info.label} API key is saved, and the model ${m.key} runs on ${info.label}. Add the key first.`);
-      // OpenRouter asks apps to name themselves; it shows in its usage pages.
-      const headers = m.provider === 'openrouter' ? { 'HTTP-Referer': 'https://senju.app', 'X-Title': 'Senju', ...(info.headers ?? {}) } : (info.headers ?? {});
+      // OpenRouter asks apps to name themselves; it shows in its usage pages. The website goes along only when one
+      // is set ("appUrl" in swarm.config.json, or SENJU_APP_URL): never an address that is not ours.
+      const site = config.appUrl ?? process.env.SENJU_APP_URL ?? null;
+      const headers = m.provider === 'openrouter' ? { 'X-Title': 'Senju', ...(site ? { 'HTTP-Referer': site } : {}), ...(info.headers ?? {}) } : (info.headers ?? {});
       clients.set(key, makeOpenAiClient({ baseURL: info.baseURL, apiKey, headers, fetchImpl }));
     }
     return clients.get(key);

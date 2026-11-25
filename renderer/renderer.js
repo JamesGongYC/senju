@@ -573,7 +573,7 @@ function renderKeyPrompt(e) {
   add(form, 'button', '', 'Save').type = 'submit';
   form.addEventListener('submit', (ev) => { ev.preventDefault(); window.swarm.saveKey(input.value.trim()); });
   input.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') ev.stopPropagation(); });
-  add(box, 'div', 'acct-note', 'Agents run on your own key. It is encrypted with your Mac\'s keychain and stays on this computer. Choose models and add other keys in the Senju window (Models & keys).');
+  add(box, 'div', 'acct-note', 'Agents run on your own key. It is encrypted with your Mac\'s keychain and stays on this computer. Set a spending limit on it with the provider. Choose models, connect OpenRouter or add other keys in the Senju window (Models & keys).');
   if (e.error) add(box, 'div', 'acct-error', e.error);
   input.focus();
 }

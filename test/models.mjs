@@ -3,6 +3,9 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
+import { splitEnvKeys } from '../src/models.js';
+import { pkce, authUrl, connectDesktop, exchange } from '../src/openrouter-connect.js';
 import { resolveModel, modelKey, guessProvider, checkKey, parseKeys, missingKeys, fitTools, keysFromEnv } from '../src/models.js';
 import { toChat, fromChat, parseArgs, fitMessages, estimateTokens } from '../src/llm-openai.js';
 import { makeLlm } from '../src/llm.js';
@@ -215,6 +218,59 @@ const chatReply = (message, finish = 'stop') => ({ id: 'x', choices: [{ finish_r
   assert.ok(!workerBody.tools.some((t) => /look_at_page|click_at/.test(t.function.name)), 'and gets no picture tools');
   assert.ok(swarm.usage.byModel[RIPPLE].input > 0, 'tokens are counted per model');
   await swarm.shutdown();
+}
+
+// ---- Keys out of .env, into the keychain ----
+{
+  const { keys, rest } = splitEnvKeys('SWARM_DATA_DIR=/x\nOPENROUTER_API_KEY="sk-or-v1-abc"\n# note\nexport ANTHROPIC_API_KEY=sk-ant-xyz\nGROQ_API_KEY=\n');
+  assert.deepEqual(keys, { openrouter: 'sk-or-v1-abc', anthropic: 'sk-ant-xyz' });
+  assert.equal(rest, 'SWARM_DATA_DIR=/x\n# note\nGROQ_API_KEY=\n', 'everything else stays as it was');
+}
+
+// ---- OpenRouter's site header: only a website that is set ----
+{
+  const { calls, fetchImpl } = fake(() => chatReply({ content: 'hi' }));
+  await makeLlm({ openrouter: 'k' }, {}, { fetchImpl }).create({ model: RIPPLE, messages: [{ role: 'user', content: 'x' }] });
+  assert.ok(!('HTTP-Referer' in calls[0].headers), 'no made-up website');
+  await makeLlm({ openrouter: 'k' }, { appUrl: 'https://senjulabs.ai' }, { fetchImpl }).create({ model: RIPPLE, messages: [{ role: 'user', content: 'x' }] });
+  assert.equal(calls[1].headers['HTTP-Referer'], 'https://senjulabs.ai');
+}
+
+// ---- Connect OpenRouter (OAuth with PKCE) ----
+{
+  const { verifier, challenge, state } = pkce();
+  assert.equal(challenge, crypto.createHash('sha256').update(verifier).digest('base64url'));
+  assert.match(challenge, /^[A-Za-z0-9_-]{43}$/, 'base64url, no padding');
+  const u = new URL(authUrl({ callback: 'http://localhost:5555/callback', challenge, state }));
+  assert.equal(u.origin + u.pathname, 'https://openrouter.ai/auth');
+  assert.equal(u.searchParams.get('code_challenge_method'), 'S256');
+  assert.equal(u.searchParams.get('callback_url'), 'http://localhost:5555/callback');
+  assert.equal(u.searchParams.get('key_label'), 'Senju');
+  assert.equal(u.searchParams.get('limit'), '20', 'a spending limit is suggested');
+  assert.equal(u.searchParams.get('state'), state);
+
+  // The whole desktop flow: the browser opens OpenRouter, which sends the person back to the local callback.
+  const exchanged = [];
+  const orFetch = async (url, init) => { exchanged.push({ url, body: JSON.parse(init.body) }); return { ok: true, status: 200, json: async () => ({ key: 'sk-or-v1-connected' }) }; };
+  let opened = null;
+  const visit = async (auth, override = {}) => {
+    const a = new URL(auth);
+    const cb = new URL(a.searchParams.get('callback_url'));
+    cb.hostname = '127.0.0.1';   // what the browser reaches for localhost
+    if (override.code !== null) cb.searchParams.set('code', override.code ?? 'the-code');
+    cb.searchParams.set('state', override.state ?? a.searchParams.get('state'));
+    return (await fetch(cb)).text();
+  };
+  const got = connectDesktop({ open: (url) => { opened = url; setTimeout(() => visit(url), 10); }, fetchImpl: orFetch });
+  assert.equal(await got, 'sk-or-v1-connected');
+  assert.match(new URL(opened).searchParams.get('callback_url'), /^http:\/\/localhost:\d+\/callback$/);
+  assert.equal(exchanged[0].url, 'https://openrouter.ai/api/v1/auth/keys');
+  assert.equal(exchanged[0].body.code, 'the-code');
+  assert.equal(crypto.createHash('sha256').update(exchanged[0].body.code_verifier).digest('base64url'), new URL(opened).searchParams.get('code_challenge'), 'the secret matches the challenge sent');
+  await assert.rejects(connectDesktop({ open: (url) => setTimeout(() => visit(url, { state: 'forged' }), 10), fetchImpl: orFetch }), /different request/);
+  await assert.rejects(connectDesktop({ open: (url) => setTimeout(() => visit(url, { code: null }), 10), fetchImpl: orFetch }), /declined/);
+  await assert.rejects(connectDesktop({ open: () => {}, fetchImpl: orFetch, timeoutMs: 50 }), /ten minutes/);
+  await assert.rejects(exchange('c', 'v', async () => ({ ok: false, status: 403, json: async () => ({}) })), /expired or did not match/);
 }
 
 console.log('models test passed');

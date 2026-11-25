@@ -62,6 +62,7 @@ async function loadAccount() {
   state.hasKey = Boolean((await state.sb.rpc('has_api_key')).data);
   await loadBilling();
   connect();
+  await finishOpenRouter();
   const back = new URLSearchParams(location.search).get('billing');
   if (back) {
     history.replaceState(null, '', location.pathname);
@@ -70,6 +71,35 @@ async function loadAccount() {
     if (back === 'done') for (const wait of [1500, 4000, 9000]) setTimeout(async () => { await loadBilling(); if (state.page === 'billing') render(); }, wait);
   }
   render();
+}
+
+// ---- Connect OpenRouter (OAuth with PKCE; https://openrouter.ai/docs/use-cases/oauth-pkce) ----
+// The secret stays in this tab (sessionStorage) until OpenRouter sends the person back; the server swaps the code
+// for the key and keeps it encrypted, so the key itself never reaches this page.
+const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function connectOpenRouter() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
+  const st = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  try { sessionStorage.setItem('senju.or', JSON.stringify({ verifier, state: st })); } catch { toast('This browser blocks the storage the connection needs. Paste a key instead.'); return; }
+  const q = new URLSearchParams({ callback_url: `${location.origin}${location.pathname}?openrouter=back`, code_challenge: challenge, code_challenge_method: 'S256', key_label: 'Senju', limit: '20', state: st });
+  location.href = `https://openrouter.ai/auth?${q}`;
+}
+async function finishOpenRouter() {
+  const q = new URLSearchParams(location.search);
+  if (q.get('openrouter') !== 'back') return;
+  history.replaceState(null, '', location.pathname);
+  state.page = 'billing';
+  let saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem('senju.or') ?? 'null'); sessionStorage.removeItem('senju.or'); } catch { /* blocked */ }
+  if (!q.get('code')) return toast('OpenRouter was not connected.');
+  if (!saved || q.get('state') !== saved.state) return toast('That OpenRouter answer was not for this page. Try Connect OpenRouter again.');
+  try {
+    await api('POST', '/api/key/openrouter', { code: q.get('code'), verifier: saved.verifier });
+    state.keys = null;
+    state.hasKey = true;
+    toast('OpenRouter is connected. Sessions you start can run on it.');
+  } catch (err) { toast(err.message); }
 }
 
 async function loadBilling() {
@@ -388,11 +418,16 @@ function billingPage() {
     h('section', { class: 'card' },
       h('div', { class: 'card-head' }, h('h2', { class: 'display' }, b?.hosted ? 'Or bring your own key' : 'Your API key')),
       h('p', { class: 'dim' }, 'Sessions you start run on your own keys, free of credits: one per provider your models use (chosen in the Senju desktop app, under Models & keys). Keys are encrypted on the server and never shown again, and teammates cannot use them for their own sessions.'),
-      (state.keys?.known ?? [{ id: 'anthropic', label: 'Anthropic', hint: 'sk-ant-…' }]).map((p) => (state.keys?.providers ?? []).includes(p.id)
-        ? h('p', { class: 'key-saved' }, h('b', {}, p.label), ': a key is saved. ', h('button', { class: 'link', onclick: () => keyCall('DELETE', undefined, p.id) }, 'Remove it'))
-        : h('form', { class: 'inline', onsubmit: (ev) => { ev.preventDefault(); keyCall('POST', { key: new FormData(ev.target).get('key'), provider: p.id }); } },
+      h('p', { class: 'dim small' }, 'Sessions are billed to these keys. Set a spending limit on each with its provider, so a long session cannot run up an open-ended bill. Connect OpenRouter suggests a $20 limit, which you can change on its page.'),
+      (state.keys?.known ?? [{ id: 'anthropic', label: 'Anthropic', hint: 'sk-ant-…' }]).map((p) => {
+        const limit = p.limits ? h('a', { class: 'link small', href: p.limits, target: '_blank', rel: 'noopener' }, 'Set a spending limit ↗') : null;
+        if ((state.keys?.providers ?? []).includes(p.id)) return h('p', { class: 'key-saved' }, h('b', {}, p.label), ': a key is saved. ', h('button', { class: 'link', onclick: () => keyCall('DELETE', undefined, p.id) }, 'Remove it'), ' ', limit);
+        return h('form', { class: 'inline', onsubmit: (ev) => { ev.preventDefault(); keyCall('POST', { key: new FormData(ev.target).get('key'), provider: p.id }); } },
           h('span', { class: 'key-label' }, p.label),
-          h('input', { class: 'field', name: 'key', type: 'password', placeholder: p.hint, required: true, autocomplete: 'off' }), h('button', { class: 'btn btn-punk' }, 'Save'))),
+          p.connect ? h('button', { type: 'button', class: 'btn btn-punk', onclick: () => connectOpenRouter() }, 'Connect OpenRouter') : null,
+          h('input', { class: 'field', name: 'key', type: 'password', placeholder: p.connect ? `or paste a key (${p.hint})` : p.hint, required: true, autocomplete: 'off' }),
+          h('button', { class: `btn ${p.connect ? 'btn-ghost' : 'btn-punk'}` }, 'Save'), limit);
+      }),
       err));
 }
 

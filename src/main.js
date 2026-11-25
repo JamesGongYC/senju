@@ -12,7 +12,8 @@ import { demoLlm, demoConnect, demoConfigServers } from './demo.js';
 import { placeWindow } from './place.js';
 import { callTool } from './mcp.js';
 import { makeLlm as modelClient } from './llm.js';
-import { PROVIDERS, providers as allProviders, guessProvider, checkKey, keysFromEnv, missingKeys, resolveModel, modelKey } from './models.js';
+import { connectDesktop } from './openrouter-connect.js';
+import { PROVIDERS, splitEnvKeys, providers as allProviders, guessProvider, checkKey, keysFromEnv, missingKeys, resolveModel, modelKey } from './models.js';
 import { ToolHost } from './toolhost.js';
 import { CloudClient, supabaseAuth } from './cloud.js';
 import { DEFAULT_HUB } from './config.js';
@@ -63,6 +64,35 @@ function saveKey(key, provider = null) {
   dropSwarm();   // the next job builds its client with the new key
   return null;
 }
+// Keys left in the data folder's .env are plain text any program on this Mac can read. Move them into the
+// keychain and take them out of the file. A key the shell itself sets (not in .env) is left alone.
+function moveEnvKeys() {
+  const file = path.join(dataDir(), '.env');
+  if (!fs.existsSync(file) || !safeStorage.isEncryptionAvailable()) return;
+  const { keys, rest } = splitEnvKeys(fs.readFileSync(file, 'utf8'));
+  const moved = [];
+  for (const [provider, value] of Object.entries(keys)) {
+    fs.writeFileSync(keyFile(provider), safeStorage.encryptString(value), { mode: 0o600 });
+    process.env[PROVIDERS[provider].keyEnv] = value;
+    moved.push(PROVIDERS[provider].label);
+  }
+  if (!moved.length) return;
+  fs.writeFileSync(file, rest, { mode: 0o600 });
+  console.error(`Moved the ${moved.join(', ')} key(s) from .env into the keychain.`);
+}
+
+// "Connect OpenRouter": sign in there and approve, and the key it hands back goes into the keychain.
+let connecting = null;
+async function connectOpenRouter() {
+  connecting ??= connectDesktop({ open: (url) => shell.openExternal(url) }).finally(() => { connecting = null; });
+  const key = await connecting;
+  const problem = saveKey(key, 'openrouter');
+  if (problem) throw new Error(problem);
+}
+
+// Pages the key screens link to (spending limits): opened in the browser, and only these.
+const KEY_PAGES = /^https:\/\/(openrouter\.ai|console\.anthropic\.com|platform\.openai\.com)\//;
+
 function forgetKey(provider) {
   const p = PROVIDERS[provider];
   if (!p?.keyEnv) return;
@@ -88,7 +118,7 @@ function modelState() {
   return {
     lead: describe(config.plannerModel ?? config.model),
     worker: describe(config.workerModel ?? config.model),
-    providers: Object.entries(allProviders(config)).map(([id, p]) => ({ id, label: p.label, hint: p.keyHint, needsKey: Boolean(p.keyEnv), hasKey: !p.keyEnv || Boolean(keys[id]), savable: Boolean(PROVIDERS[id]) })),
+    providers: Object.entries(allProviders(config)).map(([id, p]) => ({ id, label: p.label, hint: p.keyHint, needsKey: Boolean(p.keyEnv), hasKey: !p.keyEnv || Boolean(keys[id]), savable: Boolean(PROVIDERS[id]), limits: p.limits ?? null, connect: Boolean(p.connect) })),
     suggestions: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'openrouter:ricursiveai/ripple-65b-preview', 'openrouter:anthropic/claude-sonnet-5.5', 'openai:gpt-5', 'together:ricursiveai/ripple-65b-preview', 'ollama:llama3.3'],
   };
 }
@@ -352,6 +382,8 @@ const launcherHandlers = {
   'choose-mode': async (next) => { await setMode(next); return launcherState(); },
   'save-key': (key, provider) => { const problem = saveKey(String(key ?? '').trim(), provider ?? null); if (problem) throw new Error(problem); return launcherState(); },
   'forget-key': (provider) => { forgetKey(String(provider ?? '')); return launcherState(); },
+  'connect-openrouter': async () => { await connectOpenRouter(); return launcherState(); },
+  'open-url': (url) => { if (KEY_PAGES.test(String(url))) shell.openExternal(String(url)); },
   'set-models': (models) => { setModels(models ?? {}); return launcherState(); },
   'sign-in': async (email, password) => {
     if (!cloud) throw new Error('Still reaching the team server. Try again in a moment.');
@@ -663,6 +695,7 @@ function stopTracking() {
 app.whenReady().then(() => {
   if (isMac) app.dock?.hide();
   loadSavedKey();
+  moveEnvKeys();
   sessions.recover();   // a turn the app was quit in the middle of is marked as stopped
   createWindow();
   launcher = new Launcher({ root: ROOT, handlers: launcherHandlers });

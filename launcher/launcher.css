@@ -112,6 +112,7 @@ button { font: inherit; }
 .key-row.need { border-color: var(--orange); }
 .key-name { display: flex; flex-direction: column; }
 .key-input { display: flex; gap: 6px; align-items: center; }
-.key-input .field { width: 220px; }
+.key-input .field { width: 200px; }
+.key-name .link.small { font-size: 12px; padding: 0; margin-top: 2px; text-align: left; }
 .models-panel { padding: 32px; overflow: auto; }
 .models-panel .models { max-width: 620px; }

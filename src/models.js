@@ -12,9 +12,10 @@
 //   "providers": { "mylab": { "baseURL": "https://llm.mylab.dev/v1", "keyEnv": "MYLAB_API_KEY" } }
 
 export const PROVIDERS = {
-  anthropic: { label: 'Anthropic', native: true, keyEnv: 'ANTHROPIC_API_KEY', keyPattern: /^sk-ant-[A-Za-z0-9_-]{20,}$/, keyHint: 'sk-ant-…' },
-  openrouter: { label: 'OpenRouter', baseURL: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY', keyPattern: /^sk-or-[A-Za-z0-9_-]{20,}$/, keyHint: 'sk-or-…' },
-  openai: { label: 'OpenAI', baseURL: 'https://api.openai.com/v1', keyEnv: 'OPENAI_API_KEY', keyPattern: /^sk-(proj-)?[A-Za-z0-9_-]{20,}$/, keyHint: 'sk-…' },
+  // limits: where the person sets a spending limit, so a runaway job cannot run up an open-ended bill.
+  anthropic: { label: 'Anthropic', native: true, keyEnv: 'ANTHROPIC_API_KEY', keyPattern: /^sk-ant-[A-Za-z0-9_-]{20,}$/, keyHint: 'sk-ant-…', limits: 'https://console.anthropic.com/settings/limits' },
+  openrouter: { label: 'OpenRouter', baseURL: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY', keyPattern: /^sk-or-[A-Za-z0-9_-]{20,}$/, keyHint: 'sk-or-…', limits: 'https://openrouter.ai/settings/keys', connect: true },
+  openai: { label: 'OpenAI', baseURL: 'https://api.openai.com/v1', keyEnv: 'OPENAI_API_KEY', keyPattern: /^sk-(proj-)?[A-Za-z0-9_-]{20,}$/, keyHint: 'sk-…', limits: 'https://platform.openai.com/settings/organization/limits' },
   together: { label: 'Together AI', baseURL: 'https://api.together.xyz/v1', keyEnv: 'TOGETHER_API_KEY', keyHint: 'your Together key' },
   groq: { label: 'Groq', baseURL: 'https://api.groq.com/openai/v1', keyEnv: 'GROQ_API_KEY', keyPattern: /^gsk_[A-Za-z0-9]{20,}$/, keyHint: 'gsk_…' },
   ollama: { label: 'Ollama (this Mac)', baseURL: 'http://localhost:11434/v1', keyEnv: null, keyHint: 'no key needed' },
@@ -95,6 +96,22 @@ export function keysFromEnv(env = process.env, config = {}) {
   const out = {};
   for (const [name, p] of Object.entries(providers(config))) if (p.keyEnv && env[p.keyEnv]) out[name] = env[p.keyEnv];
   return out;
+}
+
+// The provider keys in a .env file's text, and the text without them: { keys: { provider: key }, rest }.
+// Used to move plain-text keys into the keychain. Lines that are not provider keys stay exactly as they were.
+export function splitEnvKeys(text) {
+  const byVar = Object.fromEntries(Object.entries(PROVIDERS).filter(([, p]) => p.keyEnv).map(([name, p]) => [p.keyEnv, name]));
+  const keys = {};
+  const rest = String(text ?? '').split('\n').filter((line) => {
+    const m = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    const provider = m && byVar[m[1]];
+    const value = provider ? m[2].replace(/^["']|["']$/g, '') : '';
+    if (!provider || !value) return true;
+    keys[provider] = value;
+    return false;
+  }).join('\n');
+  return { keys, rest };
 }
 
 // A saved key value: an Anthropic key on its own (from before other providers), or JSON { provider: key }.

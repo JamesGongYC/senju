@@ -115,11 +115,22 @@ function modelsForm({ firstRun = false } = {}) {
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
     const status = !p.needsKey ? 'no key needed' : p.hasKey ? 'saved' : needed.has(p.id) ? 'needed for your models' : 'not set';
     const forget = async () => { app.s = await call('forgetKey', p.id); render(); };
+    // OpenRouter: sign in there and approve, instead of copying a key. The browser opens; this waits for the answer.
+    const connect = async (btn) => {
+      err.textContent = '';
+      btn.disabled = true;
+      btn.textContent = 'Waiting for OpenRouter…';
+      try { app.s = await call('connectOpenRouter'); if (firstRun && app.s.hasKey) route(); else render(); } catch (e) { err.textContent = e.message; btn.disabled = false; btn.textContent = 'Connect OpenRouter'; }
+    };
+    const limitLink = p.limits && p.needsKey ? h('button', { class: 'link small', onclick: () => call('openUrl', p.limits) }, 'Set a spending limit ↗') : null;
     return h('div', { class: `key-row${needed.has(p.id) && !p.hasKey ? ' need' : ''}` },
-      h('div', { class: 'key-name' }, h('b', {}, p.label), h('span', { class: 'dim small' }, status)),
+      h('div', { class: 'key-name' }, h('b', {}, p.label), h('span', { class: 'dim small' }, status), limitLink),
       p.needsKey && p.savable
         ? (p.hasKey ? h('button', { class: 'link', onclick: forget }, 'Remove')
-          : h('div', { class: 'key-input' }, input, h('button', { class: 'btn btn-punk btn-sm', onclick: save }, 'Save')))
+          : h('div', { class: 'key-input' },
+            p.connect ? h('button', { class: 'btn btn-punk btn-sm', onclick: (ev) => connect(ev.currentTarget) }, 'Connect OpenRouter') : null,
+            p.connect ? h('span', { class: 'dim small' }, 'or') : null,
+            input, h('button', { class: `btn ${p.connect ? 'btn-ghost' : 'btn-punk'} btn-sm`, onclick: save }, 'Save')))
         : null);
   };
   // Keys matter only for Local: Cloud sessions use the keys saved on the web page.
@@ -131,7 +142,9 @@ function modelsForm({ firstRun = false } = {}) {
     h('p', { class: 'dim small' }, 'A Claude id (claude-sonnet-5-5) or provider:model, for example openrouter:ricursiveai/ripple-65b-preview.'),
     app.s.team
       ? h('p', { class: 'dim small' }, 'Cloud sessions run on the API keys saved on the web page (Billing). Add a key there for each provider your models use.')
-      : h('div', { class: 'keys' }, h('span', { class: 'kicker' }, 'API keys'), shown.map(keyRow)),
+      : h('div', { class: 'keys' }, h('span', { class: 'kicker' }, 'API keys'),
+        h('p', { class: 'dim small' }, 'Jobs are billed to these keys. Set a spending limit on each with its provider, so a long job cannot run up an open-ended bill. Connect OpenRouter suggests a $20 limit, which you can change on its page.'),
+        shown.map(keyRow)),
     err);
   return box;
 }
